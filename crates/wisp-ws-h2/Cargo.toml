@@ -1,0 +1,30 @@
+[package]
+name = "wisp-ws-h2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wisp-wisp = { path = "../wisp-wisp" }
+wisp-wisp-server = { path = "../wisp-wisp-server" }
+wisp-config = { path = "../wisp-config" }
+wisp-origin = { path = "../wisp-origin" }
+wisp-iphash = { path = "../wisp-iphash" }
+wisp-dos = { path = "../wisp-dos" }
+wisp-reports = { path = "../wisp-reports" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-websockets = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }

@@ -1,0 +1,33 @@
+[wisp.server]
+wisp_version = "v2"
+
+[wisp.destination]
+port_whitelist    = [80, 443]
+
+[wisp.rate_limit]
+backend       = "redis"
+redis_url     = "redis://127.0.0.1:6379/0"
+redis_fail_open = true
+
+[wisp_websocket]
+enabled               = true
+host                  = "0.0.0.0"
+port                  = 4242
+endpoint              = "/wisp/"
+proxy_control_enabled = true
+plain                 = true
+
+[wisp_proxy_control]
+enabled = true
+
+[wisp_proxy_mullvad]
+enabled          = false
+relay_api        = "https://api.mullvad.net/app/v1/relays"
+wireproxy_socks5 = "127.0.0.1:1080"
+
+[wisp_proxy_resi]
+enabled      = false
+api_base     = ""
+bearer_token = ""
+country      = "US"
+ip_type      = "residential"

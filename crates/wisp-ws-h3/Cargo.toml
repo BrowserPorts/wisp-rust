@@ -1,0 +1,22 @@
+[package]
+name = "wisp-ws-h3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wisp-wisp = { path = "../wisp-wisp" }
+wisp-wisp-server = { path = "../wisp-wisp-server" }
+wisp-config = { path = "../wisp-config" }
+wisp-iphash = { path = "../wisp-iphash" }
+wisp-quic-msquic = { path = "../wisp-quic-msquic" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+http = { workspace = true }
+h3 = { workspace = true }

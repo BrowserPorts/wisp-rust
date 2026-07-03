@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+*.node
+.DS_Store
+dist/
+*.log
+.local/
+.cargo/
+vendor/
+node_modules/
+*.tsbuildinfo
+.env
+.env.*

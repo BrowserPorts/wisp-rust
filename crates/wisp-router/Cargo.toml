@@ -1,0 +1,27 @@
+[package]
+name = "wisp-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wisp-config = { path = "../wisp-config" }
+wisp-wisp-server = { path = "../wisp-wisp-server" }
+wisp-ws-h2 = { path = "../wisp-ws-h2" }
+# NOTE: wisp-ws-h3 / wisp-server are pulled in once the H3 path
+# (task #46) lands; pulling them in today drags msquic through the
+# build, which is a hard requirement for the QUIC side but slows
+# WS-side iteration. They re-attach here when that task unblocks.
+wisp-iphash = { path = "../wisp-iphash" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+http = { workspace = true }
+async-trait = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio-websockets = { workspace = true }

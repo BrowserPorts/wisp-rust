@@ -1,0 +1,214 @@
+//! Per-connection driver: rustls-terminated TCP → hyper http2 server with
+//! extended CONNECT enabled → service dispatch in `service.rs`.
+
+use std::sync::Arc;
+
+use hyper::server::conn::http2::Builder as Http2Builder;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::{debug, warn};
+use wisp_config::{
+    endpoint_matches, endpoint_path_token, WispAuthRegistry, WispAuthTokenPolicy,
+    WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
+};
+use wisp_wisp_server::{ProxyControllerTemplate, ServerOptions};
+
+use crate::service::handle_request;
+
+#[derive(Debug, Error)]
+pub enum H2Error {
+    #[error("hyper http2 server error: {0}")]
+    Hyper(String),
+}
+
+/// Shared per-listener state. One instance is built at startup and cloned
+/// (cheaply, via `Arc`) into each accepted connection.
+#[derive(Clone)]
+pub struct H2ServeContext {
+    pub options: Arc<WispServerOptions>,
+    pub server_options: Arc<ServerOptions>,
+    /// Whether the proxy-control extension should be advertised. Driven by
+    /// `[wisp.proxy_control]` config (task #41 wires this up).
+    pub proxy_control_enabled: bool,
+    pub auth_registry: WispAuthRegistry,
+    /// Optional shared provider-registry template. The per-connection
+    /// service code calls `template.spawn()` to mint a fresh
+    /// `Arc<ProxyController>` for each accepted client so per-connection
+    /// state (rules, current proxy, rate-limiter) is never shared across
+    /// tenants. `None` when proxy_control is disabled or no providers are
+    /// registered.
+    pub proxy_template: Option<Arc<ProxyControllerTemplate>>,
+}
+
+impl H2ServeContext {
+    pub fn new(options: Arc<WispServerOptions>, proxy_control_enabled: bool) -> Self {
+        Self::with_template(options, proxy_control_enabled, None)
+    }
+
+    pub fn with_template(
+        options: Arc<WispServerOptions>,
+        proxy_control_enabled: bool,
+        proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    ) -> Self {
+        Self::with_template_and_auth(
+            options,
+            proxy_control_enabled,
+            proxy_template,
+            WispAuthRegistry::default(),
+        )
+    }
+
+    pub fn with_template_and_auth(
+        options: Arc<WispServerOptions>,
+        proxy_control_enabled: bool,
+        proxy_template: Option<Arc<ProxyControllerTemplate>>,
+        auth_registry: WispAuthRegistry,
+    ) -> Self {
+        let server_options = Arc::new(ServerOptions::from_wisp(&options, proxy_control_enabled));
+        Self {
+            options,
+            server_options,
+            proxy_control_enabled,
+            auth_registry,
+            proxy_template,
+        }
+    }
+
+    /// Build a context from the merged wisp config. If the WS sub-section
+    /// supplies its own endpoint, swap it onto the base options so the
+    /// service's `endpoint_matches` check honors it without disturbing the
+    /// WT endpoint.
+    pub fn from_wisp_wt(cfg: &WispWtServerOptions) -> Self {
+        Self::from_wisp_wt_with_template(cfg, None)
+    }
+
+    pub fn from_wisp_wt_with_template(
+        cfg: &WispWtServerOptions,
+        proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    ) -> Self {
+        Self::from_wisp_wt_with_template_and_auth(cfg, proxy_template, WispAuthRegistry::default())
+    }
+
+    pub fn from_wisp_wt_with_template_and_auth(
+        cfg: &WispWtServerOptions,
+        proxy_template: Option<Arc<ProxyControllerTemplate>>,
+        auth_registry: WispAuthRegistry,
+    ) -> Self {
+        let mut base = cfg.base.clone();
+        if let Some(ep) = &cfg.websocket.endpoint {
+            base.endpoint = ep.clone();
+        }
+        let proxy_control_enabled = cfg
+            .websocket
+            .proxy_control_enabled
+            .unwrap_or(cfg.proxy_control_enabled);
+        Self::with_template_and_auth(
+            Arc::new(base),
+            proxy_control_enabled,
+            proxy_template,
+            auth_registry,
+        )
+    }
+
+    pub async fn context_for_path(&self, path: &str) -> Option<ConnectionView> {
+        let (options, auth_policy) = if let Some(token) =
+            endpoint_path_token(path, &self.options.endpoint)
+        {
+            if !self.options.auth.token_path {
+                return None;
+            }
+            let resolved = self
+                .auth_registry
+                .resolve(token.to_owned(), &self.options)
+                .await?;
+            (Arc::new(resolved.options), resolved.policy)
+        } else if endpoint_matches(path, &self.options.endpoint) {
+            if self.options.auth.required {
+                return None;
+            }
+            let base = self
+                .auth_registry
+                .profile(WISP_BASE_LIMIT_PROFILE)
+                .map(Arc::new)
+                .unwrap_or_else(|| self.options.clone());
+            (base, WispAuthTokenPolicy::default())
+        } else {
+            return None;
+        };
+        let server_options = if Arc::ptr_eq(&options, &self.options) {
+            self.server_options.clone()
+        } else {
+            Arc::new(ServerOptions::from_wisp(
+                &options,
+                self.proxy_control_enabled,
+            ))
+        };
+        Some(ConnectionView {
+            options,
+            server_options,
+            auth_policy,
+        })
+    }
+
+    pub fn path_is_endpoint_scope(&self, path: &str) -> bool {
+        endpoint_matches(path, &self.options.endpoint)
+            || endpoint_path_token(path, &self.options.endpoint).is_some()
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectionView {
+    pub options: Arc<WispServerOptions>,
+    pub server_options: Arc<ServerOptions>,
+    pub auth_policy: WispAuthTokenPolicy,
+}
+
+/// Drive one accepted connection. The caller is responsible for the TCP
+/// accept and TLS termination — this function takes the post-TLS duplex
+/// (any `tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static` works,
+/// e.g. `tokio_rustls::server::TlsStream<TcpStream>`).
+///
+/// `client_ip` is the peer-IP string (already extracted from the TCP
+/// `peer_addr`); the service uses it for DoS / hashing.
+pub async fn accept_h2_connection<I>(
+    io: I,
+    client_ip: String,
+    ctx: Arc<H2ServeContext>,
+) -> Result<(), H2Error>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut builder = Http2Builder::new(TokioExecutor::new());
+    builder.enable_connect_protocol();
+
+    let svc = service_fn(move |req| {
+        let ctx = ctx.clone();
+        let client_ip = client_ip.clone();
+        async move { handle_request(req, client_ip, ctx).await }
+    });
+
+    let conn = builder.serve_connection(TokioIo::new(io), svc);
+    if let Err(err) = conn.await {
+        // h2 GOAWAYs and reset connections come through here. Log and
+        // surface — the wisp ingress task in the runtime will swallow
+        // these and continue accepting.
+        let msg = err.to_string();
+        if !is_clean_disconnect(&msg) {
+            warn!(error = %msg, "h2 connection error");
+        } else {
+            debug!(error = %msg, "h2 connection closed");
+        }
+        return Err(H2Error::Hyper(msg));
+    }
+    Ok(())
+}
+
+fn is_clean_disconnect(msg: &str) -> bool {
+    // Hyper / h2 string-matched signals for "the peer went away politely".
+    msg.contains("connection reset")
+        || msg.contains("broken pipe")
+        || msg.contains("connection closed")
+        || msg.contains("NO_ERROR")
+}

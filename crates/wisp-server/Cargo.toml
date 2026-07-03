@@ -1,0 +1,35 @@
+[package]
+name = "wisp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+h3 = { workspace = true }
+h3-webtransport = { workspace = true }
+h3-datagram = { workspace = true }
+msquic = { workspace = true }
+wisp-wire = { path = "../wisp-wire" }
+wisp-config = { path = "../wisp-config" }
+wisp-origin = { path = "../wisp-origin" }
+wisp-iphash = { path = "../wisp-iphash" }
+wisp-reports = { path = "../wisp-reports" }
+wisp-inspect = { path = "../wisp-inspect" }
+wisp-dos = { path = "../wisp-dos" }
+wisp-proxy = { path = "../wisp-proxy" }
+wisp-quic-msquic = { path = "../wisp-quic-msquic" }
+wisp-ws-h3 = { path = "../wisp-ws-h3" }
+wisp-wisp-server = { path = "../wisp-wisp-server" }

@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wispd",
+    "crates/wisp-core",
+    "crates/wisp-wire",
+    "crates/wisp-server",
+    "crates/wisp-config",
+    "crates/wisp-proxy",
+    "crates/wisp-dos",
+    "crates/wisp-inspect",
+    "crates/wisp-origin",
+    "crates/wisp-iphash",
+    "crates/wisp-reports",
+    "crates/wisp-quic-msquic",
+    "crates/wisp-wisp",
+    "crates/wisp-wisp-server",
+    "crates/wisp-ws-h2",
+    "crates/wisp-ws-h3",
+    "crates/wisp-router",
+    "crates/wisp-rust-napi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/browser-ports/wisp-rust"
+
+[workspace.dependencies]
+bytes = "1.7"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+http = "1.1"
+url = "2.5"
+sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+governor = "0.7"
+dashmap = "6.1"
+crossbeam = "0.8"
+parking_lot = "0.12"
+socket2 = { version = "0.5", features = ["all"] }
+hickory-resolver = "0.24"
+mimalloc = { version = "0.1", default-features = false }
+anyhow = "1.0"
+
+# QUIC / HTTP/3 / WebTransport
+msquic = "=2.5.1-beta"
+h3 = "0.0.8"
+h3-webtransport = "0.1.2"
+h3-datagram = "0.0.2"
+
+# H2 / WS
+hyper = { version = "1.5", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+tokio-websockets = { version = "0.13", default-features = false, features = ["server", "fastrand", "sha1_smol"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# h3 0.0.8 (latest published 2025-05-06) only exposes Protocol::WEB_TRANSPORT
+# and Protocol::CONNECT_UDP. Master adds Protocol::WEBSOCKET (and CONNECT_IP)
+# which we need for the Wisp v2 WS-over-H3 dispatcher. Pinned to a specific
+# revision so reproducible builds aren't at the mercy of upstream master.
+# All three (h3, h3-webtransport, h3-datagram) come from the same monorepo
+# commit so internal path-deps stay consistent.
+[patch.crates-io]
+h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+h3-webtransport = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+
+[patch."ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git"]
+wisp-proxy-base = { path = "../wisp-rust-proxy-providers/crates/wisp-proxy-base" }
+wisp-proxy-mullvad = { path = "../wisp-rust-proxy-providers/crates/wisp-proxy-mullvad" }
+wisp-proxy-resi = { path = "../wisp-rust-proxy-providers/crates/wisp-proxy-resi" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = "none"
+
+[profile.bench]
+inherits = "release"
+debug = true

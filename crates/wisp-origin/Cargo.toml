@@ -1,0 +1,11 @@
+[package]
+name = "wisp-origin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+url = { workspace = true }
+http = { workspace = true }
+wisp-config = { path = "../wisp-config" }

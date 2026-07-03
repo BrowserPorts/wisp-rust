@@ -1,0 +1,28 @@
+[package]
+name = "wispd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wispd"
+path = "src/main.rs"
+
+[features]
+# Mirrors wisp-core's feature toggles. `--no-default-features --features ws`
+# yields the WS-only binary used by the Wispmark `wisp-wt-rust-ws` variant
+# and gives a working build on hosts without msquic.
+default = ["quic", "ws"]
+quic = ["wisp-core/quic"]
+ws = ["wisp-core/ws"]
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+mimalloc = { workspace = true }
+wisp-core = { path = "../wisp-core", default-features = false }
+wisp-config = { path = "../wisp-config" }

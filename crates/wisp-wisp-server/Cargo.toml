@@ -1,0 +1,33 @@
+[package]
+name = "wisp-wisp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wisp-wisp = { path = "../wisp-wisp" }
+wisp-config = { path = "../wisp-config" }
+wisp-inspect = { path = "../wisp-inspect" }
+wisp-origin = { path = "../wisp-origin" }
+wisp-iphash = { path = "../wisp-iphash" }
+wisp-reports = { path = "../wisp-reports" }
+wisp-dos = { path = "../wisp-dos" }
+wisp-proxy-base = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git" }
+wisp-proxy = { path = "../wisp-proxy" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+hickory-resolver = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+socket2 = { workspace = true }
+governor = { workspace = true }

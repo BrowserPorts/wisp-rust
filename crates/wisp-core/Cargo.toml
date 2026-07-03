@@ -1,0 +1,38 @@
+[package]
+name = "wisp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Both transports on by default. Disable `quic` to build WS-only — useful
+# on platforms where msquic isn't readily available (macOS dev hosts) and
+# for the Wispmark `wisp-wt-rust-ws` variant which never opens UDP.
+default = ["quic", "ws"]
+quic = ["dep:wisp-server", "dep:wisp-proxy"]
+ws = [
+    "dep:wisp-router",
+    "dep:wisp-ws-h2",
+    "dep:wisp-wisp-server",
+    "dep:wisp-proxy-base",
+    "dep:wisp-proxy-mullvad",
+    "dep:wisp-proxy-resi",
+]
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+wisp-config = { path = "../wisp-config" }
+wisp-dos = { path = "../wisp-dos" }
+wisp-server = { path = "../wisp-server", optional = true }
+wisp-proxy = { path = "../wisp-proxy", optional = true }
+wisp-router = { path = "../wisp-router", optional = true }
+wisp-ws-h2 = { path = "../wisp-ws-h2", optional = true }
+wisp-wisp-server = { path = "../wisp-wisp-server", optional = true }
+wisp-proxy-base = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git", optional = true }
+wisp-proxy-mullvad = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git", optional = true }
+wisp-proxy-resi = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git", optional = true }

@@ -1,0 +1,20 @@
+[package]
+name = "wisp-quic-msquic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+http = { workspace = true }
+dashmap = { workspace = true }
+h3 = { workspace = true }
+h3-datagram = { workspace = true }
+msquic = { workspace = true }

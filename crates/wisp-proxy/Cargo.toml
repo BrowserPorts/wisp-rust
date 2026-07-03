@@ -1,0 +1,19 @@
+[package]
+name = "wisp-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+hickory-resolver = { workspace = true }
+url = { workspace = true }
+wisp-config = { path = "../wisp-config" }
+wisp-wire = { path = "../wisp-wire" }
+wisp-reports = { path = "../wisp-reports" }
