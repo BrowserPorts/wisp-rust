@@ -52,7 +52,23 @@ async fn run_udp(
         return;
     }
 
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Resolve and gate every resolved address against policy before binding,
+    // then connect to a checked address (closes the SSRF that a raw
+    // `connect((hostname, port))` left open by never re-checking resolved IPs).
+    let peer = match crate::stream::resolve_checked(&hostname, port, &ctx.policy).await {
+        Ok(addrs) => addrs[0],
+        Err(e) => {
+            warn!(stream_id, %hostname, port, error = %e, "wisp udp connect rejected");
+            let _ = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => Ok(()),
+                r = egress.send(WispMessage::Binary(encode_close(stream_id, close_reason::UNREACHABLE_HOST))) => r.map_err(|_| ()),
+            };
+            return;
+        }
+    };
+    let bind_addr = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             warn!(stream_id, error = %e, "wisp udp bind failed");
@@ -64,7 +80,7 @@ async fn run_udp(
             return;
         }
     };
-    if let Err(e) = socket.connect((hostname.as_str(), port)).await {
+    if let Err(e) = socket.connect(peer).await {
         warn!(stream_id, %hostname, port, error = %e, "wisp udp connect failed");
         let _ = tokio::select! {
             biased;
@@ -149,6 +165,38 @@ async fn run_udp(
         };
         match msg {
             UdpStreamMsg::Data(payload) => {
+                // Meter the client->upstream direction with the same datagram
+                // limiter used on the reply path, so a client can't blast
+                // outbound UDP uncapped by the datagram-specific limits.
+                match datagram_limit_decision(
+                    &ctx.client_ip,
+                    &ctx.conn_dos,
+                    &ctx.options,
+                    payload.len() as u64,
+                    &ctx.dos_store,
+                ) {
+                    DatagramDecision::Allow => {}
+                    DatagramDecision::Drop => {
+                        debug!(
+                            stream_id,
+                            bytes = payload.len(),
+                            "wisp udp outbound datagram dropped: rate limit",
+                        );
+                        continue;
+                    }
+                    DatagramDecision::Close => {
+                        warn!(
+                            stream_id,
+                            "wisp: closing connection: sustained outbound datagram rate exceeded",
+                        );
+                        let _ = tokio::select! {
+                            biased;
+                            _ = ctx.cancel.cancelled() => Ok(()),
+                            r = egress.send(WispMessage::Binary(encode_close(0, close_reason::CONN_THROTTLED))) => r.map_err(|_| ()),
+                        };
+                        break;
+                    }
+                }
                 let send_res = tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => break,

@@ -12,8 +12,10 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio_websockets::{Limits, Message, ServerBuilder};
 use tracing::{debug, info, warn};
-use wisp_config::WispWtServerOptions;
+use wisp_config::{resolve_client_ip, WispWtServerOptions};
+use wisp_dos::{global_connection_limiter, global_guard, is_connection_start_allowed};
 use wisp_iphash::hash_client_ip;
+use wisp_origin::{is_origin_allowed, origin_from_headers};
 use wisp_wisp_server::{serve_connection, ServerContext, WispMessage};
 use wisp_ws_h2::{listener::ConnectionView, H2ServeContext};
 
@@ -126,6 +128,40 @@ async fn handle_connection(
     let Some(view) = ctx.context_for_path(path).await else {
         debug!(%path, expected = %ctx.options.endpoint, "ws-plain: path mismatch");
         return Ok(());
+    };
+
+    // Origin gate — the plain listener previously skipped this, so any web
+    // page could open a cross-origin WebSocket to the proxy. Enforce it here
+    // exactly as the H2 path does.
+    let origin = origin_from_headers(request.headers()).map(|s| s.to_owned());
+    if !is_origin_allowed(origin.as_deref(), &view.options) {
+        debug!(?origin, "ws-plain: rejecting websocket: origin policy");
+        return Ok(());
+    }
+
+    // Resolve the real client IP (honoring trusted X-Forwarded-For), then gate
+    // on the connection-start rate and the live-connection concurrency caps
+    // before doing any per-connection work.
+    let xff = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let client_ip = resolve_client_ip(&client_ip, xff, &view.options);
+    let store = global_guard();
+    if !is_connection_start_allowed(&client_ip, &view.options, &store) {
+        debug!(client_ip = %client_ip, "ws-plain: rejecting: connection-start rate");
+        return Ok(());
+    }
+    let _conn_guard = match global_connection_limiter().try_acquire(
+        &client_ip,
+        view.options.max_connections,
+        view.options.max_connections_per_ip,
+    ) {
+        Some(g) => g,
+        None => {
+            debug!(client_ip = %client_ip, "ws-plain: rejecting: connection concurrency cap");
+            return Ok(());
+        }
     };
 
     let client_advertises_v2 = request

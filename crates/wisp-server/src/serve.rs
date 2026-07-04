@@ -13,6 +13,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use h3::quic::{BidiStream as H3BidiStream, RecvStream as _, SendStreamUnframed as _};
@@ -24,8 +25,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use wisp_config::{normalize_endpoint, WispWtServerOptions};
-use wisp_dos::DosGuard;
+use wisp_config::{normalize_endpoint, WispServerOptions, WispWtServerOptions};
+use wisp_dos::{
+    datagram_limit_decision, is_dns_resolution_allowed, is_tcp_bytes_allowed,
+    is_tcp_stream_open_allowed, ConnectionDosGuard, DatagramDecision, DosGuard,
+};
 use wisp_proxy::TcpConnector;
 use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_quic_msquic::engine::{EngineConfig, EngineError, MsQuicEngine};
@@ -312,6 +316,20 @@ async fn handle_connection(
         }
     };
 
+    // Enforce the live-connection concurrency caps (the pre-upgrade policy only
+    // gates the connection-start *rate*). Held across the whole session.
+    let _conn_guard = match wisp_dos::global_connection_limiter().try_acquire(
+        &client_ip,
+        options.base.max_connections,
+        options.base.max_connections_per_ip,
+    ) {
+        Some(g) => g,
+        None => {
+            warn!(client_ip = %client_ip, "wisp: rejecting: connection concurrency cap");
+            return Ok(());
+        }
+    };
+
     let session = WebTransportSession::accept(request, stream, h3_conn)
         .await
         .map_err(|e| HandlerError::WtAccept(format!("{e:?}")))?;
@@ -396,13 +414,15 @@ async fn session_loop(
     let accept_session = session.clone();
     let accept_connector = tcp_connector.clone();
     let stream_logger = ctx.client_ip.clone();
+    let accept_limits = SessionLimits::from_ctx(ctx);
     let accept_task = tokio::spawn(async move {
-        accept_streams_loop(accept_session, accept_connector, stream_logger).await;
+        accept_streams_loop(accept_session, accept_connector, stream_logger, accept_limits).await;
     });
 
     let demux_flows = udp_flows.clone();
+    let demux_limits = SessionLimits::from_ctx(ctx);
     let demux_task = tokio::spawn(async move {
-        datagram_demux_loop(dgram_rx, demux_flows).await;
+        datagram_demux_loop(dgram_rx, demux_flows, demux_limits).await;
     });
 
     let sink_options = ctx.options.clone();
@@ -412,6 +432,7 @@ async fn session_loop(
         dgram_send: dgram_send.clone(),
         control_writer: control_writer_tx,
         options: sink_options,
+        limits: SessionLimits::from_ctx(ctx),
     };
 
     let dispatch = SessionDispatch::new(ctx);
@@ -432,11 +453,52 @@ async fn session_loop(
     }
 }
 
+/// Per-session DoS accounting threaded into the stream/datagram pump tasks so
+/// the WT/QUIC path enforces the same per-IP / per-connection rate limits the
+/// WS path does. Cloneable (all fields are `Arc`/`String`).
+#[derive(Clone)]
+struct SessionLimits {
+    client_ip: String,
+    options: Arc<WispServerOptions>,
+    dos: Arc<DosGuard>,
+    conn_dos: Arc<ConnectionDosGuard>,
+}
+
+impl SessionLimits {
+    fn from_ctx(ctx: &SessionContext) -> Self {
+        Self {
+            client_ip: ctx.client_ip.clone(),
+            options: ctx.options.clone(),
+            dos: ctx.dos.clone(),
+            conn_dos: ctx.conn_dos.clone(),
+        }
+    }
+
+    fn tcp_open_allowed(&self, hostname: &str) -> bool {
+        let needs_dns = hostname.parse::<std::net::IpAddr>().is_err();
+        if needs_dns
+            && !is_dns_resolution_allowed(&self.client_ip, hostname, &self.options, &self.dos)
+        {
+            return false;
+        }
+        is_tcp_stream_open_allowed(&self.client_ip, &self.conn_dos, &self.options, &self.dos)
+    }
+
+    fn tcp_bytes_allowed(&self, bytes: u64) -> bool {
+        is_tcp_bytes_allowed(&self.client_ip, &self.conn_dos, &self.options, bytes, &self.dos)
+    }
+
+    fn datagram_decision(&self, bytes: u64) -> DatagramDecision {
+        datagram_limit_decision(&self.client_ip, &self.conn_dos, &self.options, bytes, &self.dos)
+    }
+}
+
 /// Hot loop: per-session, accept bidi streams and bridge to TCP/WT_PROXY_SUB.
 async fn accept_streams_loop(
     session: Arc<WebTransportSession<MsQuicConnection, Bytes>>,
     connector: Arc<TcpConnector>,
     client_ip: String,
+    limits: SessionLimits,
 ) {
     loop {
         let accepted = match session.accept_bi().await {
@@ -456,8 +518,9 @@ async fn accept_streams_loop(
         };
         let connector = connector.clone();
         let client_ip = client_ip.clone();
+        let limits = limits.clone();
         tokio::spawn(async move {
-            if let Err(e) = bridge_one_stream(bidi, connector, &client_ip).await {
+            if let Err(e) = bridge_one_stream(bidi, connector, &client_ip, &limits).await {
                 debug!(client_ip = %client_ip, error = %e, "wisp: stream bridge ended");
             }
         });
@@ -474,30 +537,52 @@ async fn bridge_one_stream(
     >,
     connector: Arc<TcpConnector>,
     client_ip: &str,
+    limits: &SessionLimits,
 ) -> Result<(), BridgeError> {
     let (mut send, mut recv) = H3BidiStream::<Bytes>::split(bidi);
 
+    // Bound the header read so a client can't open a bidi and pin the task
+    // forever by never sending (or drip-feeding) the header.
+    let header_timeout =
+        Duration::from_millis(limits.options.handshake_timeout_ms.unwrap_or(10_000).max(1));
     let mut rx_buf = BytesMut::with_capacity(1024);
-    let (header, consumed) = loop {
-        match try_parse_bidi_stream_header(&rx_buf)
-            .map_err(|e| BridgeError::BadHeader(e.to_string()))?
-        {
-            Some((h, n)) => break (h, n),
-            None => {
-                let chunk = std::future::poll_fn(|cx| recv.poll_data(cx))
-                    .await
-                    .map_err(|e| BridgeError::Io(format!("wt recv (header): {e:?}")))?;
-                match chunk {
-                    Some(b) => rx_buf.extend_from_slice(b.chunk()),
-                    None => return Ok(()),
+    let parsed = tokio::time::timeout(header_timeout, async {
+        loop {
+            match try_parse_bidi_stream_header(&rx_buf)
+                .map_err(|e| BridgeError::BadHeader(e.to_string()))?
+            {
+                Some((h, n)) => return Ok::<_, BridgeError>(Some((h, n))),
+                None => {
+                    let chunk = std::future::poll_fn(|cx| recv.poll_data(cx))
+                        .await
+                        .map_err(|e| BridgeError::Io(format!("wt recv (header): {e:?}")))?;
+                    match chunk {
+                        Some(b) => rx_buf.extend_from_slice(b.chunk()),
+                        None => return Ok(None),
+                    }
                 }
             }
         }
+    })
+    .await
+    .map_err(|_| BridgeError::Io("stream header read timed out".into()))??;
+    let (header, consumed) = match parsed {
+        Some(v) => v,
+        None => return Ok(()),
     };
     let _ = rx_buf.split_to(consumed);
 
     match header.kind {
         BidiStreamKind::Tcp { hostname, port } => {
+            if !limits.tcp_open_allowed(&hostname) {
+                info!(
+                    client_ip = %client_ip,
+                    host = %hostname,
+                    port,
+                    "wisp: TCP bridge rejected (stream-open / dns rate limit)"
+                );
+                return Ok(());
+            }
             info!(
                 client_ip = %client_ip,
                 host = %hostname,
@@ -519,13 +604,31 @@ async fn bridge_one_stream(
                     .map_err(|e| BridgeError::Io(format!("tcp write (initial): {e}")))?;
             }
 
+            let idle = Duration::from_millis(
+                limits.options.stream_idle_timeout_ms.unwrap_or(600_000).max(1),
+            );
+            let limits_up = limits.clone();
             let wt_to_tcp = async move {
                 loop {
-                    let chunk = std::future::poll_fn(|cx| recv.poll_data(cx))
-                        .await
-                        .map_err(|e| BridgeError::Io(format!("wt recv: {e:?}")))?;
+                    let chunk = match tokio::time::timeout(
+                        idle,
+                        std::future::poll_fn(|cx| recv.poll_data(cx)),
+                    )
+                    .await
+                    {
+                        Ok(r) => r.map_err(|e| BridgeError::Io(format!("wt recv: {e:?}")))?,
+                        Err(_) => {
+                            let _ = tcp_write.shutdown().await;
+                            return Ok::<(), BridgeError>(());
+                        }
+                    };
                     match chunk {
                         Some(b) if b.has_remaining() => {
+                            if !limits_up.tcp_bytes_allowed(b.chunk().len() as u64) {
+                                return Err(BridgeError::Io(
+                                    "client->upstream byte rate exceeded".into(),
+                                ));
+                            }
                             tcp_write
                                 .write_all(b.chunk())
                                 .await
@@ -539,15 +642,19 @@ async fn bridge_one_stream(
                     }
                 }
             };
+            let limits_down = limits.clone();
             let tcp_to_wt = async move {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
-                    let n = tcp_read
-                        .read(&mut buf)
-                        .await
-                        .map_err(|e| BridgeError::Io(format!("tcp read: {e}")))?;
+                    let n = match tokio::time::timeout(idle, tcp_read.read(&mut buf)).await {
+                        Ok(r) => r.map_err(|e| BridgeError::Io(format!("tcp read: {e}")))?,
+                        Err(_) => return Ok::<(), BridgeError>(()),
+                    };
                     if n == 0 {
                         return Ok::<(), BridgeError>(());
+                    }
+                    if !limits_down.tcp_bytes_allowed(n as u64) {
+                        return Err(BridgeError::Io("upstream->client byte rate exceeded".into()));
                     }
                     let mut chunk = Bytes::copy_from_slice(&buf[..n]);
                     while chunk.has_remaining() {
@@ -590,6 +697,7 @@ struct BridgeSink {
     dgram_send: Arc<wisp_quic_msquic::adapter::MsQuicDatagramSendHandle>,
     control_writer: mpsc::UnboundedSender<Bytes>,
     options: Arc<wisp_config::WispServerOptions>,
+    limits: SessionLimits,
 }
 
 #[async_trait::async_trait]
@@ -598,6 +706,19 @@ impl ControlSink for BridgeSink {
         debug!(text = %text, "wisp: CONTROL text frame");
     }
     async fn on_udp_open(&mut self, frame: UdpOpenFrame) {
+        // Cap concurrent UDP flows per connection (mirrors the WS StreamCaps),
+        // so a client can't accumulate unbounded sockets + tasks by opening
+        // flows without ever closing them.
+        let flow_cap = self.options.stream_limit_total;
+        if flow_cap != 0 && self.flows.len() as u64 >= flow_cap {
+            debug!(
+                host = %frame.hostname,
+                port = frame.port,
+                cap = flow_cap,
+                "wisp: UDP_OPEN rejected: concurrent flow cap"
+            );
+            return;
+        }
         let flow_id = self.flows.alloc_id();
         debug!(
             flow_id = flow_id,
@@ -609,6 +730,7 @@ impl ControlSink for BridgeSink {
         let dgram_send = self.dgram_send.clone();
         let flows = self.flows.clone();
         let control_writer = self.control_writer.clone();
+        let limits = self.limits.clone();
         let max_age_ms = self.options.stream_idle_timeout_ms.unwrap_or(60_000);
         tokio::spawn(async move {
             open_udp_flow(
@@ -618,6 +740,7 @@ impl ControlSink for BridgeSink {
                 dgram_send,
                 flows,
                 control_writer,
+                limits,
                 max_age_ms,
             )
             .await;
@@ -674,6 +797,10 @@ impl UdpFlowRegistry {
         self.flows.insert(id, handle);
     }
 
+    fn len(&self) -> usize {
+        self.flows.len()
+    }
+
     fn route(&self, flow_id: u32, payload: Bytes) {
         if let Some(entry) = self.flows.get(&flow_id) {
             let _ = entry.upstream_tx.send(payload);
@@ -696,12 +823,27 @@ impl UdpFlowRegistry {
 
 /// Demux loop: pop one msquic datagram, parse the datagram header (always
 /// class- and kind-prefixed), route by kind/flow_id.
-async fn datagram_demux_loop(mut rx: mpsc::UnboundedReceiver<Bytes>, flows: Arc<UdpFlowRegistry>) {
+async fn datagram_demux_loop(
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
+    flows: Arc<UdpFlowRegistry>,
+    limits: SessionLimits,
+) {
     while let Some(buf) = rx.recv().await {
         match wisp_wire::parse_datagram(&buf) {
             Ok(d) => match d.kind {
                 datagram_kind::UDP => {
-                    flows.route(d.flow_id, d.payload);
+                    // Meter the client->upstream datagram direction. Drop over
+                    // budget; on sustained abuse (Close) stop forwarding.
+                    match limits.datagram_decision(d.payload.len() as u64) {
+                        DatagramDecision::Allow => flows.route(d.flow_id, d.payload),
+                        DatagramDecision::Drop => {
+                            debug!(flow = d.flow_id, "wisp: client->upstream datagram dropped: rate limit");
+                        }
+                        DatagramDecision::Close => {
+                            warn!("wisp: client->upstream datagram rate sustained-exceeded; stopping demux");
+                            return;
+                        }
+                    }
                 }
                 datagram_kind::WT_PROXY => {
                     debug!(
@@ -730,6 +872,7 @@ async fn open_udp_flow(
     dgram_send: Arc<wisp_quic_msquic::adapter::MsQuicDatagramSendHandle>,
     flows: Arc<UdpFlowRegistry>,
     control_writer: mpsc::UnboundedSender<Bytes>,
+    limits: SessionLimits,
     max_age_ms: u64,
 ) {
     let sock = match connector.bind(&frame.hostname, frame.port).await {
@@ -774,6 +917,7 @@ async fn open_udp_flow(
     let sock_recv = sock.clone();
     let cancel_recv = cancel.clone();
     let dgram_send_recv = dgram_send.clone();
+    let recv_limits = limits;
     let max_age = std::time::Duration::from_millis(max_age_ms);
     let recv_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65_536];
@@ -792,6 +936,18 @@ async fn open_udp_flow(
                             return;
                         }
                     };
+                    // Meter the upstream->client datagram direction.
+                    match recv_limits.datagram_decision(n as u64) {
+                        DatagramDecision::Allow => {}
+                        DatagramDecision::Drop => {
+                            debug!(flow_id, bytes = n, "wisp: upstream->client datagram dropped: rate limit");
+                            continue;
+                        }
+                        DatagramDecision::Close => {
+                            debug!(flow_id, "wisp: upstream->client datagram rate sustained-exceeded; closing flow");
+                            return;
+                        }
+                    }
                     // Default class for upstream→client UDP is NORMAL.
                     // Heuristic upgrades (DNS = INTERACTIVE, etc.) can land
                     // on top later.

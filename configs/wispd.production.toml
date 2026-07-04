@@ -4,10 +4,12 @@ wisp_version = "v2"
 [wisp.destination]
 port_whitelist    = [80, 443]
 
+# The distributed Redis limiter is not implemented yet; "redis" is rejected at
+# startup. Use "memory" (per-instance) until it lands. Behind a load balancer,
+# per-IP/global limits are enforced per instance, not shared across the fleet.
 [wisp.rate_limit]
-backend       = "redis"
-redis_url     = "redis://127.0.0.1:6379/0"
-redis_fail_open = true
+backend       = "memory"
+redis_fail_open = false
 
 [wisp_websocket]
 enabled               = true

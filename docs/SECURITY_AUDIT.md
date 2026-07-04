@@ -35,69 +35,71 @@ panic-reachability review mattered; it came back clean for network input.
 - **Dead code removed.** `StreamState` / `TcpStreamResult` placeholder `()` aliases
   in `wisp-wisp-server` and their re-export.
 
-## Open findings — prioritized (need design decisions, not yet changed)
+## Second pass — previously-open findings now fixed
 
-These are real but touch core networking behavior or advertise config surface
-that isn't implemented; they warrant deliberate fixes rather than an autonomous
-rewrite.
+All of the findings below were addressed in a follow-up pass.
 
 ### Critical
 
-1. **SSRF on the WS transport's no-proxy fallback.** `wisp-wisp-server`
-   `stream.rs`/`udp.rs` call `TcpStream::connect((host, port))` /
-   `UdpSocket::connect((host, port))` directly. `HostPolicy::check` only runs
-   `check_ip` when `host` parses as a literal IP, so a **hostname** resolving to
-   `127.0.0.1` / `169.254.169.254` / RFC-1918 bypasses `allow_private_ips` /
-   `allow_loopback_ips`. The WT/QUIC path is safe (it goes through
-   `TcpConnector`/`UdpConnector`, which resolve and `check_ip` every address).
-   Fix: route the WS fallback through the same resolver + per-address `check_ip`
-   (and consider DNS-rebinding TOCTOU: check the exact IP you then connect to).
+1. **SSRF on the WS transport's no-proxy fallback — FIXED.** `wisp-wisp-server`
+   `stream.rs`/`udp.rs` no longer connect by hostname. A new `resolve_checked`
+   helper resolves via `tokio::net::lookup_host`, gates **every** resolved
+   address through `HostPolicy::check_ip`, and rejects the whole connection if
+   any address is disallowed (closing the DNS-rebinding public+private mix), then
+   connects to the checked address.
 
-2. **TCP/UDP/DNS rate limiters are never called on the WT/QUIC path.**
-   `is_tcp_stream_open_allowed`, `is_tcp_bytes_allowed`, `datagram_limit_decision`,
-   and `is_dns_resolution_allowed` are wired only in `wisp-wisp-server` (WS). On
-   the WT path (`serve.rs` `bridge_one_stream` / `open_udp_flow`) a single
-   connection can open unlimited TCP streams and push unlimited bytes. Only
-   `is_connection_start_allowed` and `is_control_message_allowed` are enforced.
+2. **TCP/UDP/DNS rate limiters wired on both transports — FIXED.**
+   `is_tcp_stream_open_allowed` + `is_dns_resolution_allowed` gate stream opens
+   (WS `connection.rs`; WT `bridge_one_stream` via `SessionLimits`).
+   `is_tcp_bytes_allowed` meters both byte-pump directions (WS `stream.rs`; WT
+   `bridge_one_stream`) — on sustained over-budget the stream is closed (dropping
+   TCP bytes would corrupt the stream; a sleep-shaper is disallowed by project
+   rules). `datagram_limit_decision` now runs on both UDP directions on both
+   transports.
 
-3. **`max_connections` / `max_connections_per_ip` are not enforced as concurrency
-   caps.** No live-connection counter exists; `max_connections` only maps to h3's
-   per-connection `max_webtransport_sessions`. ws-h2 / ws-plain accept loops
-   `tokio::spawn` a handler per TCP accept with no admission control (ws-h2 pays a
-   full TLS handshake first; ws-plain also skips the Origin check that the other
-   transports enforce).
+3. **`max_connections` / `max_connections_per_ip` enforced as concurrency caps —
+   FIXED.** New `wisp_dos::ConnectionLimiter` (+ `global_connection_limiter()`)
+   tracks live connections globally and per normalized IP and returns an RAII
+   `ConnectionGuard` that releases on every exit path. Acquired at admission on
+   ws-h2, ws-plain, and WT. ws-plain also gained the **Origin** check it was
+   missing, and both WS listeners now gate the connection-start rate.
 
-4. **Per-IP DoS keys use the unmasked /128 IPv6 address.** `wisp-iphash` already
-   masks IPv6 to /64 for the client hash, but DoS bucket keys use the raw address,
-   so /64 rotation defeats every per-IP limit. Route the DoS key through the same
-   /64 normalization.
+4. **Per-IP DoS keys masked to /64 — FIXED.** All per-IP keys in `wisp-dos` now
+   run through `dos_ip_key` (→ `wisp_iphash::normalize_client_ip`), so IPv6 /64
+   rotation no longer mints unlimited buckets. A `MAX_BUCKETS` LRU cap also bounds
+   total map growth.
 
-5. **`rate_limit.backend = "redis"` and `parse_real_ip*` are parsed but not
-   implemented.** The shipped `configs/wispd.production.toml` sets `backend =
-   "redis"` (implying shared limits across instances) and the example advertises
-   `parse_real_ip` / `parse_real_ip_from`. Neither is wired: every instance uses a
-   private in-memory limiter, and `client_ip` is always the raw socket peer (so a
-   reverse-proxied deployment collapses all clients to the proxy IP). Either
-   implement them or fail config validation and drop the dead surface.
+5. **Redis backend + `parse_real_ip` — FIXED.** `WispServerOptions::validate`
+   now rejects `rate_limit.backend = "redis"` (not implemented) instead of
+   silently falling back; the shipped production config was switched to `memory`.
+   `wisp_config::resolve_client_ip` implements trusted-hop `X-Forwarded-For`
+   resolution (only trusts the header when the direct peer is within
+   `parse_real_ip_from`, walking the chain right-to-left), wired into ws-h2,
+   ws-plain (WT already resolves the peer directly).
 
 ### High
 
-- **No idle/read timeouts on the WT path.** `handshake_timeout_ms` and
-  `stream_idle_timeout_ms` are unused for WT control/handshake and TCP bridge
-  streams; `bridge_one_stream`'s header read has no timeout. Slow-resource-pinning.
-- **Unbounded concurrent UDP flows per WT connection.** `serve.rs`
-  `UdpFlowRegistry` has no cap; the WS side's `StreamCaps` does. Add an equivalent.
-- **Client→upstream UDP is unmetered by the datagram limiter** (WS `udp.rs`);
-  `datagram_limit_decision` runs only on the reply direction.
+- **WT timeouts — FIXED.** `bridge_one_stream` bounds the header read by
+  `handshake_timeout_ms` and both TCP pumps by `stream_idle_timeout_ms`.
+- **WT concurrent UDP-flow cap — FIXED.** `on_udp_open` rejects once live flows
+  reach `stream_limit_total`.
+- **Client→upstream UDP metering — FIXED** on both transports.
 
 ### Medium / defensive
 
-- No `catch_unwind` around msquic callback closures. `panic = "abort"` makes this
-  a clean process abort today, but debug/test builds unwind across the `extern "C"`
-  trampoline. Wrap callback bodies in `catch_unwind(AssertUnwindSafe(..))` to turn
-  a per-connection panic into a per-connection failure.
-- Raw msquic `HQUIC` pointer used as an eternal `DashMap` key (ABA/handle-reuse
-  hazard under high stream churn). Prefer keying by the msquic stream id.
-- `DosGuard` bucket map is bounded only by a coarse periodic sweep; add an LRU cap.
-- `redis_fail_open = true` in shipped configs will fail-open once Redis is wired.
-- Port `0` is not explicitly rejected by policy (OS rejects at connect time).
+- **`catch_unwind` around msquic callbacks — FIXED** (connection + stream
+  callbacks); panics are logged and swallowed instead of crossing the FFI
+  boundary.
+- **msquic stream registry keyed by QUIC stream id — FIXED** (was the raw
+  `HQUIC` pointer; ids are never reused within a connection).
+- **`DosGuard` LRU cap — FIXED** (`MAX_BUCKETS`).
+- **`redis_fail_open` — FIXED** in the shipped production config (now `false`;
+  moot anyway since `redis` is rejected at validation).
+- **Port `0` explicitly rejected — FIXED** in `HostPolicy::check`.
+
+### Remaining follow-up (deliberately not done)
+
+- **Distributed Redis rate-limit backend is still unimplemented** — it now fails
+  loud at config validation rather than silently under-protecting. Implementing
+  the shared limiter (atomic Lua token buckets, connection pooling) is a feature,
+  not a safety fix, and is left for when horizontal scaling is actually needed.

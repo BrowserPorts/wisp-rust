@@ -2478,6 +2478,7 @@ dependencies = [
  "dashmap",
  "parking_lot",
  "wisp-config",
+ "wisp-iphash",
 ]
 
 [[package]]
@@ -2612,7 +2613,9 @@ dependencies = [
  "tokio-websockets",
  "tracing",
  "wisp-config",
+ "wisp-dos",
  "wisp-iphash",
+ "wisp-origin",
  "wisp-wisp-server",
  "wisp-ws-h2",
 ]

@@ -13,6 +13,8 @@ use hyper::ext::Protocol;
 use hyper_util::rt::TokioIo;
 use tokio_websockets::{Limits, Message, ServerBuilder};
 use tracing::{debug, warn};
+use wisp_config::resolve_client_ip;
+use wisp_dos::{global_connection_limiter, global_guard, is_connection_start_allowed};
 use wisp_origin::{is_origin_allowed, origin_from_headers, policy_headers};
 use wisp_wisp_server::{serve_connection, ServerContext, WispMessage};
 
@@ -55,6 +57,31 @@ pub(crate) async fn handle_request(
         return Ok(origin_denied_response(origin.as_deref(), &view));
     }
 
+    // Resolve the real client IP (trusted X-Forwarded-For), then gate on the
+    // connection-start rate and live-connection concurrency caps before the
+    // upgrade / per-connection work.
+    let xff = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let client_ip = resolve_client_ip(&client_ip, xff, &view.options);
+    let store = global_guard();
+    if !is_connection_start_allowed(&client_ip, &view.options, &store) {
+        debug!(client_ip = %client_ip, "ws-h2: rejecting: connection-start rate");
+        return Ok(status(StatusCode::TOO_MANY_REQUESTS));
+    }
+    let conn_guard = match global_connection_limiter().try_acquire(
+        &client_ip,
+        view.options.max_connections,
+        view.options.max_connections_per_ip,
+    ) {
+        Some(g) => g,
+        None => {
+            debug!(client_ip = %client_ip, "ws-h2: rejecting: connection concurrency cap");
+            return Ok(status(StatusCode::TOO_MANY_REQUESTS));
+        }
+    };
+
     let client_advertises_v2 = req
         .headers()
         .get_all("sec-websocket-protocol")
@@ -81,6 +108,8 @@ pub(crate) async fn handle_request(
         .saturating_add(1024);
 
     tokio::spawn(async move {
+        // Hold the connection slot for the whole session; drops on task exit.
+        let _conn_guard = conn_guard;
         let upgraded = match on_upgrade.await {
             Ok(u) => u,
             Err(e) => {

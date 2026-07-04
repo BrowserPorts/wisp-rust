@@ -14,6 +14,8 @@ wisp-ws-h2 = { path = "../wisp-ws-h2" }
 # build, which is a hard requirement for the QUIC side but slows
 # WS-side iteration. They re-attach here when that task unblocks.
 wisp-iphash = { path = "../wisp-iphash" }
+wisp-origin = { path = "../wisp-origin" }
+wisp-dos = { path = "../wisp-dos" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

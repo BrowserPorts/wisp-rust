@@ -43,7 +43,10 @@ use thiserror::Error;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use wisp_config::{WispServerOptions, WispVersion};
-use wisp_dos::{global_guard, ConnectionDosGuard, DosGuard};
+use wisp_dos::{
+    global_guard, is_dns_resolution_allowed, is_tcp_stream_open_allowed, ConnectionDosGuard,
+    DosGuard,
+};
 use wisp_proxy::HostPolicy;
 use wisp_wisp::{
     close_reason, encode_close, encode_continue, encode_info, extension_id,
@@ -1012,8 +1015,50 @@ async fn handle_packet(
                     return Err(ServerError::StreamCollision(conn.stream_id));
                 }
             }
+            let needs_dns = conn.hostname.parse::<std::net::IpAddr>().is_err();
+            let dns_allowed = !needs_dns
+                || is_dns_resolution_allowed(
+                    &ctx.client_ip,
+                    &conn.hostname,
+                    &ctx.options,
+                    &ctx.dos_store,
+                );
+            if !dns_allowed {
+                tracing::info!(
+                    stream_id = conn.stream_id,
+                    host = %conn.hostname,
+                    "wisp connect rejected: dns resolution rate limit"
+                );
+                let _ = egress
+                    .send(WispMessage::Binary(encode_close(
+                        conn.stream_id,
+                        close_reason::CONN_THROTTLED,
+                    )))
+                    .await;
+                return Ok(());
+            }
             match conn.stream_type {
                 stream_type::TCP if ctx.server_options.allow_tcp_streams => {
+                    if !is_tcp_stream_open_allowed(
+                        &ctx.client_ip,
+                        &ctx.conn_dos,
+                        &ctx.options,
+                        &ctx.dos_store,
+                    ) {
+                        tracing::info!(
+                            stream_id = conn.stream_id,
+                            host = %conn.hostname,
+                            port = conn.port,
+                            "wisp tcp connect rejected: stream-open rate limit"
+                        );
+                        let _ = egress
+                            .send(WispMessage::Binary(encode_close(
+                                conn.stream_id,
+                                close_reason::CONN_THROTTLED,
+                            )))
+                            .await;
+                        return Ok(());
+                    }
                     if let Err(reason) = caps.try_admit(conn.stream_id, &conn.hostname, conn.port) {
                         tracing::info!(
                             stream_id = conn.stream_id,

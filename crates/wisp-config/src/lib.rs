@@ -1312,8 +1312,106 @@ impl WispServerOptions {
                 "wisp.protocol_inspection.max_bytes must be > 0 when inspection is enabled".into(),
             ));
         }
+        if matches!(self.rate_limit_backend, RateLimitBackend::Redis) {
+            // The distributed Redis limiter is not implemented yet. Failing here
+            // is deliberate: silently falling back to a per-process in-memory
+            // limiter would multiply every "shared" limit by the instance count
+            // behind a load balancer. Use "memory" or "auto" until it lands.
+            return Err(ConfigError::Validate(
+                "wisp.rate_limit.backend=redis is not implemented; use \"memory\" or \"auto\"".into(),
+            ));
+        }
         Ok(())
     }
+}
+
+/// Resolve the effective client IP from the direct socket peer and an optional
+/// `X-Forwarded-For` header, honoring `parse_real_ip` / `parse_real_ip_from`.
+///
+/// The header is trusted only when the direct peer is itself within one of the
+/// `parse_real_ip_from` trusted-proxy CIDRs; otherwise the raw peer is returned
+/// (a client cannot spoof its IP by sending the header directly). When trusted,
+/// the chain is walked right-to-left and the first hop that is not itself a
+/// trusted proxy is taken as the real client.
+pub fn resolve_client_ip(
+    peer_ip: &str,
+    forwarded_for: Option<&str>,
+    opts: &WispServerOptions,
+) -> String {
+    use std::net::IpAddr;
+    if !opts.parse_real_ip {
+        return peer_ip.to_owned();
+    }
+    let Some(xff) = forwarded_for else {
+        return peer_ip.to_owned();
+    };
+    let Ok(peer) = peer_ip.parse::<IpAddr>() else {
+        return peer_ip.to_owned();
+    };
+    if !ip_in_trusted(peer, &opts.parse_real_ip_from) {
+        return peer_ip.to_owned();
+    }
+    let chain: Vec<IpAddr> = xff
+        .split(',')
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .collect();
+    for ip in chain.iter().rev() {
+        if !ip_in_trusted(*ip, &opts.parse_real_ip_from) {
+            return ip.to_string();
+        }
+    }
+    chain
+        .first()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| peer_ip.to_owned())
+}
+
+fn ip_in_trusted(ip: std::net::IpAddr, cidrs: &[String]) -> bool {
+    cidrs.iter().any(|c| cidr_contains(c, ip))
+}
+
+fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let cidr = cidr.trim();
+    if cidr.is_empty() {
+        return false;
+    }
+    let (addr_s, prefix_s) = cidr.split_once('/').unwrap_or((cidr, ""));
+    let Ok(net) = addr_s.trim().parse::<IpAddr>() else {
+        return false;
+    };
+    match (net.to_canonical(), ip.to_canonical()) {
+        (IpAddr::V4(n), IpAddr::V4(c)) => {
+            let prefix = parse_prefix(prefix_s, 32);
+            match prefix {
+                Some(p) => prefix_match(u128::from(u32::from(n)), u128::from(u32::from(c)), p, 32),
+                None => false,
+            }
+        }
+        (IpAddr::V6(n), IpAddr::V6(c)) => {
+            let prefix = parse_prefix(prefix_s, 128);
+            match prefix {
+                Some(p) => prefix_match(u128::from(n), u128::from(c), p, 128),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn parse_prefix(prefix_s: &str, max: u8) -> Option<u8> {
+    if prefix_s.is_empty() {
+        return Some(max);
+    }
+    prefix_s.parse::<u8>().ok().filter(|p| *p <= max)
+}
+
+fn prefix_match(net: u128, cand: u128, prefix: u8, total: u8) -> bool {
+    if prefix == 0 {
+        return true;
+    }
+    let shift = u32::from(total - prefix);
+    (net >> shift) == (cand >> shift)
 }
 
 pub fn validate_wisp_version_with_proxy_control(
@@ -1345,6 +1443,45 @@ mod tests {
         assert_eq!(o.parse_real_ip_from, vec!["127.0.0.1", "::1"]);
         assert_eq!(o.max_session_hops, Some(16));
         assert_eq!(o.rate_limit_backend, RateLimitBackend::Auto);
+    }
+
+    #[test]
+    fn resolve_client_ip_trust_boundary() {
+        let mut o = WispServerOptions {
+            parse_real_ip: true,
+            parse_real_ip_from: vec!["10.0.0.0/8".to_owned(), "127.0.0.1".to_owned()],
+            ..Default::default()
+        };
+
+        // Untrusted direct peer: header ignored, peer wins (no spoofing).
+        assert_eq!(
+            resolve_client_ip("203.0.113.9", Some("1.2.3.4"), &o),
+            "203.0.113.9"
+        );
+        // Trusted proxy: rightmost untrusted hop is the real client.
+        assert_eq!(
+            resolve_client_ip("10.1.2.3", Some("1.2.3.4, 10.9.9.9"), &o),
+            "1.2.3.4"
+        );
+        // No header: peer wins.
+        assert_eq!(resolve_client_ip("10.1.2.3", None, &o), "10.1.2.3");
+        // Disabled: peer wins even with a header from a trusted hop.
+        o.parse_real_ip = false;
+        assert_eq!(
+            resolve_client_ip("10.1.2.3", Some("1.2.3.4"), &o),
+            "10.1.2.3"
+        );
+    }
+
+    #[test]
+    fn redis_backend_rejected_by_validate() {
+        let mut o = WispServerOptions {
+            rate_limit_backend: RateLimitBackend::Redis,
+            ..Default::default()
+        };
+        assert!(o.validate().is_err());
+        o.rate_limit_backend = RateLimitBackend::Memory;
+        assert!(o.validate().is_ok());
     }
 
     #[test]

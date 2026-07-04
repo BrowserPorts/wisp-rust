@@ -87,6 +87,9 @@ impl HostPolicy {
     }
 
     pub fn check(&self, host: &str, port: u16) -> Result<(), ProxyError> {
+        if port == 0 {
+            return Err(ProxyError::PortBlocked(0));
+        }
         if self.port_blacklist.contains(&port) {
             return Err(ProxyError::PortBlocked(port));
         }

@@ -10,17 +10,62 @@
 //! inside of wisp-wisp as well."
 
 use bytes::{Bytes, BytesMut};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::warn;
+use wisp_dos::is_tcp_bytes_allowed;
 use wisp_inspect::{inspect, BlockReason, InspectionDecision};
+use wisp_proxy::HostPolicy;
 use wisp_wisp::{close_reason, encode_close, encode_continue, encode_data_owned};
 
 use crate::connection::{ServerContext, WispMessage};
+
+/// Resolve `host:port` and gate every resolved address through the connection
+/// policy. Returns the allowed addresses, or an error string if resolution
+/// fails or *any* resolved address is disallowed. Rejecting when any address
+/// fails (rather than filtering) closes the DNS-rebinding hole where a hostname
+/// returns a mix of a public and a private/loopback record: the WS transport
+/// used to connect by hostname and never re-checked the resolved IP, so a name
+/// pointing at `127.0.0.1` / `169.254.169.254` / RFC-1918 bypassed
+/// `allow_private_ips` / `allow_loopback_ips`.
+pub(crate) async fn resolve_checked(
+    host: &str,
+    port: u16,
+    policy: &HostPolicy,
+) -> Result<Vec<SocketAddr>, String> {
+    let addrs: Vec<SocketAddr> = lookup_host((host, port))
+        .await
+        .map_err(|e| e.to_string())?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("no addresses resolved for {host}"));
+    }
+    for sa in &addrs {
+        policy.check_ip(sa.ip()).map_err(|e| e.to_string())?;
+    }
+    Ok(addrs)
+}
+
+async fn connect_checked_tcp(
+    host: &str,
+    port: u16,
+    policy: &HostPolicy,
+) -> Result<TcpStream, String> {
+    let addrs = resolve_checked(host, port, policy).await?;
+    let mut last = String::from("no address connected");
+    for sa in addrs {
+        match TcpStream::connect(sa).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
 
 #[derive(Debug)]
 pub enum TcpStreamMsg {
@@ -80,9 +125,7 @@ async fn run_stream(
         } else if ctx.options.force_proxy {
             Err("force_proxy is enabled but no proxy controller is active".to_owned())
         } else {
-            TcpStream::connect((hostname.as_str(), port))
-                .await
-                .map_err(|e| e.to_string())
+            connect_checked_tcp(&hostname, port, &ctx.policy).await
         }
     })
     .await
@@ -127,6 +170,7 @@ async fn run_stream(
     let buffer_size = ctx.server_options.buffer_size as usize;
     let continue_threshold = ctx.server_options.continue_threshold as usize;
     let reader_cancel = ctx.cancel.clone();
+    let reader_ctx = ctx.clone();
     let reader_task = tokio::spawn(async move {
         const READ_CHUNK: usize = 64 * 1024;
         let mut buf = BytesMut::with_capacity(READ_CHUNK);
@@ -148,6 +192,22 @@ async fn run_stream(
                         break;
                     }
                     Ok(n) => {
+                        if !is_tcp_bytes_allowed(
+                            &reader_ctx.client_ip,
+                            &reader_ctx.conn_dos,
+                            &reader_ctx.options,
+                            n as u64,
+                            &reader_ctx.dos_store,
+                        ) {
+                            warn!(stream_id_for_reader, "wisp tcp upstream->client byte rate exceeded, closing stream");
+                            let _ = tokio::select! {
+                                biased;
+                                _ = reader_cancel.cancelled() => Ok(()),
+                                r = egress_for_reader
+                                    .send(WispMessage::Binary(encode_close(stream_id_for_reader, close_reason::CONN_THROTTLED))) => r.map_err(|_| ()),
+                            };
+                            break;
+                        }
                         bytes_since_continue = bytes_since_continue.saturating_add(n);
                         let payload = buf.split().freeze();
                         let frame = encode_data_owned(stream_id_for_reader, payload);
@@ -200,6 +260,21 @@ async fn run_stream(
         };
         match msg {
             TcpStreamMsg::Data(payload) => {
+                if !is_tcp_bytes_allowed(
+                    &ctx.client_ip,
+                    &ctx.conn_dos,
+                    &ctx.options,
+                    payload.len() as u64,
+                    &ctx.dos_store,
+                ) {
+                    warn!(stream_id, "wisp tcp client->upstream byte rate exceeded, closing stream");
+                    let _ = tokio::select! {
+                        biased;
+                        _ = ctx.cancel.cancelled() => Ok(()),
+                        r = egress.send(WispMessage::Binary(encode_close(stream_id, close_reason::CONN_THROTTLED))) => r.map_err(|_| ()),
+                    };
+                    break;
+                }
                 if let Some(ibuf) = inspection_buf.as_mut() {
                     let remaining = inspection_max.saturating_sub(ibuf.len());
                     let take = remaining.min(payload.len());

@@ -132,7 +132,11 @@ pub(crate) struct SendItem {
 // ---------------- shared connection state ---------------------------------
 
 pub(crate) struct ConnectionState {
-    streams: DashMap<usize, StreamChans>,
+    /// Keyed by the msquic-assigned QUIC stream id (monotonic and never reused
+    /// within a connection). Keying by the raw `HQUIC` pointer risked an
+    /// ABA/handle-reuse mixup: a freed stream's address could be reused by a
+    /// new stream while a stale callback for the old one was still in flight.
+    streams: DashMap<u64, StreamChans>,
     new_bidi_tx: mpsc::UnboundedSender<NewStreamEvent>,
     new_uni_tx: mpsc::UnboundedSender<NewStreamEvent>,
     datagram_tx: mpsc::UnboundedSender<Bytes>,
@@ -211,7 +215,16 @@ impl MsQuicConnection {
         let cb_max = max_datagram_size.clone();
         let cb_enabled = datagram_send_enabled.clone();
         connection.set_callback_handler(move |_conn_ref, event| {
-            on_connection_event(&cb_state, &cb_conn, &cb_max, &cb_enabled, event);
+            // Never let a panic unwind across msquic's extern "C" trampoline.
+            // Under panic=abort (release) a panic aborts anyway; in debug/test
+            // builds this converts a would-be process-wide crash into a
+            // swallowed per-connection error.
+            let hook = std::panic::AssertUnwindSafe(|| {
+                on_connection_event(&cb_state, &cb_conn, &cb_max, &cb_enabled, event);
+            });
+            if std::panic::catch_unwind(hook).is_err() {
+                tracing::error!("panic in msquic connection callback (swallowed)");
+            }
             Ok(())
         });
         Self {
@@ -397,13 +410,17 @@ fn install_stream(
         recv_tx,
         fin_notify: fin_notify.clone(),
     };
-    let key = unsafe { stream.as_raw() } as usize;
-    state.streams.insert(key, chans);
+    state.streams.insert(stream_id, chans);
 
     let cb_state = state.clone();
-    let cb_stream = stream.clone();
     stream.set_callback_handler(move |_, ev| {
-        on_stream_event(&cb_state, &cb_stream, ev);
+        // See the connection callback: never unwind across the FFI boundary.
+        let hook = std::panic::AssertUnwindSafe(|| {
+            on_stream_event(&cb_state, stream_id, ev);
+        });
+        if std::panic::catch_unwind(hook).is_err() {
+            tracing::error!(stream_id, "panic in msquic stream callback (swallowed)");
+        }
         Ok(())
     });
 
@@ -437,8 +454,7 @@ fn install_stream(
     }
 }
 
-fn on_stream_event(state: &ConnectionState, stream: &Arc<Stream>, event: StreamEvent<'_>) {
-    let key = unsafe { stream.as_raw() } as usize;
+fn on_stream_event(state: &ConnectionState, key: u64, event: StreamEvent<'_>) {
     let entry = state.streams.get(&key).map(|e| e.value().clone());
     let Some(chans) = entry else { return };
     match event {
