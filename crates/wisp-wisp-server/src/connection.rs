@@ -161,18 +161,15 @@ impl ServerOptions {
             } else {
                 Some(u32::try_from(options.stream_limit_per_host).unwrap_or(u32::MAX))
             },
-            max_tcp_stream_opens_per_connection_per_minute: options
-                .max_tcp_stream_opens_per_connection_per_minute
-                .try_into()
-                .unwrap_or(u32::MAX),
-            max_control_messages_per_connection_per_minute: options
-                .max_control_messages_per_connection_per_minute
-                .try_into()
-                .unwrap_or(u32::MAX),
-            max_binary_packets_per_connection_per_minute: options
-                .max_binary_packets_per_connection_per_minute
-                .try_into()
-                .unwrap_or(u32::MAX),
+            max_tcp_stream_opens_per_connection_per_minute: per_minute_u32(
+                options.max_tcp_stream_opens_per_connection_per_minute,
+            ),
+            max_control_messages_per_connection_per_minute: per_minute_u32(
+                options.max_control_messages_per_connection_per_minute,
+            ),
+            max_binary_packets_per_connection_per_minute: per_minute_u32(
+                options.max_binary_packets_per_connection_per_minute,
+            ),
             max_concurrent_proxy_control_handlers: usize::try_from(
                 options.max_concurrent_proxy_control_handlers,
             )
@@ -825,19 +822,7 @@ pub(crate) struct StreamCaps {
 
 impl StreamCaps {
     fn new(opts: &ServerOptions) -> Self {
-        let open_limiter = if opts.max_tcp_stream_opens_per_connection_per_minute == 0 {
-            None
-        } else {
-            let per_minute = NonZeroU32::new(opts.max_tcp_stream_opens_per_connection_per_minute)
-                .expect("nonzero rate");
-            let burst = NonZeroU32::new(opts.max_tcp_stream_opens_per_connection_per_minute.max(1))
-                .expect("nonzero burst");
-            let quota = Quota::with_period(std::time::Duration::from_secs(60))
-                .expect("nonzero period")
-                .allow_burst(burst);
-            let _ = per_minute;
-            Some(RateLimiter::direct(quota))
-        };
+        let open_limiter = build_per_minute_limiter(opts.max_tcp_stream_opens_per_connection_per_minute);
         Self {
             total: 0,
             host_counts: HashMap::new(),
@@ -1166,13 +1151,24 @@ async fn handle_packet(
     Ok(())
 }
 
+/// Normalize a per-minute limit from the u64 config space into governor's u32
+/// rate space. The `UNLIMITED` sentinel (`u64::MAX`, set via `-1` in TOML) and
+/// `0` both mean "no limiter"; any other value is clamped into `u32`.
+fn per_minute_u32(v: u64) -> u32 {
+    if v == u64::MAX {
+        return 0;
+    }
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
 fn build_per_minute_limiter(per_minute: u32) -> Option<DirectLimiter> {
     if per_minute == 0 {
         return None;
     }
-    let burst = NonZeroU32::new(per_minute.max(1)).expect("nonzero burst");
-    let quota = Quota::with_period(std::time::Duration::from_secs(60))
-        .expect("nonzero period")
-        .allow_burst(burst);
-    Some(RateLimiter::direct(quota))
+    let rate = NonZeroU32::new(per_minute).expect("nonzero rate");
+    // Quota::per_minute replenishes `rate` cells over 60s with a burst of
+    // `rate`; its window is a fixed 60s so it can't overflow governor's Nanos.
+    // (The old `with_period(60s).allow_burst(rate)` stored a 60s*rate window,
+    // which panics for large rates — "Duration is longer than 584 years".)
+    Some(RateLimiter::direct(Quota::per_minute(rate)))
 }
