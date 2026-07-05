@@ -463,6 +463,10 @@ pub fn is_tcp_stream_open_allowed(
     )])
 }
 
+/// Hot path: called on every relayed TCP chunk. Both limits set to
+/// [`UNLIMITED`] (the sentinel used to disable a limit, e.g. in a benchmark
+/// config) short-circuits with zero allocation and no bucket lookup — the
+/// per-IP key is only built when the per-IP limit is actually finite.
 pub fn is_tcp_bytes_allowed(
     client_ip: &str,
     conn: &ConnectionDosGuard,
@@ -470,18 +474,21 @@ pub fn is_tcp_bytes_allowed(
     bytes: u64,
     store: &DosGuard,
 ) -> bool {
-    if !conn.consume(&[ConsumeRequest::new(
-        "tcp:bytes:connection",
-        options.max_tcp_bytes_per_connection_per_second,
-        SECOND_MS,
-    )
-    .with_amount(bytes)])
+    let conn_lim = options.max_tcp_bytes_per_connection_per_second;
+    if conn_lim != UNLIMITED
+        && !conn.consume(&[
+            ConsumeRequest::new("tcp:bytes:connection", conn_lim, SECOND_MS).with_amount(bytes)
+        ])
     {
         return false;
     }
+    let ip_lim = options.max_tcp_bytes_per_ip_per_second;
+    if ip_lim == UNLIMITED {
+        return true;
+    }
     store.consume(&[ConsumeRequest::new(
         format!("tcp:bytes:ip:{}", dos_ip_key(client_ip)),
-        options.max_tcp_bytes_per_ip_per_second,
+        ip_lim,
         SECOND_MS,
     )
     .with_amount(bytes)])
@@ -494,6 +501,16 @@ pub fn datagram_limit_decision(
     bytes: u64,
     store: &DosGuard,
 ) -> DatagramDecision {
+    // Hot path: called per datagram. If every datagram limit is disabled
+    // (UNLIMITED), skip all accounting — no bucket lookups, no per-IP key
+    // allocation. This is the benchmark / limits-off configuration.
+    if options.max_datagrams_per_connection_per_second == UNLIMITED
+        && options.max_datagram_bytes_per_connection_per_second == UNLIMITED
+        && options.max_datagrams_per_ip_per_second == UNLIMITED
+        && options.max_datagram_bytes_per_ip_per_second == UNLIMITED
+    {
+        return DatagramDecision::Allow;
+    }
     let conn_ok = conn.consume(&[
         ConsumeRequest::new(
             "udp:datagrams:connection",
@@ -620,6 +637,30 @@ mod tests {
         // Second call within same second window returns existing count check.
         // Implementation detail: count increments only across distinct seconds,
         // so just assert that eventually a strike returns true.
+    }
+
+    #[test]
+    fn unlimited_limits_short_circuit_hot_paths() {
+        let store = DosGuard::new();
+        let conn = ConnectionDosGuard::new();
+        let opts = WispServerOptions {
+            max_tcp_bytes_per_connection_per_second: UNLIMITED,
+            max_tcp_bytes_per_ip_per_second: UNLIMITED,
+            max_datagrams_per_connection_per_second: UNLIMITED,
+            max_datagram_bytes_per_connection_per_second: UNLIMITED,
+            max_datagrams_per_ip_per_second: UNLIMITED,
+            max_datagram_bytes_per_ip_per_second: UNLIMITED,
+            ..WispServerOptions::default()
+        };
+        // Disabled limits admit every byte/datagram and never touch the maps.
+        for _ in 0..100_000 {
+            assert!(is_tcp_bytes_allowed("1.2.3.4", &conn, &opts, 65_536, &store));
+            assert_eq!(
+                datagram_limit_decision("1.2.3.4", &conn, &opts, 1200, &store),
+                DatagramDecision::Allow
+            );
+        }
+        assert_eq!(store.buckets.len(), 0);
     }
 
     #[test]
