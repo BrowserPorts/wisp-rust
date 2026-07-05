@@ -704,21 +704,25 @@ pub struct WispLimitsToml {
     pub max_text_frame_bytes: Option<u64>,
     pub max_host_bytes: Option<u64>,
     pub max_pending_packets_per_stream: Option<u64>,
-    pub max_connection_starts_per_ip_per_minute: Option<u64>,
-    pub max_connection_starts_per_minute: Option<u64>,
-    pub max_tcp_stream_opens_per_connection_per_minute: Option<u64>,
-    pub max_tcp_stream_opens_per_ip_per_minute: Option<u64>,
-    pub max_tcp_bytes_per_connection_per_second: Option<u64>,
-    pub max_tcp_bytes_per_ip_per_second: Option<u64>,
-    pub max_datagrams_per_connection_per_second: Option<u64>,
-    pub max_datagram_bytes_per_connection_per_second: Option<u64>,
-    pub max_datagrams_per_ip_per_second: Option<u64>,
-    pub max_datagram_bytes_per_ip_per_second: Option<u64>,
+    // Rate/count limits accept -1 (or any negative) to mean "unlimited",
+    // matching the TS convention; the merge maps that to the u64::MAX sentinel
+    // the DoS guard treats as no-cap. TOML integers are i64, so u64::MAX is not
+    // expressible directly — the negative sentinel is the disable knob.
+    pub max_connection_starts_per_ip_per_minute: Option<i64>,
+    pub max_connection_starts_per_minute: Option<i64>,
+    pub max_tcp_stream_opens_per_connection_per_minute: Option<i64>,
+    pub max_tcp_stream_opens_per_ip_per_minute: Option<i64>,
+    pub max_tcp_bytes_per_connection_per_second: Option<i64>,
+    pub max_tcp_bytes_per_ip_per_second: Option<i64>,
+    pub max_datagrams_per_connection_per_second: Option<i64>,
+    pub max_datagram_bytes_per_connection_per_second: Option<i64>,
+    pub max_datagrams_per_ip_per_second: Option<i64>,
+    pub max_datagram_bytes_per_ip_per_second: Option<i64>,
     pub datagram_rate_limit_strikes: Option<u64>,
     pub datagram_rate_limit_strike_window_ms: Option<u64>,
-    pub max_control_messages_per_connection_per_minute: Option<u64>,
-    pub max_control_messages_per_ip_per_minute: Option<u64>,
-    pub max_binary_packets_per_connection_per_minute: Option<u64>,
+    pub max_control_messages_per_connection_per_minute: Option<i64>,
+    pub max_control_messages_per_ip_per_minute: Option<i64>,
+    pub max_binary_packets_per_connection_per_minute: Option<i64>,
     pub max_concurrent_proxy_control_handlers: Option<u64>,
     pub proxy_control_ext_payload_max_bytes: Option<u64>,
     pub max_proxy_rules_per_connection: Option<u64>,
@@ -1061,27 +1065,37 @@ fn merge_wisp(opts: &mut WispServerOptions, t: &WispToml) {
                 }
             };
         }
+        // Rate/count limits: negative (e.g. -1) means "unlimited" -> u64::MAX,
+        // which the DoS guard treats as no-cap (and the hot-path helpers
+        // short-circuit on). Non-negative maps straight through.
+        macro_rules! set_lim {
+            ($f:ident) => {
+                if let Some(v) = l.$f {
+                    opts.$f = if v < 0 { u64::MAX } else { v as u64 };
+                }
+            };
+        }
         set!(max_connections);
         set!(max_connections_per_ip);
         set!(max_binary_frame_bytes);
         set!(max_text_frame_bytes);
         set!(max_host_bytes);
         set!(max_pending_packets_per_stream);
-        set!(max_connection_starts_per_ip_per_minute);
-        set!(max_connection_starts_per_minute);
-        set!(max_tcp_stream_opens_per_connection_per_minute);
-        set!(max_tcp_stream_opens_per_ip_per_minute);
-        set!(max_tcp_bytes_per_connection_per_second);
-        set!(max_tcp_bytes_per_ip_per_second);
-        set!(max_datagrams_per_connection_per_second);
-        set!(max_datagram_bytes_per_connection_per_second);
-        set!(max_datagrams_per_ip_per_second);
-        set!(max_datagram_bytes_per_ip_per_second);
+        set_lim!(max_connection_starts_per_ip_per_minute);
+        set_lim!(max_connection_starts_per_minute);
+        set_lim!(max_tcp_stream_opens_per_connection_per_minute);
+        set_lim!(max_tcp_stream_opens_per_ip_per_minute);
+        set_lim!(max_tcp_bytes_per_connection_per_second);
+        set_lim!(max_tcp_bytes_per_ip_per_second);
+        set_lim!(max_datagrams_per_connection_per_second);
+        set_lim!(max_datagram_bytes_per_connection_per_second);
+        set_lim!(max_datagrams_per_ip_per_second);
+        set_lim!(max_datagram_bytes_per_ip_per_second);
         set!(datagram_rate_limit_strikes);
         set!(datagram_rate_limit_strike_window_ms);
-        set!(max_control_messages_per_connection_per_minute);
-        set!(max_control_messages_per_ip_per_minute);
-        set!(max_binary_packets_per_connection_per_minute);
+        set_lim!(max_control_messages_per_connection_per_minute);
+        set_lim!(max_control_messages_per_ip_per_minute);
+        set_lim!(max_binary_packets_per_connection_per_minute);
         set!(max_concurrent_proxy_control_handlers);
         set!(proxy_control_ext_payload_max_bytes);
         set!(max_proxy_rules_per_connection);
