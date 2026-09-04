@@ -1,12 +1,12 @@
 //! Per-connection Wisp driver. Each accepted WebSocket connection
 //! (after the extended-CONNECT upgrade) becomes one [`serve_connection`]
-//! call. The driver dispatches on the resolved Wisp version (v1 or v2) BEFORE
-//! emitting any handshake bytes — v2 clients receive byte-identical wire
-//! traces to the prior v2-only behavior, while v1 clients (e.g. wisp-js
-//! without `Sec-WebSocket-Protocol: wisp-v2`) skip the v2 INFO exchange and
-//! proceed directly to the v1 CONTINUE-first stream phase. Resolution is
-//! controlled by `ServerOptions::wisp_version` (V1, V2, or Auto, where
-//! Auto inspects `ServerContext::client_advertises_v2`).
+//! call. The driver dispatches on the resolved Wisp version (v1 or v2) before
+//! emitting any handshake bytes. A client that advertises
+//! `Sec-WebSocket-Protocol: wisp-v2` takes the v2 path; a client that does
+//! not skips the v2 INFO exchange and proceeds directly to the v1
+//! CONTINUE-first stream phase. Resolution is controlled by
+//! `ServerOptions::wisp_version` (V1, V2, or Auto, where Auto inspects
+//! `ServerContext::client_advertises_v2`).
 //!
 //! In v2 mode the driver:
 //!
@@ -24,10 +24,10 @@
 //! for the simple model), CLOSE tears down a stream, INFO is a protocol
 //! error after the initial handshake. Text-frame payloads on stream 0 are
 //! routed to the proxy-control handler when
-//! [`extension_id::STELLITE_PROXY_CONTROL`] is negotiated (v2 only).
+//! [`extension_id::WISP_PROXY_CONTROL`] is negotiated (v2 only).
 //!
 //! The TCP stream-open path runs [`wisp_inspect::inspect`] before
-//! upstream bytes flow, mirroring the existing WT server.
+//! upstream bytes flow.
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -40,16 +40,16 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use wisp_config::{WispServerOptions, WispVersion};
 use wisp_dos::{
-    global_guard, is_dns_resolution_allowed, is_tcp_stream_open_allowed, ConnectionDosGuard,
-    DosGuard,
+    is_dns_resolution_allowed, is_tcp_stream_open_allowed, ConnectionDosGuard, DosGuard,
+    TcpByteLimiter,
 };
 use wisp_proxy::HostPolicy;
 use wisp_wisp::{
-    close_reason, encode_close, encode_continue, encode_info, extension_id,
+    close_reason, encode_close, encode_continue, encode_info, extension_id, packet_type,
     parse_extensions_capped, parse_packet, stream_type, ExtensionEntry, WispError, WispPacket,
     DEFAULT_MAX_EXTENSION_ENTRIES,
 };
@@ -58,17 +58,92 @@ type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 const WISP_MAJOR_VERSION: u8 = 2;
 
-use crate::proxy_control::{handle_proxy_control_text, ProxyControlLimits, ProxyController};
-use crate::stream::{spawn_tcp_stream, StreamHandle, TcpStreamMsg};
+use crate::proxy_control::{
+    handle_proxy_control_text, proxy_control_error_frame, ProxyControlLimits, ProxyController,
+};
+use crate::stream::{
+    activate_writer, drop_slot, spawn_tcp_connect, write_upstream, StreamTable, TcpEvent,
+    TcpStreamSlot, WriteOutcome,
+};
 use crate::udp::{spawn_udp_stream, UdpStreamMsg};
 
 /// Tagged WS-frame envelope. The transport layer (H2 or H3 + tokio-websockets)
 /// preserves the binary/text distinction so the server can route text frames
-/// to STELLITE_PROXY_CONTROL while keeping binary on the Wisp v2 codec path.
+/// to WISP_PROXY_CONTROL while keeping binary on the Wisp v2 codec path.
 #[derive(Debug, Clone)]
 pub enum WispMessage {
     Binary(Bytes),
     Text(String),
+}
+
+struct BudgetedMessage {
+    message: WispMessage,
+    permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+pub(crate) struct EgressSender {
+    tx: mpsc::Sender<BudgetedMessage>,
+    flow_tx: mpsc::Sender<BudgetedMessage>,
+    budget: Arc<Semaphore>,
+}
+
+impl EgressSender {
+    fn new(
+        tx: mpsc::Sender<BudgetedMessage>,
+        flow_tx: mpsc::Sender<BudgetedMessage>,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            tx,
+            flow_tx,
+            budget: Arc::new(Semaphore::new(max_bytes)),
+        }
+    }
+
+    fn channel(&self, message: &WispMessage) -> &mpsc::Sender<BudgetedMessage> {
+        match message {
+            WispMessage::Binary(bytes) if bytes.first() == Some(&packet_type::CONTINUE) => {
+                &self.flow_tx
+            }
+            _ => &self.tx,
+        }
+    }
+
+    fn message_cost(message: &WispMessage) -> Option<u32> {
+        let bytes = match message {
+            WispMessage::Binary(bytes) => bytes.len(),
+            WispMessage::Text(text) => text.len(),
+        };
+        u32::try_from(bytes.max(1)).ok()
+    }
+
+    pub(crate) async fn send(&self, message: WispMessage) -> Result<(), ()> {
+        let permits = Self::message_cost(&message).ok_or(())?;
+        let permit = self
+            .budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| ())?;
+        self.channel(&message)
+            .send(BudgetedMessage { message, permit })
+            .await
+            .map_err(|_| ())
+    }
+
+    #[cfg(test)]
+    fn try_send(&self, message: WispMessage) -> Result<(), ()> {
+        let permits = Self::message_cost(&message).ok_or(())?;
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map_err(|_| ())?;
+        self.channel(&message)
+            .try_send(BudgetedMessage { message, permit })
+            .map_err(|_| ())
+    }
 }
 
 impl WispMessage {
@@ -80,12 +155,24 @@ impl WispMessage {
     }
 }
 
+/// Transport-side failure. Distinct from protocol errors so callers match
+/// [`ServerError::Transport`] instead of scraping a `String`.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct TransportError(Box<str>);
+
+impl TransportError {
+    pub fn new(err: impl std::fmt::Display) -> Self {
+        Self(err.to_string().into_boxed_str())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("client transport closed")]
     ClientClosed,
     #[error("client transport error: {0}")]
-    Transport(String),
+    Transport(#[source] TransportError),
     #[error("wisp protocol error: {0}")]
     Protocol(#[from] WispError),
     #[error("initial INFO packet missing or invalid")]
@@ -96,10 +183,15 @@ pub enum ServerError {
     ProtocolViolation(&'static str),
 }
 
-/// Per-connection server options. Mirrors the subset of
-/// [`WispServerOptions`] that affects the WS conversation. There is no
-/// MOTD field — MOTD is intentionally omitted from wisp-wt-rust as dead
-/// weight from the bun reference; it will never be emitted or honored.
+impl ServerError {
+    fn transport(err: impl std::fmt::Display) -> Self {
+        ServerError::Transport(TransportError::new(err))
+    }
+}
+
+/// Per-connection server options. Projects the subset of
+/// [`WispServerOptions`] that affects the WS conversation. There is
+/// deliberately no MOTD field — it is never emitted or honored.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     pub buffer_size: u32,
@@ -108,22 +200,20 @@ pub struct ServerOptions {
     pub allow_tcp_streams: bool,
     pub proxy_control_enabled: bool,
     /// Cap on per-packet payload bytes (defends against gigantic frames).
-    /// Matches `WispServerOptions::max_binary_frame_bytes`.
     pub max_binary_frame_bytes: u32,
     pub max_text_frame_bytes: u32,
-    /// Audit-3 fix #63: hard cap on total concurrent streams (TCP+UDP)
-    /// per WebSocket connection. 0 disables the cap.
+    pub handshake_timeout_ms: u64,
+    /// Hard cap on total concurrent streams (TCP+UDP) per WebSocket
+    /// connection. 0 disables the cap.
     pub stream_limit_total: u32,
-    /// Audit-3 fix #63: cap on concurrent streams per upstream host:port
-    /// key. `None` (i.e. configured value < 0) disables the per-host cap.
+    /// Cap on concurrent streams per upstream host:port key. `None`
+    /// (configured value < 0) disables the per-host cap.
     pub stream_limit_per_host: Option<u32>,
-    /// Audit-3 fix #63: ceiling on stream-open events per minute per
-    /// connection. 0 disables.
+    /// Ceiling on stream-open events per minute per connection. 0 disables.
     pub max_tcp_stream_opens_per_connection_per_minute: u32,
-    /// Audit-3 fix #67: ceiling on incoming text (proxy_control) frames
-    /// parsed per minute per connection. Kicks in BEFORE
-    /// `serde_json::from_str` so an attacker cannot force the parser at
-    /// line speed. 0 disables.
+    /// Ceiling on incoming text (proxy_control) frames parsed per minute per
+    /// connection. Enforced before `serde_json::from_str` so an attacker
+    /// cannot force the parser at line speed. 0 disables.
     pub max_control_messages_per_connection_per_minute: u32,
     pub max_binary_packets_per_connection_per_minute: u32,
     pub max_concurrent_proxy_control_handlers: usize,
@@ -141,8 +231,7 @@ pub struct ServerOptions {
 impl ServerOptions {
     /// Project the WS-relevant subset of [`WispServerOptions`] into the
     /// per-connection runtime view. `proxy_control_enabled` is passed in
-    /// separately because [`WispServerOptions`] does not yet expose it
-    /// (task #41 wires it through TOML).
+    /// separately because [`WispServerOptions`] does not expose it.
     pub fn from_wisp(options: &WispServerOptions, proxy_control_enabled: bool) -> Self {
         Self {
             buffer_size: options.buffer_size.try_into().unwrap_or(u32::MAX),
@@ -155,6 +244,7 @@ impl ServerOptions {
                 .try_into()
                 .unwrap_or(u32::MAX),
             max_text_frame_bytes: options.max_text_frame_bytes.try_into().unwrap_or(u32::MAX),
+            handshake_timeout_ms: options.handshake_timeout_ms.unwrap_or(10_000).max(1),
             stream_limit_total: options.stream_limit_total.try_into().unwrap_or(u32::MAX),
             stream_limit_per_host: if options.stream_limit_per_host < 0 {
                 None
@@ -217,7 +307,7 @@ pub struct ServerContext {
     pub client_hash: Option<String>,
     pub options: Arc<WispServerOptions>,
     pub server_options: Arc<ServerOptions>,
-    /// Per-process proxy controller. `None` when STELLITE_PROXY_CONTROL is
+    /// Per-process proxy controller. `None` when WISP_PROXY_CONTROL is
     /// not configured at the runtime layer; the negotiation falls back to
     /// "advertise but not active" and text frames are dropped.
     pub proxy_controller: Option<Arc<ProxyController>>,
@@ -231,6 +321,7 @@ pub struct ServerContext {
     pub policy: Arc<HostPolicy>,
     pub dos_store: Arc<DosGuard>,
     pub conn_dos: Arc<ConnectionDosGuard>,
+    pub tcp_byte_limiter: Arc<TcpByteLimiter>,
     /// Per-connection cancellation token. Cloned into every spawned stream /
     /// UDP-flow task so their blocking reads can wake on connection
     /// shutdown instead of waiting on a closed channel that the kernel
@@ -252,8 +343,13 @@ impl ServerContext {
         server_options: Arc<ServerOptions>,
         proxy_controller: Option<Arc<ProxyController>>,
         client_advertises_v2: bool,
+        dos_store: Arc<DosGuard>,
     ) -> Self {
         let policy = Arc::new(HostPolicy::from_options(&options));
+        let conn_dos = Arc::new(ConnectionDosGuard::new());
+        let tcp_byte_limiter = Arc::new(TcpByteLimiter::new(
+            &client_ip, &conn_dos, &options, &dos_store,
+        ));
         Self {
             client_ip,
             client_hash,
@@ -262,10 +358,16 @@ impl ServerContext {
             proxy_controller,
             client_advertises_v2,
             policy,
-            dos_store: global_guard(),
-            conn_dos: Arc::new(ConnectionDosGuard::new()),
+            dos_store,
+            conn_dos,
+            tcp_byte_limiter,
             cancel: CancellationToken::new(),
         }
+    }
+
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 }
 
@@ -286,16 +388,16 @@ where
     TxErr: std::fmt::Display + Send + 'static,
     RxErr: std::fmt::Display + Send,
 {
-    // Audit fix #6: derive proxy_control activation from both the
-    // deployer-level flag AND the actual controller wiring. A
-    // misconfigured deployment (flag on, no providers registered) would
-    // otherwise advertise the extension AND accept negotiation but then
-    // silently drop every text frame — the client thinks it has
-    // proxy_control but no implementation runs.
     let proxy_control_active =
         ctx.server_options.proxy_control_enabled && ctx.proxy_controller.is_some();
 
-    let (egress_tx, mut egress_rx) = mpsc::channel::<WispMessage>(4096);
+    let (egress_raw_tx, mut egress_rx) = mpsc::channel::<BudgetedMessage>(4096);
+    let (flow_egress_tx, mut flow_egress_rx) = mpsc::channel::<BudgetedMessage>(512);
+    let egress_tx = EgressSender::new(
+        egress_raw_tx,
+        flow_egress_tx,
+        usize::try_from(ctx.options.max_egress_queue_bytes).unwrap_or(u32::MAX as usize),
+    );
 
     let (control_egress_tx, mut control_egress_rx) = mpsc::channel::<String>(8);
     let control_concurrency = Arc::new(Semaphore::new(
@@ -307,26 +409,42 @@ where
     let egress_writer_cancel = ctx.cancel.clone();
     let egress_writer = tokio::spawn(async move {
         let mut main_closed = false;
+        let mut flow_closed = false;
         let mut ctl_closed = false;
-        let mut batch: Vec<WispMessage> = Vec::with_capacity(64);
-        while !(main_closed && ctl_closed) {
+        let mut batch: Vec<(WispMessage, Option<OwnedSemaphorePermit>)> = Vec::with_capacity(64);
+        let mut flushed_permits: Vec<OwnedSemaphorePermit> = Vec::with_capacity(64);
+        while !(main_closed && flow_closed && ctl_closed) {
             let first = tokio::select! {
                 biased;
                 _ = egress_writer_cancel.cancelled() => break,
+                msg = flow_egress_rx.recv(), if !flow_closed => match msg {
+                    Some(m) => Some((m.message, Some(m.permit))),
+                    None => { flow_closed = true; continue; }
+                },
                 msg = egress_rx.recv(), if !main_closed => match msg {
-                    Some(m) => Some(m),
+                    Some(m) => Some((m.message, Some(m.permit))),
                     None => { main_closed = true; continue; }
                 },
                 text = control_egress_rx.recv(), if !ctl_closed => match text {
-                    Some(t) => Some(WispMessage::Text(t)),
+                    Some(t) => Some((WispMessage::Text(t), None)),
                     None => { ctl_closed = true; continue; }
                 },
             };
             let Some(m) = first else { continue };
             batch.push(m);
             while batch.len() < 64 {
+                match flow_egress_rx.try_recv() {
+                    Ok(m) => batch.push((m.message, Some(m.permit))),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        flow_closed = true;
+                        break;
+                    }
+                }
+            }
+            while batch.len() < 64 {
                 match egress_rx.try_recv() {
-                    Ok(m) => batch.push(m),
+                    Ok(m) => batch.push((m.message, Some(m.permit))),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         main_closed = true;
@@ -337,7 +455,7 @@ where
             if batch.len() < 64 && !ctl_closed {
                 while batch.len() < 64 {
                     match control_egress_rx.try_recv() {
-                        Ok(t) => batch.push(WispMessage::Text(t)),
+                        Ok(t) => batch.push((WispMessage::Text(t), None)),
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                             ctl_closed = true;
@@ -346,19 +464,23 @@ where
                     }
                 }
             }
-            for m in batch.drain(..) {
+            for (m, permit) in batch.drain(..) {
                 if let Err(e) = outgoing.feed(m).await {
-                    return Err(e.to_string());
+                    return Err(ServerError::transport(e));
+                }
+                if let Some(permit) = permit {
+                    flushed_permits.push(permit);
                 }
             }
             if let Err(e) = outgoing.flush().await {
-                return Err(e.to_string());
+                return Err(ServerError::transport(e));
             }
+            flushed_permits.clear();
         }
         if let Err(e) = outgoing.close().await {
-            return Err(e.to_string());
+            return Err(ServerError::transport(e));
         }
-        Ok::<(), String>(())
+        Ok::<(), ServerError>(())
     });
 
     let resolved_version =
@@ -375,11 +497,17 @@ where
                 return Err(ServerError::ClientClosed);
             }
 
-            let client_info = match incoming.next().await {
-                Some(Ok(WispMessage::Binary(b))) => b,
-                Some(Ok(WispMessage::Text(_))) => return Err(ServerError::BadHandshake),
-                Some(Err(e)) => return Err(ServerError::Transport(e.to_string())),
-                None => return Err(ServerError::ClientClosed),
+            let handshake_timeout =
+                std::time::Duration::from_millis(ctx.server_options.handshake_timeout_ms.max(1));
+            let client_info = tokio::select! {
+                _ = ctx.cancel.cancelled() => return Ok(()),
+                result = tokio::time::timeout(handshake_timeout, incoming.next()) => match result {
+                    Err(_) => return Err(ServerError::BadHandshake),
+                    Ok(Some(Ok(WispMessage::Binary(b)))) => b,
+                    Ok(Some(Ok(WispMessage::Text(_)))) => return Err(ServerError::BadHandshake),
+                    Ok(Some(Err(e))) => return Err(ServerError::transport(e)),
+                    Ok(None) => return Err(ServerError::ClientClosed),
+                },
             };
             if client_info.len() as u64 > ctx.server_options.max_binary_frame_bytes as u64 {
                 return Err(ServerError::BadHandshake);
@@ -442,10 +570,11 @@ where
         }
     };
 
-    let mut streams: HashMap<u32, StreamHandle> = HashMap::new();
+    let mut streams = StreamTable::new();
     let mut udp_streams: HashMap<u32, mpsc::Sender<UdpStreamMsg>> = HashMap::new();
     let mut caps = StreamCaps::new(&ctx.server_options);
     let (stream_done_tx, mut stream_done_rx) = mpsc::channel::<u32>(256);
+    let (tcp_events_tx, mut tcp_events_rx) = mpsc::channel::<TcpEvent>(256);
     let control_msg_limiter: Option<DirectLimiter> = build_per_minute_limiter(
         ctx.server_options
             .max_control_messages_per_connection_per_minute,
@@ -458,22 +587,78 @@ where
 
     loop {
         let msg = tokio::select! {
-            recv = incoming.next() => match recv {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => {
-                    serve_err = Some(ServerError::Transport(e.to_string()));
-                    break;
+            biased;
+            _ = ctx.cancel.cancelled() => break,
+            ev = tcp_events_rx.recv() => {
+                match ev {
+                    Some(TcpEvent::Ready { stream_id, write, reader }) => {
+                        if let Some(slot) = streams.get_mut(stream_id) {
+                            if let WriteOutcome::DropStream(reason) = activate_writer(
+                                    slot,
+                                    write,
+                                    reader,
+                                    stream_id,
+                                    &ctx,
+                                    &egress_tx,
+                                    &tcp_events_tx,
+                                ).await
+                            {
+                                if egress_tx
+                                    .send(WispMessage::Binary(encode_close(stream_id, reason)))
+                                    .await
+                                    .is_err()
+                                {
+                                    serve_err = Some(ServerError::ClientClosed);
+                                    break;
+                                }
+                                if let Some(slot) = streams.remove(stream_id) {
+                                    drop_slot(slot);
+                                }
+                                caps.release(stream_id);
+                            } else if negotiated.stream_open_confirmation
+                                && egress_tx
+                                    .send(WispMessage::Binary(encode_continue(
+                                        stream_id,
+                                        ctx.server_options.buffer_size,
+                                    )))
+                                    .await
+                                    .is_err()
+                            {
+                                serve_err = Some(ServerError::ClientClosed);
+                                break;
+                            }
+                        } else {
+                            drop(write);
+                            reader.abort();
+                        }
+                    }
+                    Some(TcpEvent::Failed { stream_id })
+                    | Some(TcpEvent::ReaderDone { stream_id })
+                    | Some(TcpEvent::WriterDone { stream_id }) => {
+                        if let Some(slot) = streams.remove(stream_id) {
+                            drop_slot(slot);
+                            caps.release(stream_id);
+                        }
+                    }
+                    None => {}
                 }
-                None => break,
-            },
+                continue;
+            }
             done = stream_done_rx.recv() => {
                 if let Some(stream_id) = done {
-                    streams.remove(&stream_id);
                     udp_streams.remove(&stream_id);
                     caps.release(stream_id);
                 }
                 continue;
             }
+            recv = incoming.next() => match recv {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    serve_err = Some(ServerError::transport(e));
+                    break;
+                }
+                None => break,
+            },
         };
         match msg {
             WispMessage::Binary(frame) => {
@@ -500,6 +685,31 @@ where
                         break;
                     }
                 }
+                if frame.len() >= 5 && frame[0] == packet_type::DATA {
+                    let stream_id = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                    if let Err(e) = handle_data(
+                        stream_id,
+                        frame.slice(5..),
+                        &mut streams,
+                        &mut udp_streams,
+                        &mut caps,
+                        &ctx,
+                        &egress_tx,
+                        &tcp_events_tx,
+                    )
+                    .await
+                    {
+                        let _ = egress_tx
+                            .send(WispMessage::Binary(encode_close(
+                                0,
+                                close_reason::CLIENT_ERROR,
+                            )))
+                            .await;
+                        serve_err = Some(e);
+                        break;
+                    }
+                    continue;
+                }
                 let packet = match parse_packet(frame) {
                     Ok(p) => p,
                     Err(e) => {
@@ -516,6 +726,7 @@ where
                     &negotiated,
                     &egress_tx,
                     &stream_done_tx,
+                    &tcp_events_tx,
                 )
                 .await
                 {
@@ -565,10 +776,9 @@ where
                         tracing::info!(
                             "wisp: dropping proxy_control text frame: in-flight cap reached",
                         );
-                        if let Err(mpsc::error::TrySendError::Full(_)) = control_egress_tx.try_send(
-                            "{\"type\":\"proxy_control_error\",\"ok\":false,\"error\":\"busy\"}"
-                                .to_owned(),
-                        ) {
+                        if let Err(mpsc::error::TrySendError::Full(_)) =
+                            control_egress_tx.try_send(proxy_control_error_frame("busy"))
+                        {
                             tracing::info!(
                                 "wisp: dropping proxy_control busy NACK: control egress saturated",
                             );
@@ -599,6 +809,10 @@ where
         }
     }
     drop(stream_done_tx);
+    drop(tcp_events_tx);
+    for (_, slot) in streams.drain() {
+        drop_slot(slot);
+    }
     ctx.cancel.cancel();
     drop(egress_tx);
     drop(control_egress_tx);
@@ -606,7 +820,7 @@ where
         Ok(Ok(())) => {}
         Ok(Err(sink_err)) => {
             if serve_err.is_none() {
-                serve_err = Some(ServerError::Transport(sink_err));
+                serve_err = Some(sink_err);
             }
         }
         Err(_join_err) => {}
@@ -642,7 +856,11 @@ fn resolve_wisp_version(configured: WispVersion, client_advertises_v2: bool) -> 
 /// deployer opted in" so the advertised set never overstates what the
 /// server can actually execute.
 fn build_server_info(opts: &ServerOptions, proxy_control_active: bool) -> Bytes {
-    let mut exts = Vec::with_capacity(2);
+    let mut exts = Vec::with_capacity(3);
+    exts.push(ExtensionEntry {
+        id: extension_id::STREAM_OPEN_CONFIRMATION,
+        payload: Bytes::new(),
+    });
     if opts.allow_udp_streams {
         exts.push(ExtensionEntry {
             id: extension_id::UDP,
@@ -651,17 +869,17 @@ fn build_server_info(opts: &ServerOptions, proxy_control_active: bool) -> Bytes 
     }
     if proxy_control_active {
         exts.push(ExtensionEntry {
-            id: extension_id::STELLITE_PROXY_CONTROL,
+            id: extension_id::WISP_PROXY_CONTROL,
             payload: Bytes::from_static(PROXY_CONTROL_PAYLOAD),
         });
     }
     encode_info(2, 0, &exts)
 }
 
-/// Audit fix #6: pin the proxy_control extension payload to a single
-/// version constant so both sides can detect skew without parsing magic.
-/// The negotiator below checks the client's payload version against this
-/// before flipping `negotiated.proxy_control`.
+/// Pins the proxy_control extension payload to a single version constant so
+/// both sides can detect skew without parsing magic. The negotiator checks
+/// the client's payload version against this before flipping
+/// `negotiated.proxy_control`.
 const PROXY_CONTROL_VERSION: u8 = 1;
 const PROXY_CONTROL_PAYLOAD: &[u8] = br#"{"version":1}"#;
 
@@ -669,6 +887,7 @@ const PROXY_CONTROL_PAYLOAD: &[u8] = br#"{"version":1}"#;
 pub(crate) struct NegotiatedExtensions {
     pub udp: bool,
     pub proxy_control: bool,
+    pub stream_open_confirmation: bool,
 }
 
 fn intersect_extensions(
@@ -680,18 +899,15 @@ fn intersect_extensions(
     for ext in client_exts {
         match ext.id {
             extension_id::UDP if opts.allow_udp_streams => neg.udp = true,
-            extension_id::STELLITE_PROXY_CONTROL if proxy_control_active => {
-                // Audit fix #6: require the client's payload to advertise a
-                // version we understand. Empty payloads are accepted as
-                // version 1 for the legacy clients that pre-date the
-                // version field; everything else must parse as JSON with a
-                // numeric `version` we know.
-                if proxy_control_payload_compatible(
-                    &ext.payload,
-                    opts.proxy_control_ext_payload_max_bytes,
-                ) {
-                    neg.proxy_control = true;
-                }
+            extension_id::STREAM_OPEN_CONFIRMATION => neg.stream_open_confirmation = true,
+            extension_id::WISP_PROXY_CONTROL
+                if proxy_control_active
+                    && proxy_control_payload_compatible(
+                        &ext.payload,
+                        opts.proxy_control_ext_payload_max_bytes,
+                    ) =>
+            {
+                neg.proxy_control = true;
             }
             _ => {}
         }
@@ -806,11 +1022,11 @@ mod proxy_control_compat_tests {
     }
 }
 
-/// Audit-3 fix #63: per-connection stream-cap accounting. Tracks total
-/// concurrent streams, per-host:port counts, and the stream-open rate so
-/// the CONNECT handler can reject without tearing the whole connection
-/// down. None of this state crosses connections — a fresh `StreamCaps` is
-/// built at the top of [`serve_connection`].
+/// Per-connection stream-cap accounting. Tracks total concurrent streams,
+/// per-host:port counts, and the stream-open rate so the CONNECT handler can
+/// reject without tearing the whole connection down. None of this state
+/// crosses connections — a fresh `StreamCaps` is built at the top of
+/// [`serve_connection`].
 pub(crate) struct StreamCaps {
     total: u32,
     host_counts: HashMap<String, u32>,
@@ -822,7 +1038,8 @@ pub(crate) struct StreamCaps {
 
 impl StreamCaps {
     fn new(opts: &ServerOptions) -> Self {
-        let open_limiter = build_per_minute_limiter(opts.max_tcp_stream_opens_per_connection_per_minute);
+        let open_limiter =
+            build_per_minute_limiter(opts.max_tcp_stream_opens_per_connection_per_minute);
         Self {
             total: 0,
             host_counts: HashMap::new(),
@@ -892,6 +1109,7 @@ mod stream_caps_tests {
             proxy_control_enabled: false,
             max_binary_frame_bytes: 65536,
             max_text_frame_bytes: 65536,
+            handshake_timeout_ms: 10_000,
             stream_limit_total: total,
             stream_limit_per_host: per_host,
             max_tcp_stream_opens_per_connection_per_minute: opens_per_min,
@@ -967,15 +1185,77 @@ mod stream_caps_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_data(
+    stream_id: u32,
+    payload: Bytes,
+    streams: &mut StreamTable,
+    udp_streams: &mut HashMap<u32, mpsc::Sender<UdpStreamMsg>>,
+    caps: &mut StreamCaps,
+    ctx: &ServerContext,
+    egress: &EgressSender,
+    tcp_events: &mpsc::Sender<TcpEvent>,
+) -> Result<(), ServerError> {
+    if stream_id == 0 {
+        return Err(ServerError::ProtocolViolation(
+            "stream_id 0 reserved for control channel",
+        ));
+    }
+    if let Some(slot) = streams.get_mut(stream_id) {
+        match write_upstream(slot, payload, stream_id, ctx, egress, tcp_events) {
+            WriteOutcome::DropStream(reason) => {
+                egress
+                    .send(WispMessage::Binary(encode_close(stream_id, reason)))
+                    .await
+                    .map_err(|()| ServerError::ClientClosed)?;
+                if let Some(slot) = streams.remove(stream_id) {
+                    drop_slot(slot);
+                }
+                caps.release(stream_id);
+            }
+            WriteOutcome::SendContinue => {
+                if egress
+                    .send(WispMessage::Binary(encode_continue(
+                        stream_id,
+                        ctx.server_options.buffer_size,
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return Err(ServerError::ClientClosed);
+                }
+            }
+            WriteOutcome::Ok => {}
+        }
+    } else if let Some(udp) = udp_streams.get(&stream_id) {
+        match udp.try_send(UdpStreamMsg::Data(payload)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(msg)) => {
+                let tx = udp.clone();
+                if tx.send(msg).await.is_err() {
+                    udp_streams.remove(&stream_id);
+                    caps.release(stream_id);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                udp_streams.remove(&stream_id);
+                caps.release(stream_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_packet(
     packet: WispPacket,
-    streams: &mut HashMap<u32, StreamHandle>,
+    streams: &mut StreamTable,
     udp_streams: &mut HashMap<u32, mpsc::Sender<UdpStreamMsg>>,
     caps: &mut StreamCaps,
     ctx: &ServerContext,
     negotiated: &NegotiatedExtensions,
-    egress: &mpsc::Sender<WispMessage>,
+    egress: &EgressSender,
     stream_done_tx: &mpsc::Sender<u32>,
+    tcp_events: &mpsc::Sender<TcpEvent>,
 ) -> Result<(), ServerError> {
     match packet {
         WispPacket::Connect(conn) => {
@@ -984,13 +1264,8 @@ async fn handle_packet(
                     "stream_id 0 reserved for control channel",
                 ));
             }
-            if let Some(existing) = streams.get(&conn.stream_id) {
-                if existing.tx.is_closed() {
-                    streams.remove(&conn.stream_id);
-                    caps.release(conn.stream_id);
-                } else {
-                    return Err(ServerError::StreamCollision(conn.stream_id));
-                }
+            if streams.contains(conn.stream_id) {
+                return Err(ServerError::StreamCollision(conn.stream_id));
             }
             if let Some(existing) = udp_streams.get(&conn.stream_id) {
                 if existing.is_closed() {
@@ -1060,15 +1335,15 @@ async fn handle_packet(
                             .await;
                         return Ok(());
                     }
-                    let handle = spawn_tcp_stream(
+                    streams.insert(conn.stream_id, TcpStreamSlot::connecting());
+                    spawn_tcp_connect(
                         conn.stream_id,
                         conn.hostname.clone(),
                         conn.port,
                         ctx.clone(),
                         egress.clone(),
-                        stream_done_tx.clone(),
+                        tcp_events.clone(),
                     );
-                    streams.insert(conn.stream_id, handle);
                 }
                 stream_type::UDP if negotiated.udp => {
                     if let Err(reason) = caps.try_admit(conn.stream_id, &conn.hostname, conn.port) {
@@ -1108,24 +1383,17 @@ async fn handle_packet(
             }
         }
         WispPacket::Data(data) => {
-            if data.stream_id == 0 {
-                return Err(ServerError::ProtocolViolation(
-                    "stream_id 0 reserved for control channel",
-                ));
-            }
-            if let Some(handle) = streams.get(&data.stream_id) {
-                let tx = handle.tx.clone();
-                if tx.send(TcpStreamMsg::Data(data.payload)).await.is_err() {
-                    streams.remove(&data.stream_id);
-                    caps.release(data.stream_id);
-                }
-            } else if let Some(udp) = udp_streams.get(&data.stream_id) {
-                let udp = udp.clone();
-                if udp.send(UdpStreamMsg::Data(data.payload)).await.is_err() {
-                    udp_streams.remove(&data.stream_id);
-                    caps.release(data.stream_id);
-                }
-            }
+            return handle_data(
+                data.stream_id,
+                data.payload,
+                streams,
+                udp_streams,
+                caps,
+                ctx,
+                egress,
+                tcp_events,
+            )
+            .await;
         }
         WispPacket::Continue(_) => {}
         WispPacket::Close(close) => {
@@ -1134,8 +1402,8 @@ async fn handle_packet(
                     "stream_id 0 reserved for control channel",
                 ));
             }
-            if let Some(handle) = streams.remove(&close.stream_id) {
-                let _ = handle.tx.try_send(TcpStreamMsg::Close(close.reason));
+            if let Some(slot) = streams.remove(close.stream_id) {
+                drop_slot(slot);
                 caps.release(close.stream_id);
             } else if let Some(udp) = udp_streams.remove(&close.stream_id) {
                 let _ = udp.try_send(UdpStreamMsg::Close);
@@ -1166,9 +1434,396 @@ fn build_per_minute_limiter(per_minute: u32) -> Option<DirectLimiter> {
         return None;
     }
     let rate = NonZeroU32::new(per_minute).expect("nonzero rate");
-    // Quota::per_minute replenishes `rate` cells over 60s with a burst of
-    // `rate`; its window is a fixed 60s so it can't overflow governor's Nanos.
-    // (The old `with_period(60s).allow_burst(rate)` stored a 60s*rate window,
-    // which panics for large rates — "Duration is longer than 584 years".)
     Some(RateLimiter::direct(Quota::per_minute(rate)))
+}
+
+#[cfg(test)]
+mod serve_connection_tests {
+    use super::*;
+    use crate::ConnectError;
+    use bytes::Bytes;
+    use futures::{channel::mpsc as fmpsc, SinkExt, StreamExt};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+    use wisp_dos::{tcp_byte_limits_active, DosGuard, UNLIMITED};
+    use wisp_proxy::HostPolicy;
+    use wisp_wisp::{
+        encode_connect, encode_data, encode_info, parse_packet, stream_type, ConnectPacket,
+        WispPacket,
+    };
+
+    #[tokio::test]
+    async fn egress_budget_tracks_bytes_until_receive() {
+        let (raw_tx, mut raw_rx) = mpsc::channel(4);
+        let (flow_tx, _flow_rx) = mpsc::channel(4);
+        let tx = EgressSender::new(raw_tx, flow_tx, 4);
+        assert!(tx
+            .send(WispMessage::Binary(Bytes::from_static(b"1234")))
+            .await
+            .is_ok());
+        assert!(tx
+            .try_send(WispMessage::Binary(Bytes::from_static(b"5")))
+            .is_err());
+        drop(raw_rx.recv().await);
+        assert!(tx
+            .try_send(WispMessage::Binary(Bytes::from_static(b"5")))
+            .is_ok());
+    }
+
+    fn loopback_test_options(echo_port: u16) -> Arc<WispServerOptions> {
+        Arc::new(WispServerOptions {
+            protocol_inspection: false,
+            allow_loopback_ips: true,
+            allow_private_ips: true,
+            allow_direct_ip: true,
+            port_whitelist: Some(vec![echo_port]),
+            max_tcp_bytes_per_connection_per_second: UNLIMITED,
+            max_tcp_bytes_per_ip_per_second: UNLIMITED,
+            stream_idle_timeout_ms: Some(5_000),
+            idle_timeout_ms: Some(2_000),
+            connect_timeout_ms: Some(2_000),
+            ..WispServerOptions::default()
+        })
+    }
+
+    fn test_ctx(options: Arc<WispServerOptions>, advertises_v2: bool) -> ServerContext {
+        let server_options = Arc::new(ServerOptions::from_wisp(&options, false));
+        ServerContext::new(
+            "127.0.0.1".to_owned(),
+            None,
+            options,
+            server_options,
+            None,
+            advertises_v2,
+            Arc::new(DosGuard::new()),
+        )
+    }
+
+    async fn spawn_serve(
+        ctx: ServerContext,
+    ) -> (
+        fmpsc::UnboundedSender<Result<WispMessage, std::io::Error>>,
+        fmpsc::UnboundedReceiver<WispMessage>,
+        tokio::task::JoinHandle<Result<(), ServerError>>,
+    ) {
+        let (in_tx, in_rx) = fmpsc::unbounded();
+        let (out_tx, out_rx) = fmpsc::unbounded();
+        let handle = tokio::spawn(async move { serve_connection(out_tx, in_rx, ctx).await });
+        (in_tx, out_rx, handle)
+    }
+
+    async fn next_packet(rx: &mut fmpsc::UnboundedReceiver<WispMessage>) -> WispPacket {
+        let msg = timeout(Duration::from_secs(2), rx.next())
+            .await
+            .expect("server packet timed out")
+            .expect("server closed");
+        match msg {
+            WispMessage::Binary(b) => parse_packet(b).expect("valid wisp packet"),
+            WispMessage::Text(t) => panic!("unexpected text frame {t}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_handshake_emits_continue_first() {
+        let opts = loopback_test_options(6002);
+        let ctx = test_ctx(opts, false);
+        let (_in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => {
+                assert_eq!(c.stream_id, 0);
+                assert!(c.remaining > 0);
+            }
+            other => panic!("v1 must start with CONTINUE, got {other:?}"),
+        }
+        drop(_in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn v2_handshake_info_then_continue() {
+        let opts = loopback_test_options(6002);
+        let ctx = test_ctx(opts, true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Info(info) => {
+                assert_eq!(info.stream_id, 0);
+                assert_eq!(info.major, 2);
+            }
+            other => panic!("v2 must start with INFO, got {other:?}"),
+        }
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_info(2, 0, &[]))))
+            .await
+            .unwrap();
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("v2 must CONTINUE after INFO, got {other:?}"),
+        }
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    async fn echo_listener() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn connect_data_echo_roundtrip() {
+        let (port, echo) = echo_listener().await;
+        let opts = loopback_test_options(port);
+        assert!(
+            !tcp_byte_limits_active(&opts),
+            "unlimited sentinels must skip TCP byte metering"
+        );
+        let ctx = test_ctx(opts, false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_connect(&ConnectPacket {
+                stream_id: 1,
+                stream_type: stream_type::TCP,
+                port,
+                hostname: "127.0.0.1".to_owned(),
+            }))))
+            .await
+            .unwrap();
+
+        let payload = Bytes::from_static(b"wisp-echo-payload");
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_data(1, &payload))))
+            .await
+            .unwrap();
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Data(d) => {
+                assert_eq!(d.stream_id, 1);
+                assert_eq!(&d.payload[..], &payload[..]);
+            }
+            other => panic!("expected echoed DATA, got {other:?}"),
+        }
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn data_queued_during_connect_is_flushed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let echo = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let opts = loopback_test_options(port);
+        let ctx = test_ctx(opts, false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_connect(&ConnectPacket {
+                stream_id: 1,
+                stream_type: stream_type::TCP,
+                port,
+                hostname: "127.0.0.1".to_owned(),
+            }))))
+            .await
+            .unwrap();
+
+        let payload = Bytes::from_static(b"queued-before-tcp-ready");
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_data(1, &payload))))
+            .await
+            .unwrap();
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Data(d) => {
+                assert_eq!(d.stream_id, 1);
+                assert_eq!(&d.payload[..], &payload[..]);
+            }
+            other => panic!("expected flushed DATA, got {other:?}"),
+        }
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn full_initial_window_fits_bounded_stream_queue() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await
+        });
+        let opts = loopback_test_options(port);
+        let ctx = test_ctx(opts, false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_connect(&ConnectPacket {
+                stream_id: 1,
+                stream_type: stream_type::TCP,
+                port,
+                hostname: "127.0.0.1".to_owned(),
+            }))))
+            .await
+            .unwrap();
+
+        let chunk = vec![b'x'; 50 * 1024];
+        for _ in 0..256 {
+            in_tx
+                .send(Ok(WispMessage::Binary(encode_data(1, &chunk))))
+                .await
+                .unwrap();
+        }
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) if c.stream_id == 1 => {}
+            WispPacket::Close(c) if c.stream_id == 1 => {
+                panic!(
+                    "initial credit window closed early with reason {}",
+                    c.reason
+                )
+            }
+            other => panic!("expected stream flow-control update, got {other:?}"),
+        }
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn mux_does_not_stall_other_streams_when_one_tcp_blocks() {
+        let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let block_port = blocker.local_addr().unwrap().port();
+        let block_task = tokio::spawn(async move {
+            let (_sock, _) = blocker.accept().await.unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let (echo_port, echo) = echo_listener().await;
+        let opts = Arc::new(WispServerOptions {
+            protocol_inspection: false,
+            allow_loopback_ips: true,
+            allow_private_ips: true,
+            allow_direct_ip: true,
+            port_whitelist: Some(vec![echo_port, block_port]),
+            max_tcp_bytes_per_connection_per_second: UNLIMITED,
+            max_tcp_bytes_per_ip_per_second: UNLIMITED,
+            stream_idle_timeout_ms: Some(5_000),
+            idle_timeout_ms: Some(2_000),
+            connect_timeout_ms: Some(2_000),
+            ..WispServerOptions::default()
+        });
+        let ctx = test_ctx(opts, false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_connect(&ConnectPacket {
+                stream_id: 1,
+                stream_type: stream_type::TCP,
+                port: block_port,
+                hostname: "127.0.0.1".to_owned(),
+            }))))
+            .await
+            .unwrap();
+
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..256 {
+            in_tx
+                .send(Ok(WispMessage::Binary(encode_data(1, &chunk))))
+                .await
+                .unwrap();
+        }
+
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_connect(&ConnectPacket {
+                stream_id: 2,
+                stream_type: stream_type::TCP,
+                port: echo_port,
+                hostname: "127.0.0.1".to_owned(),
+            }))))
+            .await
+            .unwrap();
+
+        let payload = Bytes::from_static(b"other-stream-still-live");
+        in_tx
+            .send(Ok(WispMessage::Binary(encode_data(2, &payload))))
+            .await
+            .unwrap();
+        loop {
+            match next_packet(&mut out_rx).await {
+                WispPacket::Data(d) if d.stream_id == 2 => {
+                    assert_eq!(&d.payload[..], &payload[..]);
+                    break;
+                }
+                WispPacket::Continue(c) if c.stream_id == 1 => {}
+                WispPacket::Close(c) if c.stream_id == 1 => {}
+                other => panic!("mux stalled: no echo on stream 2, got {other:?}"),
+            }
+        }
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        echo.abort();
+        block_task.abort();
+    }
+
+    #[test]
+    fn connect_error_is_typed_not_string() {
+        let err = ConnectError::NoAddresses("example.test".to_owned());
+        assert!(matches!(err, ConnectError::NoAddresses(_)));
+        let policy = HostPolicy::from_options(&WispServerOptions::default());
+        let _ = policy;
+    }
 }

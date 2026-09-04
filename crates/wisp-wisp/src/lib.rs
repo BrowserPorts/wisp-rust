@@ -1,15 +1,11 @@
 //! Wisp v2 wire codec.
 //!
-//! Mirrors the protocol at `wisp-protocol/protocol.md` exactly. Packets are
-//! `[type:u8][stream_id:u32 LE][payload]`. All multi-byte integers are
-//! little-endian.
+//! Packets are `[type:u8][stream_id:u32 LE][payload]`. All multi-byte
+//! integers are little-endian.
 //!
 //! Packet types: CONNECT (0x01), DATA (0x02), CONTINUE (0x03), CLOSE (0x04),
 //! INFO (0x05). Stream types: TCP (0x01), UDP (0x02). Extensions are
 //! `[id:u8][len:u32 LE][payload]` and live inside INFO payloads.
-//!
-//! The legacy bun reference (`stellite-wisp/src/wisp/protocol.ts`) is the
-//! oracle for byte layouts; this crate's tests round-trip the same shapes.
 
 #![forbid(unsafe_code)]
 
@@ -54,8 +50,6 @@ pub const DEFAULT_MAX_HOST_BYTES: usize = 255;
 
 pub type Result<T> = std::result::Result<T, WispError>;
 
-// -------------------------------------------------------------- packet types
-
 /// Wisp packet type bytes.
 pub mod packet_type {
     pub const CONNECT: u8 = 0x01;
@@ -72,7 +66,7 @@ pub mod stream_type {
 }
 
 /// Wisp close reason codes. The `0x45 PROXY_ROTATED` reason is a
-/// stellite-specific extension on top of the spec; see legacy `protocol.ts`.
+/// Wisp-specific extension on top of the spec.
 pub mod close_reason {
     pub const UNKNOWN: u8 = 0x01;
     pub const VOLUNTARY: u8 = 0x02;
@@ -94,15 +88,16 @@ pub mod close_reason {
 
 /// Wisp v2 extension IDs. Aligned with `wisp-wire::extension::*` so the
 /// same numeric ids mean the same thing across the WT and WS transports.
-/// Auth, MOTD, and STREAM_OPEN_CONFIRMATION extensions from the legacy
-/// bun server are intentionally omitted as dead weight.
+/// Auth and MOTD extensions are intentionally omitted as dead weight.
+/// Extension `0x02` (WEBTRANSPORT_PROXY) is WT-only and unused in the WS
+/// transport. STREAM_OPEN_CONFIRMATION lets a client wait for the upstream
+/// connect before treating a stream as open: when negotiated, the server
+/// sends a per-stream CONTINUE as soon as the TCP connect succeeds.
 pub mod extension_id {
     pub const UDP: u8 = 0x01;
-    // 0x02 = WEBTRANSPORT_PROXY (WT-only; not used in the WS transport).
-    pub const STELLITE_PROXY_CONTROL: u8 = 0x03;
+    pub const WISP_PROXY_CONTROL: u8 = 0x03;
+    pub const STREAM_OPEN_CONFIRMATION: u8 = 0x05;
 }
-
-// -------------------------------------------------------------- packets
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectPacket {
@@ -158,8 +153,6 @@ impl WispPacket {
         }
     }
 }
-
-// -------------------------------------------------------------- parse
 
 pub fn parse_packet(buf: Bytes) -> Result<WispPacket> {
     if buf.len() < 5 {
@@ -248,8 +241,6 @@ fn parse_info(stream_id: u32, payload: Bytes) -> Result<InfoPacket> {
     })
 }
 
-// -------------------------------------------------------------- encode
-
 pub fn encode_connect(packet: &ConnectPacket) -> Bytes {
     let host_bytes = packet.hostname.as_bytes();
     let mut buf = BytesMut::with_capacity(8 + host_bytes.len());
@@ -261,20 +252,28 @@ pub fn encode_connect(packet: &ConnectPacket) -> Bytes {
     buf.freeze()
 }
 
+/// Size of the Wisp packet header (`type:u8` + `stream_id:u32 LE`).
+pub const PACKET_HEADER_LEN: usize = 5;
+
+/// Write a DATA header into the first [`PACKET_HEADER_LEN`] bytes of `buf`.
+/// The remainder of `buf` is the payload and is left untouched — used by the
+/// TCP/UDP pumps so a read buffer can become a frame without copying payload.
+pub fn write_data_header(stream_id: u32, buf: &mut [u8]) {
+    debug_assert!(buf.len() >= PACKET_HEADER_LEN);
+    buf[0] = packet_type::DATA;
+    buf[1..5].copy_from_slice(&stream_id.to_le_bytes());
+}
+
 pub fn encode_data(stream_id: u32, payload: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + payload.len());
-    buf.put_u8(packet_type::DATA);
-    buf.put_u32_le(stream_id);
+    let mut buf = BytesMut::with_capacity(PACKET_HEADER_LEN + payload.len());
+    buf.resize(PACKET_HEADER_LEN, 0);
     buf.extend_from_slice(payload);
+    write_data_header(stream_id, &mut buf);
     buf.freeze()
 }
 
 pub fn encode_data_owned(stream_id: u32, payload: Bytes) -> Bytes {
-    let mut hdr = BytesMut::with_capacity(5 + payload.len());
-    hdr.put_u8(packet_type::DATA);
-    hdr.put_u32_le(stream_id);
-    hdr.extend_from_slice(&payload);
-    hdr.freeze()
+    encode_data(stream_id, &payload)
 }
 
 pub fn encode_continue(stream_id: u32, remaining: u32) -> Bytes {
@@ -297,14 +296,12 @@ pub fn encode_info(major: u8, minor: u8, extensions: &[ExtensionEntry]) -> Bytes
     let ext_bytes = encode_extensions(extensions);
     let mut buf = BytesMut::with_capacity(7 + ext_bytes.len());
     buf.put_u8(packet_type::INFO);
-    buf.put_u32_le(0); // INFO uses stream_id = 0
+    buf.put_u32_le(0);
     buf.put_u8(major);
     buf.put_u8(minor);
     buf.extend_from_slice(&ext_bytes);
     buf.freeze()
 }
-
-// -------------------------------------------------------------- extensions
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionEntry {
@@ -364,8 +361,6 @@ pub fn parse_extensions_capped(buf: Bytes, max_entries: usize) -> Result<Vec<Ext
     Ok(out)
 }
 
-// -------------------------------------------------------------- tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +389,17 @@ mod tests {
             }
             other => panic!("got {:?}", other),
         }
+    }
+
+    #[test]
+    fn write_data_header_matches_encode_data() {
+        let payload = b"in-place";
+        let encoded = encode_data(7, payload);
+        let mut buf = BytesMut::with_capacity(PACKET_HEADER_LEN + payload.len());
+        buf.resize(PACKET_HEADER_LEN, 0);
+        buf.extend_from_slice(payload);
+        write_data_header(7, &mut buf);
+        assert_eq!(encoded, buf.freeze());
     }
 
     #[test]
@@ -430,7 +436,7 @@ mod tests {
                 payload: Bytes::new(),
             },
             ExtensionEntry {
-                id: extension_id::STELLITE_PROXY_CONTROL,
+                id: extension_id::WISP_PROXY_CONTROL,
                 payload: Bytes::from_static(br#"{"version":1}"#),
             },
         ];
@@ -468,7 +474,6 @@ mod tests {
 
     #[test]
     fn truncated_extension_rejects() {
-        // id + len = 0xff_ff_ff_ff but no payload bytes
         let buf = Bytes::from_static(&[0x01, 0xff, 0xff, 0xff, 0xff]);
         assert_eq!(
             parse_extensions(buf).unwrap_err(),

@@ -1,8 +1,0 @@
-.DS_Store
-.git/
-target/
-**/target/
-**/*.rs.bk
-*.pdb
-*.log
-backups/
