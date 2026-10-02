@@ -117,6 +117,7 @@ export type WispRustRuntimeOptions = {
   cwd?: string;
   native?: WispRustNativeModule;
   resolvedWsPort?: number;
+  trustedBunFront?: boolean;
 };
 
 export type WispRustViteOptions = WispRustRuntimeOptions & {
@@ -181,6 +182,9 @@ const MULTIPLIED_LIMIT_FIELDS = new Set([
   "proxyControlMutationBurst",
   "protocolInspectionMaxBytes"
 ]);
+
+const MAX_BUN_PENDING_BYTES = 1024 * 1024;
+const BUN_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 
 export class WispRustRuntime {
   readonly native: WispRustNativeModule;
@@ -361,6 +365,267 @@ export function createWispRustRuntime(options: WispRustRuntimeOptions = {}): Wis
   return new WispRustRuntime(options);
 }
 
+export type WispRustBunProxyOptions = WispRustRuntimeOptions & {
+  appTarget: string;
+  appTargets?: Record<string, string>;
+  proxyPath?: string;
+  /** Resolve the public mount for each request, or return null to disable it */
+  resolveProxyPath?: (request: Request) => string | null | Promise<string | null>;
+  hostname?: string;
+  port?: number;
+  idleTimeout?: number;
+  trustedBunFront?: boolean;
+  stopOnSignals?: boolean;
+};
+
+type BunProxyMessage = string | Buffer;
+type BunProxySocketData = {
+  upstreamUrl: string;
+  origin?: string;
+  forwardedFor?: string;
+  protocols: string[];
+  upstream?: WebSocket;
+  pending: BunProxyMessage[];
+  pendingBytes: number;
+  connectTimer?: ReturnType<typeof setTimeout>;
+};
+
+export type WispRustBunProxy = {
+  runtime: WispRustRuntime;
+  server: Bun.Server<BunProxySocketData>;
+  stop(): Promise<RuntimeStatus>;
+};
+
+export async function serveWispRustBunProxy(
+  options: WispRustBunProxyOptions,
+): Promise<WispRustBunProxy> {
+  if (!process.versions.bun) {
+    throw new Error("serveWispRustBunProxy requires Bun");
+  }
+  const runtime = createWispRustRuntime({
+    ...options,
+    trustedBunFront: options.trustedBunFront ?? true,
+  });
+  await runtime.start();
+  const context = runtime.proxyContext(options.proxyPath);
+  const appTarget = new URL(options.appTarget);
+  const appTargets = new Map(
+    Object.entries(options.appTargets ?? {}).map(([hostname, target]) => [
+      hostname.toLowerCase(),
+      new URL(target),
+    ]),
+  );
+
+  const server = Bun.serve<BunProxySocketData>({
+    hostname: options.hostname ?? "127.0.0.1",
+    port: options.port ?? 8081,
+    idleTimeout: options.idleTimeout ?? 255,
+    async fetch(request, activeServer) {
+      const requestUrl = new URL(request.url);
+      const forwardedFor = appendForwardedFor(
+        request.headers.get("x-forwarded-for"),
+        activeServer.requestIP(request)?.address,
+      );
+      const selectedAppTarget =
+        appTargets.get(requestUrl.hostname.toLowerCase()) ?? appTarget;
+      if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+        const mount = options.resolveProxyPath
+          ? await options.resolveProxyPath(request)
+          : context.proxyPath;
+        const connectionContext = mount === null
+          ? null
+          : { ...context, proxyPath: normalizeMountPath(mount) };
+        const upstreamUrl = connectionContext && pathMatchesMount(requestUrl.pathname, connectionContext.proxyPath)
+          ? wispWebSocketUrl(requestUrl, connectionContext)
+          : appWebSocketUrl(requestUrl, selectedAppTarget);
+        const protocols = (request.headers.get("sec-websocket-protocol") ?? "")
+          .split(",")
+          .map((protocol) => protocol.trim())
+          .filter(Boolean);
+        const upgraded = activeServer.upgrade(request, {
+          data: {
+            upstreamUrl,
+            origin: request.headers.get("origin") ?? undefined,
+            forwardedFor,
+            protocols,
+            pending: [],
+            pendingBytes: 0,
+          },
+        });
+        return upgraded
+          ? undefined
+          : new Response("WebSocket upgrade failed", { status: 500 });
+      }
+      return proxyBunHttpRequest(
+        request,
+        requestUrl,
+        selectedAppTarget,
+        forwardedFor,
+      );
+    },
+    websocket: {
+      open(socket) {
+        const headers: Record<string, string> = {};
+        if (socket.data.origin) headers.Origin = socket.data.origin;
+        if (socket.data.forwardedFor)
+          headers["X-Forwarded-For"] = socket.data.forwardedFor;
+        const upstream = new WebSocket(socket.data.upstreamUrl, {
+          headers: Object.keys(headers).length > 0 ? headers : undefined,
+          protocols: socket.data.protocols,
+        });
+        socket.data.upstream = upstream;
+        upstream.binaryType = "arraybuffer";
+        socket.data.connectTimer = setTimeout(() => {
+          socket.data.pending.length = 0;
+          socket.data.pendingBytes = 0;
+          socket.close(1013, "Upstream WebSocket connection timed out");
+          upstream.close();
+        }, BUN_UPSTREAM_CONNECT_TIMEOUT_MS);
+        upstream.addEventListener("open", () => {
+          clearTimeout(socket.data.connectTimer);
+          socket.data.connectTimer = undefined;
+          for (const message of socket.data.pending) upstream.send(message);
+          socket.data.pending.length = 0;
+          socket.data.pendingBytes = 0;
+        });
+        upstream.addEventListener("message", (event) => {
+          socket.send(
+            typeof event.data === "string"
+              ? event.data
+              : Buffer.from(event.data as ArrayBuffer),
+          );
+        });
+        upstream.addEventListener("close", (event) => {
+          clearTimeout(socket.data.connectTimer);
+          socket.data.connectTimer = undefined;
+          socket.close(normalizeWebSocketCloseCode(event.code), event.reason);
+        });
+        upstream.addEventListener("error", () => {
+          clearTimeout(socket.data.connectTimer);
+          socket.data.connectTimer = undefined;
+          socket.close(1011, "Upstream WebSocket failed");
+        });
+      },
+      message(socket, message) {
+        const upstream = socket.data.upstream;
+        if (upstream?.readyState === WebSocket.OPEN) {
+          upstream.send(message);
+        } else {
+          const messageBytes = bunProxyMessageBytes(message);
+          if (socket.data.pendingBytes + messageBytes > MAX_BUN_PENDING_BYTES) {
+            socket.data.pending.length = 0;
+            socket.data.pendingBytes = 0;
+            socket.close(1009, "Upstream WebSocket queue limit exceeded");
+            upstream?.close();
+            return;
+          }
+          socket.data.pending.push(message);
+          socket.data.pendingBytes += messageBytes;
+        }
+      },
+      close(socket, code, reason) {
+        clearTimeout(socket.data.connectTimer);
+        socket.data.connectTimer = undefined;
+        socket.data.pending.length = 0;
+        socket.data.pendingBytes = 0;
+        const upstream = socket.data.upstream;
+        if (upstream && upstream.readyState < WebSocket.CLOSING) {
+          upstream.close(normalizeWebSocketCloseCode(code), reason);
+        }
+      },
+    },
+  });
+
+  let stopPromise: Promise<RuntimeStatus> | undefined;
+  const stop = () => {
+    if (!stopPromise) {
+      stopPromise = server.stop(true).then(() => runtime.stop());
+    }
+    return stopPromise;
+  };
+  if (options.stopOnSignals ?? true) {
+    const stopForSignal = () => {
+      stop().then(
+        () => process.exit(0),
+        (error) => {
+          console.error(error);
+          process.exit(1);
+        },
+      );
+    };
+    process.once("SIGINT", stopForSignal);
+    process.once("SIGTERM", stopForSignal);
+  }
+  return { runtime, server, stop };
+}
+
+function pathMatchesMount(pathname: string, mountPath: string): boolean {
+  const normalized = normalizeMountPath(mountPath);
+  if (normalized === "/") return pathname.startsWith("/");
+  return pathname === normalized || pathname.startsWith(normalized + "/");
+}
+
+function bunProxyMessageBytes(message: BunProxyMessage): number {
+  return typeof message === "string"
+    ? Buffer.byteLength(message)
+    : message.byteLength;
+}
+
+function wispWebSocketUrl(
+  requestUrl: URL,
+  context: WispRustProxyContext,
+): string {
+  const upstream = new URL(context.boundUrl);
+  upstream.pathname = rewriteMountPath(
+    requestUrl.pathname,
+    context.proxyPath,
+    context.endpointPath,
+  );
+  upstream.search = requestUrl.search;
+  return upstream.href;
+}
+
+function appWebSocketUrl(requestUrl: URL, appTarget: URL): string {
+  const upstream = new URL(requestUrl.pathname + requestUrl.search, appTarget);
+  upstream.protocol = appTarget.protocol === "https:" ? "wss:" : "ws:";
+  return upstream.href;
+}
+
+async function proxyBunHttpRequest(
+  request: Request,
+  requestUrl: URL,
+  appTarget: URL,
+  forwardedFor?: string,
+): Promise<Response> {
+  const upstream = new URL(requestUrl.pathname + requestUrl.search, appTarget);
+  const headers = new Headers(request.headers);
+  headers.delete("connection");
+  headers.delete("upgrade");
+  if (forwardedFor) headers.set("x-forwarded-for", forwardedFor);
+  const hasBody = request.method !== "GET" && request.method !== "HEAD";
+  return fetch(upstream, {
+    method: request.method,
+    headers,
+    body: hasBody ? request.body : undefined,
+    redirect: "manual",
+  });
+}
+
+function appendForwardedFor(
+  existing: string | null,
+  clientIp: string | undefined,
+): string | undefined {
+  if (!clientIp) return existing?.trim() || undefined;
+  const chain = existing?.trim();
+  return chain ? `${chain}, ${clientIp}` : clientIp;
+}
+
+function normalizeWebSocketCloseCode(code: number): number {
+  const reserved =
+    code === 1004 || code === 1005 || code === 1006 || code === 1015;
+  return code >= 1000 && code <= 4999 && !reserved ? code : 1011;
+}
+
 export function wispRustVite(options: WispRustViteOptions = {}): Plugin {
   let runtime: WispRustRuntime | undefined;
   let closeRegistered = false;
@@ -495,7 +760,7 @@ async function resolveFreeWsPort(options: WispRustRuntimeOptions): Promise<numbe
 }
 
 function createNativeRuntime(native: WispRustNativeModule, options: WispRustRuntimeOptions): WispRust {
-  if (options.proxyConfigPath || options.authenticatedProxyConfigPath) {
+  if (options.proxyConfigPath || options.authenticatedProxyConfigPath || options.trustedBunFront) {
     return native.WispRust.fromToml(
       mergedRuntimeToml(options),
       options.source ?? options.tomlPath ?? options.proxyConfigPath ?? options.authenticatedProxyConfigPath
@@ -554,7 +819,24 @@ function buildRuntimeTomlTable(options: WispRustRuntimeOptions): TomlTable {
       proxyConfigTable(resolvePath(options.authenticatedProxyConfigPath, options.cwd))
     );
   }
+  if (options.trustedBunFront) applyTrustedBunFront(base);
   return base;
+}
+
+function applyTrustedBunFront(table: TomlTable) {
+  const record = table as TomlRecord;
+  const ws = isRecord(record.wisp_websocket) ? record.wisp_websocket : {};
+  ws.host = "127.0.0.1";
+  delete ws.bind_addr;
+  ws.ingress_mode = "trusted_edge";
+  record.wisp_websocket = ws;
+
+  const wisp = isRecord(record.wisp) ? record.wisp : {};
+  const client = isRecord(wisp.client) ? wisp.client : {};
+  client.parse_real_ip = true;
+  client.parse_real_ip_from = ["127.0.0.1", "::1"];
+  wisp.client = client;
+  record.wisp = wisp;
 }
 
 function mergedRuntimeToml(options: WispRustRuntimeOptions): string {
@@ -563,7 +845,7 @@ function mergedRuntimeToml(options: WispRustRuntimeOptions): string {
   return stringifyToml(base);
 }
 
-function applyWsPortOverride(table: TomlTable, port: number | undefined): void {
+function applyWsPortOverride(table: TomlTable, port: number | undefined) {
   if (port === undefined) return;
   const record = table as TomlRecord;
   const ws = isRecord(record.wisp_websocket) ? record.wisp_websocket : {};
@@ -771,14 +1053,22 @@ function normalizeMountPath(path: string): string {
 }
 
 function rewriteMountPath(path: string, from: string, to: string): string {
-  if (!path.startsWith(from)) {
+  const normalizedFrom = normalizeMountPath(from);
+  const normalizedTo = normalizeMountPath(to);
+  const marker = path.search(/[?#]/);
+  const pathname = marker === -1 ? path : path.slice(0, marker);
+  if (!pathMatchesMount(pathname, normalizedFrom)) {
     return path;
   }
-  const suffix = path.slice(from.length);
+  const suffix =
+    normalizedFrom === "/" ? path : path.slice(normalizedFrom.length);
   if (!suffix) {
-    return to;
+    return normalizedTo;
   }
-  return `${to}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+  if (suffix.startsWith("?") || suffix.startsWith("#")) {
+    return `${normalizedTo}${suffix}`;
+  }
+  return `${normalizedTo}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
 }
 
 function proxyMatchPath(path: string): string {
