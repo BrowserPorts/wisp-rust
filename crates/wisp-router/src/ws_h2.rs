@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
-use wisp_config::WispWtServerOptions;
+use wisp_config::{IngressMode, WispWtServerOptions};
 use wisp_ws_h2::{accept_h2_connection, H2ServeContext};
 
 use crate::tls::{build_h2_server_config, TlsError};
@@ -57,7 +58,7 @@ impl WsH2ListenerConfig {
     /// the WT pair is reused so a single PEM identity covers both
     /// transports on the same hostname.
     pub fn try_from_wisp_wt(cfg: &WispWtServerOptions) -> Result<Option<Self>, WsH2ListenerError> {
-        if !cfg.websocket.enabled || cfg.websocket.plain {
+        if !cfg.websocket.enabled || cfg.websocket.ingress_mode != IngressMode::DirectTls {
             return Ok(None);
         }
         let cert_path = cfg
@@ -72,10 +73,6 @@ impl WsH2ListenerConfig {
             .clone()
             .or_else(|| cfg.key_path.clone())
             .ok_or(WsH2ListenerError::MissingKey)?;
-        // `[wisp_websocket.bind_addr]` wins when set so a deployment can
-        // configure the listener via one unified env-var-style string. We
-        // resolve through `to_socket_addrs` either way so an IPv6 literal
-        // like `[::]:8443` parses identically to the host+port pair.
         let (host, port, addrs_input) = if let Some(addr) = cfg.websocket.bind_addr.as_deref() {
             (addr.to_owned(), 0u16, addr.to_owned())
         } else {
@@ -128,15 +125,16 @@ pub async fn serve_ws_h2_listener(
                 source,
             })?;
     info!(addr = %cfg.bind_addr, "wisp ws-h2 listener ready");
+    let preauth_limit = usize::try_from(ctx.options.max_connections)
+        .ok()
+        .filter(|limit| *limit > 0)
+        .unwrap_or(4096);
+    let preauth = Arc::new(Semaphore::new(preauth_limit));
 
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                // Per the wispmark Bun reference, transient accept errors
-                // are logged and the loop continues; only a hard OS error
-                // that closes the listener exits the loop (the `?` on
-                // `bind` above is the only fatal exit).
                 warn!(error = %e, "ws-h2 accept error");
                 continue;
             }
@@ -145,14 +143,26 @@ pub async fn serve_ws_h2_listener(
         let acceptor = acceptor.clone();
         let ctx = ctx.clone();
         let client_ip = peer.ip().to_string();
+        let Ok(preauth_permit) = preauth.clone().try_acquire_owned() else {
+            debug!(peer = %peer, "ws-h2 pre-authentication cap reached");
+            continue;
+        };
         tokio::spawn(async move {
-            let tls = match acceptor.accept(tcp).await {
-                Ok(t) => t,
-                Err(e) => {
+            let handshake_timeout = std::time::Duration::from_millis(
+                ctx.options.handshake_timeout_ms.unwrap_or(10_000),
+            );
+            let tls = match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
                     debug!(peer = %peer, error = %e, "ws-h2 tls handshake failed");
                     return;
                 }
+                Err(_) => {
+                    debug!(peer = %peer, "ws-h2 tls handshake timed out");
+                    return;
+                }
             };
+            let _preauth_permit = preauth_permit;
             if let Err(e) = accept_h2_connection(tls, client_ip, ctx).await {
                 debug!(peer = %peer, error = %e, "ws-h2 connection ended");
             }
