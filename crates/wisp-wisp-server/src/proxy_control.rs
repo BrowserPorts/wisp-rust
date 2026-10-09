@@ -1,6 +1,5 @@
-//! STELLITE_PROXY_CONTROL (extension 0x03) text-channel router.
+//! WISP_PROXY_CONTROL (extension 0x03) text-channel router.
 //!
-//! Wire-compatible with `stellite-wisp/src/wisp/server.ts#handleText`.
 //! Text frames on the WebSocket carry JSON requests; the router dispatches
 //! by `type` field, mutates [`ControllerState`], and returns a JSON reply.
 //! The connection driver wraps each reply into one text-frame response.
@@ -28,10 +27,14 @@ use tokio::net::TcpStream;
 use tracing::warn;
 use url::Url;
 
+use wisp_proxy::HostPolicy;
 use wisp_proxy_base::{
-    open_proxy_tcp_socket, ActiveProxy, ProxyProvider, ProxyProviderRequest, ProxyResolveError,
-    ProxyTunnelError, SharedProvider,
+    open_proxy_tcp_socket, ActiveProxy, ActiveProxyMetadata, ProxyLocationSelection, ProxyProvider,
+    ProxyProviderLocations, ProxyProviderRequest, ProxyResolveError, ProxyTunnelError,
+    SharedProvider,
 };
+
+use crate::stream::{connect_checked_tcp, ConnectError};
 
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -100,6 +103,9 @@ pub enum ProxyControlRequest {
     ProxyListProviders,
 }
 
+/// Route configuration accepted from the runtime bridge. Field names
+/// serialize in camelCase because the bridge sends `routeId` / `targetUrls`
+/// / `ipType`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyRouteConfig {
@@ -118,6 +124,8 @@ pub struct ProxyRouteConfig {
     pub ip_type: Option<String>,
 }
 
+/// Route snapshot returned to the runtime bridge. camelCase for the same
+/// bridge-boundary reason as [`ProxyRouteConfig`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyRouteSnapshot {
@@ -133,9 +141,11 @@ pub struct ProxyRouteSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<ActiveProxy>,
+    pub active: Option<ActiveProxyMetadata>,
 }
 
+/// Runtime proxy policy exchanged with the runtime bridge. camelCase for the
+/// same bridge-boundary reason as [`ProxyRouteConfig`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyRuntimePolicy {
@@ -167,8 +177,8 @@ pub enum ProxyConnectError {
     Resolve(#[from] ProxyResolveError),
     #[error("proxy tunnel failed: {0}")]
     Tunnel(#[from] ProxyTunnelError),
-    #[error("direct connect failed: {0}")]
-    Direct(#[from] std::io::Error),
+    #[error(transparent)]
+    Connect(#[from] ConnectError),
     #[error("no provider matches the request")]
     NoProvider,
     #[error("provider is not configured")]
@@ -267,7 +277,7 @@ fn snapshot_route(route: &SharedProxyRoute) -> ProxyRouteSnapshot {
         country: route.request.country.clone(),
         city: route.request.city.clone(),
         ip_type: route.request.ip_type.clone(),
-        active: route.active.clone(),
+        active: route.active.as_ref().map(ActiveProxyMetadata::from),
     }
 }
 
@@ -305,6 +315,7 @@ fn proxy_egress_ip(proxy: &ActiveProxy) -> Option<String> {
         ActiveProxy::Direct => None,
         ActiveProxy::Mullvad { relay, .. } => relay.as_ref().map(|r| r.ipv4_addr.clone()),
         ActiveProxy::Resi { proxy } => Some(proxy.host.clone()),
+        ActiveProxy::ResiWireguard { .. } => None,
     }
 }
 
@@ -315,10 +326,9 @@ fn proxy_egress_ip(proxy: &ActiveProxy) -> Option<String> {
 /// that shares the providers but owns its own rules, current proxy,
 /// enabled flag, and upstream rate limiter.
 ///
-/// Audit-2 fix #55 split this off from `ProxyController` so a single
-/// abuser cannot starve every other tenant's rate-limit budget, exhaust
-/// the rules cap for everyone, or flip the shared "current proxy" out
-/// from under siblings.
+/// The per-connection split ensures a single abuser cannot starve every
+/// other tenant's rate-limit budget, exhaust the rules cap for everyone, or
+/// flip the shared "current proxy" out from under siblings.
 pub struct ProxyControllerTemplate {
     providers: Vec<SharedProvider>,
     shared: Arc<Mutex<SharedControllerState>>,
@@ -448,25 +458,14 @@ impl ProxyControllerTemplate {
 
     pub fn egress_inventory(&self) -> Value {
         let guard = self.shared.lock();
-        let mut routes: Vec<Value> = guard
-            .routes
-            .values()
-            .map(|route| serde_json::to_value(snapshot_route(route)).unwrap_or(Value::Null))
-            .collect();
-        routes.sort_by(|a, b| {
-            let left = a.get("routeId").and_then(Value::as_str).unwrap_or_default();
-            let right = b.get("routeId").and_then(Value::as_str).unwrap_or_default();
-            left.cmp(right)
-        });
-        json!({
-            "routes": routes,
-            "blockedEgressIps": sorted_blocked_ips(&guard.blocked_egress_ips),
-            "policy": guard.policy,
+        let mut routes: Vec<ProxyRouteSnapshot> =
+            guard.routes.values().map(snapshot_route).collect();
+        routes.sort_by(|a, b| a.route_id.cmp(&b.route_id));
+        json!(EgressInventory {
+            routes,
+            blocked_egress_ips: sorted_blocked_ips(&guard.blocked_egress_ips),
+            policy: guard.policy.clone(),
         })
-    }
-
-    fn find_for_request(&self, req: &ProxyProviderRequest) -> Option<&SharedProvider> {
-        self.providers.iter().find(|p| p.can_resolve(req))
     }
 
     fn find_by_id(&self, id: &str) -> Option<&SharedProvider> {
@@ -477,7 +476,7 @@ impl ProxyControllerTemplate {
         &self,
         request: &ProxyProviderRequest,
     ) -> Result<ActiveProxy, ProxyConnectError> {
-        let Some(provider) = self.find_for_request(request) else {
+        let Some(provider) = self.providers.iter().find(|p| p.can_resolve(request)) else {
             return Err(ProxyConnectError::NoProvider);
         };
         if !provider.is_configured() {
@@ -544,12 +543,29 @@ impl ProxyController {
         self.state.lock().current.clone()
     }
 
+    /// Establish an upstream TCP connection for `host:port`, applying the
+    /// per-connection domain rule, shared route, always-on current proxy,
+    /// runtime default proxy, or direct connect in that order. When none
+    /// apply and `force_proxy` is false, the direct fallback resolves and
+    /// connects through `policy`, so every resolved address is re-checked
+    /// against [`HostPolicy`] and a DNS name pointing at a private/loopback
+    /// address cannot bypass the gate.
     pub async fn connect_tcp(
         &self,
         host: &str,
         port: u16,
         force_proxy: bool,
+        policy: &HostPolicy,
     ) -> Result<(TcpStream, Option<ActiveProxy>), ProxyConnectError> {
+        if let Some(request) = self.rule_for_host(host) {
+            if !is_direct_provider(request.provider.as_deref()) {
+                let proxy = self.proxy_for_request(&request).await?;
+                self.check_proxy_allowed(&proxy)?;
+                let stream = open_proxy_tcp_socket(&proxy, host, port).await?;
+                return Ok((stream, Some(proxy)));
+            }
+        }
+
         if let Some((route_id, request, current)) = self.shared_route_for_host(host) {
             let proxy = if let Some(proxy) = current {
                 proxy
@@ -561,6 +577,14 @@ impl ProxyController {
             self.check_proxy_allowed(&proxy)?;
             let stream = open_proxy_tcp_socket(&proxy, host, port).await?;
             return Ok((stream, Some(proxy)));
+        }
+
+        if self.mode_is_always() {
+            if let Some(proxy) = self.current_when_enabled() {
+                self.check_proxy_allowed(&proxy)?;
+                let stream = open_proxy_tcp_socket(&proxy, host, port).await?;
+                return Ok((stream, Some(proxy)));
+            }
         }
 
         if let Some(request) = self.shared_default_request() {
@@ -580,7 +604,7 @@ impl ProxyController {
             return Err(ProxyConnectError::NoProxy);
         }
 
-        let stream = TcpStream::connect((host, port)).await?;
+        let stream = connect_checked_tcp(host, port, policy).await?;
         Ok((stream, None))
     }
 
@@ -654,6 +678,45 @@ impl ProxyController {
         }
     }
 
+    fn mode_is_always(&self) -> bool {
+        self.state.lock().mode == "always"
+    }
+
+    fn rule_for_host(&self, host: &str) -> Option<ProxyProviderRequest> {
+        let domain = normalize_domain(host);
+        let guard = self.state.lock();
+        if let Some(req) = guard.rules.get(&domain) {
+            return Some(req.clone());
+        }
+        let mut best: Option<(usize, ProxyProviderRequest)> = None;
+        for (pattern, req) in &guard.rules {
+            let suffix = pattern.strip_prefix("*.").unwrap_or(pattern.as_str());
+            if domain == suffix || domain.ends_with(&format!(".{suffix}")) {
+                let score = suffix.len();
+                if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                    best = Some((score, req.clone()));
+                }
+            }
+        }
+        best.map(|(_, req)| req)
+    }
+
+    async fn proxy_for_request(
+        &self,
+        request: &ProxyProviderRequest,
+    ) -> Result<ActiveProxy, ProxyConnectError> {
+        if let Some(current) = self.current_when_enabled() {
+            if proxy_satisfies_request(&current, request) {
+                return Ok(current);
+            }
+        }
+        let proxy = self.resolve_request(request).await?;
+        let mut guard = self.state.lock();
+        guard.current = Some(proxy.clone());
+        guard.enabled = true;
+        Ok(proxy)
+    }
+
     fn check_proxy_allowed(&self, proxy: &ActiveProxy) -> Result<(), ProxyConnectError> {
         let Some(ip) = proxy_egress_ip(proxy) else {
             return Ok(());
@@ -674,160 +737,35 @@ impl ProxyController {
                 city,
                 ip_type,
             } => {
-                if self.upstream_limiter.check().is_err() {
-                    return json!({
-                        "type": "proxy_set_result",
-                        "ok": false,
-                        "error": "rate limited",
-                    });
-                }
-                if let Some(bad) = oversized_field(
-                    &[
-                        provider.as_deref(),
-                        country.as_deref(),
-                        city.as_deref(),
-                        ip_type.as_deref(),
-                    ],
-                    self.limits.max_field_bytes,
-                ) {
-                    return json!({
-                        "type": "proxy_set_result",
-                        "ok": false,
-                        "error": format!("field too long: {bad}"),
-                    });
-                }
-                let request = ProxyProviderRequest {
-                    provider: provider.clone(),
-                    country,
-                    city,
-                    ip_type,
-                };
-                let provider_ref = self.find_for_request(&request);
-                let Some(p) = provider_ref else {
-                    return json!({
-                        "type": "proxy_set_result",
-                        "ok": false,
-                        "error": "no provider matches the request",
-                    });
-                };
-                if !self.provider_is_allowed(p.as_ref()) {
-                    return json!({
-                        "type": "proxy_set_result",
-                        "ok": false,
-                        "error": "provider requires authentication",
-                    });
-                }
-                if !p.is_configured() {
-                    return json!({
-                        "type": "proxy_set_result",
-                        "ok": false,
-                        "error": p.unconfigured_message(),
-                    });
-                }
-                match p.resolve(&request, None).await {
-                    Ok(Some(proxy)) => {
-                        let mut guard = self.state.lock();
-                        guard.current = Some(proxy.clone());
-                        guard.enabled = true;
-                        drop(guard);
-                        json!({
-                            "type": "proxy_set_result",
-                            "ok": true,
-                            "active": proxy,
-                        })
-                    }
-                    Ok(None) => json!({
-                        "type": "proxy_set_result",
-                        "ok": false,
-                        "error": "provider returned no proxy",
-                    }),
-                    Err(e) => {
-                        warn!(provider = p.id(), error = %e, "proxy_set: resolve failed");
-                        json!({
-                            "type": "proxy_set_result",
-                            "ok": false,
-                            "error": e.to_string(),
-                        })
-                    }
-                }
+                self.dispatch_proxy_set(provider, country, city, ip_type)
+                    .await
             }
-            ProxyControlRequest::ProxyRotate => {
-                if self.upstream_limiter.check().is_err() {
-                    return json!({
-                        "type": "proxy_rotate_result",
-                        "ok": false,
-                        "error": "rate limited",
-                    });
-                }
-                let prev = self.state.lock().current.clone();
-                let Some(prev) = prev else {
-                    return json!({
-                        "type": "proxy_rotate_result",
-                        "ok": false,
-                        "error": "no active proxy",
-                    });
-                };
-                let provider_ref = self.find_by_id(prev.provider_id());
-                let Some(p) = provider_ref else {
-                    return json!({
-                        "type": "proxy_rotate_result",
-                        "ok": false,
-                        "error": "provider not registered",
-                    });
-                };
-                if !self.provider_is_allowed(p.as_ref()) {
-                    return json!({
-                        "type": "proxy_rotate_result",
-                        "ok": false,
-                        "error": "provider requires authentication",
-                    });
-                }
-                match p.rotate(&prev).await {
-                    Ok(Some(proxy)) => {
-                        self.state.lock().current = Some(proxy.clone());
-                        json!({
-                            "type": "proxy_rotate_result",
-                            "ok": true,
-                            "active": proxy,
-                        })
-                    }
-                    Ok(None) => json!({
-                        "type": "proxy_rotate_result",
-                        "ok": false,
-                        "error": "rotation returned no new proxy",
-                    }),
-                    Err(e) => json!({
-                        "type": "proxy_rotate_result",
-                        "ok": false,
-                        "error": e.to_string(),
-                    }),
-                }
-            }
+            ProxyControlRequest::ProxyRotate => self.dispatch_proxy_rotate().await,
             ProxyControlRequest::ProxyOn => {
                 if self.mutation_limiter.check().is_err() {
-                    return json!({"type": "proxy_state", "ok": false, "error": "rate limited"});
+                    return json!(ProxyStateReply::rate_limited());
                 }
                 self.state.lock().enabled = true;
-                json!({"type": "proxy_state", "enabled": true})
+                json!(ProxyStateReply::enabled(true))
             }
             ProxyControlRequest::ProxyOff => {
                 if self.mutation_limiter.check().is_err() {
-                    return json!({"type": "proxy_state", "ok": false, "error": "rate limited"});
+                    return json!(ProxyStateReply::rate_limited());
                 }
                 let mut guard = self.state.lock();
                 guard.enabled = false;
                 guard.current = None;
-                json!({"type": "proxy_state", "enabled": false})
+                json!(ProxyStateReply::enabled(false))
             }
             ProxyControlRequest::ProxyMode { mode } => {
                 if self.mutation_limiter.check().is_err() {
-                    return json!({"type": "proxy_mode", "ok": false, "error": "rate limited"});
+                    return json!(ProxyModeReply::error("rate limited"));
                 }
                 if mode.len() > self.limits.max_field_bytes {
-                    return json!({"type": "proxy_mode", "ok": false, "error": "mode too long"});
+                    return json!(ProxyModeReply::error("mode too long"));
                 }
                 self.state.lock().mode = mode.clone();
-                json!({"type": "proxy_mode", "mode": mode})
+                json!(ProxyModeReply::ok(mode))
             }
             ProxyControlRequest::ProxyRule {
                 domain,
@@ -836,195 +774,244 @@ impl ProxyController {
                 city,
                 ip_type,
             } => {
-                if self.mutation_limiter.check().is_err() {
-                    return json!({
-                        "type": "proxy_rule_set",
-                        "domain": domain,
-                        "ok": false,
-                        "error": "rate limited",
-                    });
-                }
-                if domain.len() > self.limits.max_field_bytes {
-                    return json!({
-                        "type": "proxy_rule_set",
-                        "ok": false,
-                        "error": "domain too long",
-                    });
-                }
-                if let Some(bad) = oversized_field(
-                    &[
-                        provider.as_deref(),
-                        country.as_deref(),
-                        city.as_deref(),
-                        ip_type.as_deref(),
-                    ],
-                    self.limits.max_field_bytes,
-                ) {
-                    return json!({
-                        "type": "proxy_rule_set",
-                        "domain": domain,
-                        "ok": false,
-                        "error": format!("field too long: {bad}"),
-                    });
-                }
-                let request = ProxyProviderRequest {
-                    provider,
-                    country,
-                    city,
-                    ip_type,
-                };
-                if request.provider.is_some() {
-                    let provider_ref = self.find_for_request(&request);
-                    let Some(p) = provider_ref else {
-                        return json!({
-                            "type": "proxy_rule_set",
-                            "domain": domain,
-                            "ok": false,
-                            "error": "no provider matches the request",
-                        });
-                    };
-                    if !self.provider_is_allowed(p.as_ref()) {
-                        return json!({
-                            "type": "proxy_rule_set",
-                            "domain": domain,
-                            "ok": false,
-                            "error": "provider requires authentication",
-                        });
-                    }
-                }
-                let mut guard = self.state.lock();
-                if guard.rules.len() >= self.limits.max_rules && !guard.rules.contains_key(&domain)
-                {
-                    return json!({
-                        "type": "proxy_rule_set",
-                        "domain": domain,
-                        "ok": false,
-                        "error": "rule cap reached",
-                    });
-                }
-                guard.rules.insert(domain.clone(), request);
-                drop(guard);
-                json!({"type": "proxy_rule_set", "domain": domain, "ok": true})
+                self.dispatch_proxy_rule(domain, provider, country, city, ip_type)
+                    .await
             }
             ProxyControlRequest::ProxyRuleRemove { domain } => {
                 if self.mutation_limiter.check().is_err() {
-                    return json!({
-                        "type": "proxy_rule_removed",
-                        "domain": domain,
-                        "removed": false,
-                        "error": "rate limited",
-                    });
+                    return json!(ProxyRuleRemovedReply::rate_limited(domain));
                 }
                 let removed = self.state.lock().rules.remove(&domain).is_some();
-                json!({"type": "proxy_rule_removed", "domain": domain, "removed": removed})
+                json!(ProxyRuleRemovedReply::removed(domain, removed))
             }
             ProxyControlRequest::ProxyLocations { provider } => {
-                if self.upstream_limiter.check().is_err() {
-                    return json!({
-                        "type": "proxy_locations_result",
-                        "ok": false,
-                        "error": "rate limited",
-                    });
-                }
-                let target = provider.as_deref();
-                // Audit-2 fix #56: enforce the cumulative reply-size budget
-                // INSIDE the provider loop. Previously we materialized every
-                // provider's full ProxyProviderLocations into a Vec<Value>,
-                // serialized the whole tree to a String, and only then
-                // checked the cap — a misbehaving provider returning 500 MB
-                // of country names spent 1 GB of heap before the check
-                // engaged. Now we serialize each provider's entry on its
-                // own, check both a per-provider sub-cap and the running
-                // total against MAX_PROXY_CONTROL_REPLY_BYTES, and bail out
-                // early if anything overflows.
-                let max_reply_bytes = self.limits.max_reply_bytes;
-                let per_provider_cap = max_reply_bytes / 2;
-                let reply_overhead: usize = 64;
-                let mut out: Vec<Value> = Vec::with_capacity(self.providers.len());
-                let mut running_bytes: usize = reply_overhead;
-                let mut truncated = false;
-                for p in &self.providers {
-                    if let Some(t) = target {
-                        if !p.matches(t) {
-                            continue;
-                        }
-                    }
-                    if !self.provider_is_allowed(p.as_ref()) {
-                        continue;
-                    }
-                    match p.locations().await {
-                        Ok(Some(locs)) => {
-                            let entry = json!({
-                                "provider": p.id(),
-                                "name": p.name(),
-                                "locations": locs,
-                            });
-                            let entry_bytes = match measure_json_capped(&entry, per_provider_cap) {
-                                MeasureResult::Within(n) => n,
-                                MeasureResult::Overflow => usize::MAX,
-                            };
-                            if entry_bytes > per_provider_cap {
-                                warn!(
-                                    provider = p.id(),
-                                    bytes = entry_bytes,
-                                    cap = per_provider_cap,
-                                    "proxy_locations: provider entry exceeds per-provider cap, skipping",
-                                );
-                                truncated = true;
-                                continue;
-                            }
-                            if running_bytes.saturating_add(entry_bytes) > max_reply_bytes {
-                                warn!(
-                                    bytes = running_bytes + entry_bytes,
-                                    cap = max_reply_bytes,
-                                    "proxy_locations: reply budget exhausted, stopping accumulation",
-                                );
-                                truncated = true;
-                                break;
-                            }
-                            running_bytes = running_bytes.saturating_add(entry_bytes);
-                            out.push(entry);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!(provider = p.id(), error = %e, "proxy_locations: failed");
-                        }
-                    }
-                }
-                let mut reply = json!({"type": "proxy_locations_result", "providers": out});
-                if truncated {
-                    reply["truncated"] = Value::Bool(true);
-                }
-                reply
+                self.dispatch_proxy_locations(provider).await
             }
             ProxyControlRequest::ProxyListProviders => {
                 if self.mutation_limiter.check().is_err() {
-                    return json!({
-                        "type": "proxy_list",
-                        "ok": false,
-                        "error": "rate limited",
-                    });
+                    return json!(ProxyListReply::rate_limited());
                 }
-                let list: Vec<Value> = self
+                let providers: Vec<ProviderEntry> = self
                     .providers
                     .iter()
-                    .filter(|p| self.provider_is_allowed(p.as_ref()))
-                    .map(|p| {
-                        json!({
-                            "id": p.id(),
-                            "name": p.name(),
-                            "aliases": p.aliases(),
-                            "configured": p.is_configured(),
-                        })
+                    .map(|p| ProviderEntry {
+                        id: p.id().to_owned(),
+                        name: p.name().to_owned(),
+                        aliases: p.aliases().iter().map(|a| (*a).to_owned()).collect(),
+                        configured: p.is_configured(),
+                        available: p.is_configured() && self.provider_is_allowed(p.as_ref()),
+                        location_selection: p.location_selection(),
                     })
                     .collect();
-                json!({"type": "proxy_list", "providers": list})
+                json!(ProxyListReply::ok(providers))
             }
         }
     }
 
+    async fn dispatch_proxy_set(
+        &self,
+        provider: Option<String>,
+        country: Option<String>,
+        city: Option<String>,
+        ip_type: Option<String>,
+    ) -> Value {
+        if self.upstream_limiter.check().is_err() {
+            return json!(ProxySetReply::error("rate limited"));
+        }
+        if let Some(bad) = oversized_field(
+            &[
+                provider.as_deref(),
+                country.as_deref(),
+                city.as_deref(),
+                ip_type.as_deref(),
+            ],
+            self.limits.max_field_bytes,
+        ) {
+            return json!(ProxySetReply::error(format!("field too long: {bad}")));
+        }
+        let request = ProxyProviderRequest {
+            provider: provider.clone(),
+            country,
+            city,
+            ip_type,
+        };
+        let Some(p) = self.find_for_request(&request) else {
+            return json!(ProxySetReply::error("no provider matches the request"));
+        };
+        if !self.provider_is_allowed(p.as_ref()) {
+            return json!(ProxySetReply::error("provider requires authentication"));
+        }
+        if !p.is_configured() {
+            return json!(ProxySetReply::error(p.unconfigured_message().to_string()));
+        }
+        match p.resolve(&request, None).await {
+            Ok(Some(proxy)) => {
+                let mut guard = self.state.lock();
+                guard.current = Some(proxy.clone());
+                guard.enabled = true;
+                drop(guard);
+                json!(ProxySetReply::ok(proxy))
+            }
+            Ok(None) => json!(ProxySetReply::error("provider returned no proxy")),
+            Err(e) => {
+                warn!(provider = p.id(), error = %e, "proxy_set: resolve failed");
+                json!(ProxySetReply::error(e.to_string()))
+            }
+        }
+    }
+
+    async fn dispatch_proxy_rotate(&self) -> Value {
+        if self.upstream_limiter.check().is_err() {
+            return json!(ProxyRotateReply::error("rate limited"));
+        }
+        let prev = self.state.lock().current.clone();
+        let Some(prev) = prev else {
+            return json!(ProxyRotateReply::error("no active proxy"));
+        };
+        let Some(p) = self.find_by_id(prev.provider_id()) else {
+            return json!(ProxyRotateReply::error("provider not registered"));
+        };
+        if !self.provider_is_allowed(p.as_ref()) {
+            return json!(ProxyRotateReply::error("provider requires authentication"));
+        }
+        match p.rotate(&prev).await {
+            Ok(Some(proxy)) => {
+                self.state.lock().current = Some(proxy.clone());
+                json!(ProxyRotateReply::ok(proxy))
+            }
+            Ok(None) => json!(ProxyRotateReply::error("rotation returned no new proxy")),
+            Err(e) => json!(ProxyRotateReply::error(e.to_string())),
+        }
+    }
+
+    async fn dispatch_proxy_rule(
+        &self,
+        domain: String,
+        provider: Option<String>,
+        country: Option<String>,
+        city: Option<String>,
+        ip_type: Option<String>,
+    ) -> Value {
+        if self.mutation_limiter.check().is_err() {
+            return json!(ProxyRuleSetReply::error(Some(domain), "rate limited"));
+        }
+        if domain.len() > self.limits.max_field_bytes {
+            return json!(ProxyRuleSetReply::error(None, "domain too long"));
+        }
+        if let Some(bad) = oversized_field(
+            &[
+                provider.as_deref(),
+                country.as_deref(),
+                city.as_deref(),
+                ip_type.as_deref(),
+            ],
+            self.limits.max_field_bytes,
+        ) {
+            return json!(ProxyRuleSetReply::error(
+                Some(domain),
+                format!("field too long: {bad}"),
+            ));
+        }
+        let request = ProxyProviderRequest {
+            provider,
+            country,
+            city,
+            ip_type,
+        };
+        if request.provider.is_some() && !is_direct_provider(request.provider.as_deref()) {
+            let Some(p) = self.find_for_request(&request) else {
+                return json!(ProxyRuleSetReply::error(
+                    Some(domain),
+                    "no provider matches the request",
+                ));
+            };
+            if !self.provider_is_allowed(p.as_ref()) {
+                return json!(ProxyRuleSetReply::error(
+                    Some(domain),
+                    "provider requires authentication",
+                ));
+            }
+        }
+        let domain = normalize_domain(&domain);
+        if domain.is_empty() {
+            return json!(ProxyRuleSetReply::error(None, "invalid domain"));
+        }
+        let mut guard = self.state.lock();
+        if guard.rules.len() >= self.limits.max_rules && !guard.rules.contains_key(&domain) {
+            return json!(ProxyRuleSetReply::error(Some(domain), "rule cap reached"));
+        }
+        guard.rules.insert(domain.clone(), request);
+        drop(guard);
+        json!(ProxyRuleSetReply::ok(domain))
+    }
+
+    async fn dispatch_proxy_locations(&self, provider: Option<String>) -> Value {
+        if self.upstream_limiter.check().is_err() {
+            return json!(ProxyLocationsReply::error("rate limited"));
+        }
+        let target = provider.as_deref();
+        let max_reply_bytes = self.limits.max_reply_bytes;
+        let per_provider_cap = max_reply_bytes / 2;
+        let reply_overhead: usize = 64;
+        let mut out: Vec<ProviderLocations> = Vec::with_capacity(self.providers.len());
+        let mut running_bytes: usize = reply_overhead;
+        let mut truncated = false;
+        for p in &self.providers {
+            if let Some(t) = target {
+                if !p.matches(t) {
+                    continue;
+                }
+            }
+            if !self.provider_is_allowed(p.as_ref()) {
+                continue;
+            }
+            match p.locations().await {
+                Ok(Some(locs)) => {
+                    let entry = ProviderLocations {
+                        provider: p.id().to_owned(),
+                        name: p.name().to_owned(),
+                        locations: locs,
+                    };
+                    let entry_bytes = match measure_json_capped(&entry, per_provider_cap) {
+                        MeasureResult::Within(n) => n,
+                        MeasureResult::Overflow => usize::MAX,
+                    };
+                    if entry_bytes > per_provider_cap {
+                        warn!(
+                            provider = p.id(),
+                            bytes = entry_bytes,
+                            cap = per_provider_cap,
+                            "proxy_locations: provider entry exceeds per-provider cap, skipping",
+                        );
+                        truncated = true;
+                        continue;
+                    }
+                    if running_bytes.saturating_add(entry_bytes) > max_reply_bytes {
+                        warn!(
+                            bytes = running_bytes + entry_bytes,
+                            cap = max_reply_bytes,
+                            "proxy_locations: reply budget exhausted, stopping accumulation",
+                        );
+                        truncated = true;
+                        break;
+                    }
+                    running_bytes = running_bytes.saturating_add(entry_bytes);
+                    out.push(entry);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(provider = p.id(), error = %e, "proxy_locations: failed");
+                }
+            }
+        }
+        json!(ProxyLocationsReply::ok(out, truncated))
+    }
+
     fn provider_is_allowed(&self, provider: &dyn ProxyProvider) -> bool {
-        if provider.matches("resi") || provider.matches("mysterium") {
+        if provider.matches("resi")
+            || provider.matches("mysterium")
+            || provider.matches("mullvad")
+        {
             return self
                 .allowed_proxy_providers
                 .as_ref()
@@ -1038,15 +1025,326 @@ impl ProxyController {
     }
 }
 
+fn is_direct_provider(provider: Option<&str>) -> bool {
+    matches!(provider, Some("none") | Some("direct") | Some(""))
+}
+
+fn proxy_satisfies_request(proxy: &ActiveProxy, request: &ProxyProviderRequest) -> bool {
+    if let Some(provider) = request.provider.as_deref() {
+        if !is_direct_provider(Some(provider)) && proxy.provider_id() != provider {
+            return false;
+        }
+    }
+    match proxy {
+        ActiveProxy::Mullvad {
+            relay: Some(relay), ..
+        } => {
+            if let Some(country) = request.country.as_deref() {
+                if !country.is_empty() && relay.country_code != country {
+                    return false;
+                }
+            }
+            if let Some(city) = request.city.as_deref() {
+                if !city.is_empty() && relay.city_code != city {
+                    return false;
+                }
+            }
+            true
+        }
+        ActiveProxy::Resi { proxy } => request
+            .country
+            .as_deref()
+            .filter(|country| !country.is_empty())
+            .is_none_or(|country| proxy.country.eq_ignore_ascii_case(country)),
+        ActiveProxy::ResiWireguard { country, .. } => request
+            .country
+            .as_deref()
+            .filter(|requested| !requested.is_empty())
+            .is_none_or(|requested| country.eq_ignore_ascii_case(requested)),
+        _ => request.country.is_none() && request.city.is_none(),
+    }
+}
+
 fn provider_allowed_by_set(provider: &dyn ProxyProvider, allowed: &HashSet<String>) -> bool {
     allowed.iter().any(|requested| provider.matches(requested))
 }
 
-/// Audit-3 fix #66: streaming length sink. `serde_json::to_writer` pushes
-/// bytes into this; the moment the running count crosses `cap` we return
-/// `ErrorKind::Other` so the serializer aborts. Avoids the
-/// `to_string().len()` round-trip that materialized the full provider tree
-/// into a `String` (2-3x heap) just to measure it.
+#[derive(Serialize)]
+struct EgressInventory {
+    routes: Vec<ProxyRouteSnapshot>,
+    #[serde(rename = "blockedEgressIps")]
+    blocked_egress_ips: Vec<String>,
+    policy: ProxyRuntimePolicy,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_set_result")]
+struct ProxySetReply {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<ActiveProxyMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxySetReply {
+    fn ok(active: ActiveProxy) -> Self {
+        Self {
+            ok: true,
+            active: Some(ActiveProxyMetadata::from(&active)),
+            error: None,
+        }
+    }
+    fn error(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            active: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_rotate_result")]
+struct ProxyRotateReply {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<ActiveProxyMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxyRotateReply {
+    fn ok(active: ActiveProxy) -> Self {
+        Self {
+            ok: true,
+            active: Some(ActiveProxyMetadata::from(&active)),
+            error: None,
+        }
+    }
+    fn error(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            active: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_state")]
+struct ProxyStateReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxyStateReply {
+    fn enabled(enabled: bool) -> Self {
+        Self {
+            ok: None,
+            enabled: Some(enabled),
+            error: None,
+        }
+    }
+    fn rate_limited() -> Self {
+        Self {
+            ok: Some(false),
+            enabled: None,
+            error: Some("rate limited".to_owned()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_mode")]
+struct ProxyModeReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxyModeReply {
+    fn ok(mode: String) -> Self {
+        Self {
+            ok: None,
+            mode: Some(mode),
+            error: None,
+        }
+    }
+    fn error(error: impl Into<String>) -> Self {
+        Self {
+            ok: Some(false),
+            mode: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_rule_set")]
+struct ProxyRuleSetReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxyRuleSetReply {
+    fn ok(domain: String) -> Self {
+        Self {
+            domain: Some(domain),
+            ok: true,
+            error: None,
+        }
+    }
+    fn error(domain: Option<String>, error: impl Into<String>) -> Self {
+        Self {
+            domain,
+            ok: false,
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_rule_removed")]
+struct ProxyRuleRemovedReply {
+    domain: String,
+    removed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxyRuleRemovedReply {
+    fn removed(domain: String, removed: bool) -> Self {
+        Self {
+            domain,
+            removed,
+            error: None,
+        }
+    }
+    fn rate_limited(domain: String) -> Self {
+        Self {
+            domain,
+            removed: false,
+            error: Some("rate limited".to_owned()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProviderEntry {
+    id: String,
+    name: String,
+    aliases: Vec<String>,
+    configured: bool,
+    available: bool,
+    #[serde(rename = "locationSelection")]
+    location_selection: ProxyLocationSelection,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_list")]
+struct ProxyListReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    providers: Option<Vec<ProviderEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ProxyListReply {
+    fn ok(providers: Vec<ProviderEntry>) -> Self {
+        Self {
+            ok: None,
+            providers: Some(providers),
+            error: None,
+        }
+    }
+    fn rate_limited() -> Self {
+        Self {
+            ok: Some(false),
+            providers: None,
+            error: Some("rate limited".to_owned()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProviderLocations {
+    provider: String,
+    name: String,
+    locations: ProxyProviderLocations,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_locations_result")]
+struct ProxyLocationsReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    providers: Option<Vec<ProviderLocations>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
+}
+
+impl ProxyLocationsReply {
+    fn ok(providers: Vec<ProviderLocations>, truncated: bool) -> Self {
+        Self {
+            ok: None,
+            providers: Some(providers),
+            error: None,
+            truncated,
+        }
+    }
+    fn error(error: impl Into<String>) -> Self {
+        Self {
+            ok: Some(false),
+            providers: None,
+            error: Some(error.into()),
+            truncated: false,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "proxy_control_error")]
+struct ProxyControlErrorReply {
+    ok: bool,
+    error: String,
+}
+
+impl ProxyControlErrorReply {
+    fn new(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: error.into(),
+        }
+    }
+}
+
+/// Serialize a normalized `proxy_control_error` text-frame reply
+/// (`{type:"proxy_control_error", ok:false, error:"..."}`).
+pub(crate) fn proxy_control_error_frame(error: &str) -> String {
+    serde_json::to_string(&ProxyControlErrorReply::new(error))
+        .unwrap_or_else(|_| String::from(r#"{"type":"proxy_control_error","ok":false,"error":""}"#))
+}
+
+/// Streaming length sink. `serde_json::to_writer` pushes bytes into this; the
+/// moment the running count crosses `cap` we return an error so the serializer
+/// aborts. Avoids materializing the full provider tree into a `String` just to
+/// measure it.
 struct LengthCappedWriter {
     written: usize,
     cap: usize,
@@ -1074,7 +1372,7 @@ enum MeasureResult {
     Overflow,
 }
 
-fn measure_json_capped(value: &Value, cap: usize) -> MeasureResult {
+fn measure_json_capped<T: Serialize>(value: &T, cap: usize) -> MeasureResult {
     let mut sink = LengthCappedWriter {
         written: 0,
         cap,
@@ -1082,7 +1380,6 @@ fn measure_json_capped(value: &Value, cap: usize) -> MeasureResult {
     };
     match serde_json::to_writer(&mut sink, value) {
         Ok(()) => MeasureResult::Within(sink.written),
-        Err(_) if sink.overflow => MeasureResult::Overflow,
         Err(_) => MeasureResult::Overflow,
     }
 }
@@ -1099,7 +1396,7 @@ fn oversized_field<'a>(fields: &[Option<&'a str>], max: usize) -> Option<&'a str
 /// Try to parse a text frame as a proxy_control request and dispatch it.
 /// Returns the JSON reply (already serialized) on success, or `None` if the
 /// text wasn't a valid request shape — invalid text frames are silently
-/// dropped to match the legacy server's tolerance for cross-extension noise.
+/// dropped so unrelated cross-extension noise does not tear down the channel.
 pub async fn handle_proxy_control_text(
     controller: &Arc<ProxyController>,
     text: &str,
@@ -1118,8 +1415,7 @@ pub async fn handle_proxy_control_text(
             len = s.len(),
             "proxy_control: reply too large, replacing with error"
         );
-        let err = json!({"type": "proxy_control_error", "error": "reply too large"});
-        return serde_json::to_string(&err).ok();
+        return serde_json::to_string(&ProxyControlErrorReply::new("reply too large")).ok();
     }
     Some(s)
 }
@@ -1174,6 +1470,11 @@ mod tests {
         limits: ProxyControlLimits,
     ) -> Arc<ProxyController> {
         ProxyControllerTemplate::new(providers).spawn(limits, None)
+    }
+
+    fn loopback_policy() -> HostPolicy {
+        let opts = wisp_config::WispServerOptions::default();
+        HostPolicy::from_options(&opts)
     }
 
     #[tokio::test]
@@ -1253,6 +1554,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_control_error_reply_is_normalized() {
+        let reply = ProxyControlErrorReply::new("boom");
+        let value = json!(reply);
+        assert_eq!(value["type"], "proxy_control_error");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"], "boom");
+    }
+
+    #[test]
+    fn public_proxy_dtos_redact_residential_credentials() {
+        let active = ActiveProxy::Resi {
+            proxy: wisp_proxy_base::ResidentialProxy {
+                host: "proxy.example".to_owned(),
+                port: 8443,
+                username: "secret-user".to_owned(),
+                password: "secret-password".to_owned(),
+                country: "us".to_owned(),
+            },
+        };
+        let reply = ProxySetReply::ok(active.clone());
+        let value = json!(reply);
+
+        assert_eq!(value["type"], "proxy_set_result");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["active"]["type"], "resi");
+        assert_eq!(value["active"]["proxy"]["host"], "proxy.example");
+        assert!(value["active"]["proxy"].get("username").is_none());
+        assert!(value["active"]["proxy"].get("password").is_none());
+
+        let route = SharedProxyRoute {
+            route_id: "route".to_owned(),
+            domains: vec!["example.com".to_owned()],
+            target_urls: Vec::new(),
+            request: ProxyProviderRequest::default(),
+            active: Some(active),
+        };
+        let value = json!(snapshot_route(&route));
+        assert_eq!(value["active"]["type"], "resi");
+        assert!(value["active"]["proxy"].get("username").is_none());
+        assert!(value["active"]["proxy"].get("password").is_none());
+    }
+
+    #[tokio::test]
     async fn proxy_rule_cap_rejects_after_max() {
         let limits = ProxyControlLimits::default();
         let controller = test_controller(vec![], limits);
@@ -1282,7 +1626,7 @@ mod tests {
         let reply = controller
             .dispatch(ProxyControlRequest::ProxyRule {
                 domain: "d0.example".into(),
-                provider: Some("anything".into()),
+                provider: None,
                 country: None,
                 city: None,
                 ip_type: None,
@@ -1344,6 +1688,25 @@ mod tests {
         assert!(
             b.current().is_none(),
             "spawned controllers must not share state"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_direct_fallback_rejects_loopback_via_policy() {
+        let controller = test_controller(vec![], ProxyControlLimits::default());
+        let policy = loopback_policy();
+        let err = controller
+            .connect_tcp("127.0.0.1", 80, false, &policy)
+            .await
+            .expect_err("loopback direct connect must be blocked by policy");
+        assert!(
+            matches!(
+                err,
+                ProxyConnectError::Connect(ConnectError::Policy(
+                    wisp_proxy::ProxyError::LoopbackBlocked(_)
+                ))
+            ),
+            "expected typed policy rejection, got {err:?}"
         );
     }
 }

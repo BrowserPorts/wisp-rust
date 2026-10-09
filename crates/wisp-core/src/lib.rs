@@ -25,10 +25,10 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use wisp_config::{
-    build_wisp_wt_options, load_toml, WispAuthRegistry, WispAuthResolver, WispServerOptions,
-    WispWtServerOptions,
+    build_wisp_wt_options, load_toml, IngressMode, ReloadingTokenResolver, WispAuthRegistry,
+    WispAuthResolver, WispServerOptions, WispWtServerOptions,
 };
-use wisp_dos::DosGuard;
+use wisp_dos::{ConnectionLimiter, DosGuard};
 
 #[cfg(feature = "ws")]
 use tokio::task::JoinHandle;
@@ -51,14 +51,17 @@ use wisp_ws_h2::H2ServeContext;
 #[cfg(all(feature = "quic", feature = "ws"))]
 use wisp_server::H3WsContext;
 #[cfg(feature = "quic")]
-use wisp_server::{serve as serve_listener, ServeError, ServeHandle};
+pub use wisp_server::ServeHandle;
+use wisp_server::{serve as serve_listener, ServeError, ServeExtras};
 
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("config: {0}")]
     Config(#[from] wisp_config::ConfigError),
-    #[error("runtime: {0}")]
-    Runtime(String),
+    #[error("rate-limit backend: {0}")]
+    Dos(#[from] wisp_dos::DosError),
+    #[error("wisp_wt.enabled is false; not binding listener")]
+    ListenerDisabled,
     #[cfg(feature = "quic")]
     #[error("serve: {0}")]
     Serve(#[from] ServeError),
@@ -75,16 +78,14 @@ pub enum CoreError {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub options: Arc<WispWtServerOptions>,
-    pub bench_mode: bool,
     pub log_level: String,
 }
 
 impl RuntimeConfig {
     pub fn from_options(options: WispWtServerOptions) -> Result<Self, CoreError> {
-        options.base.validate()?;
+        options.validate()?;
         Ok(Self {
             options: Arc::new(options),
-            bench_mode: false,
             log_level: "info".to_owned(),
         })
     }
@@ -93,11 +94,6 @@ impl RuntimeConfig {
         let parsed = load_toml(path)?;
         let options = build_wisp_wt_options(&parsed);
         Self::from_options(options)
-    }
-
-    pub fn with_bench_mode(mut self, on: bool) -> Self {
-        self.bench_mode = on;
-        self
     }
 
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
@@ -112,7 +108,9 @@ pub struct Runtime {
     cfg: RuntimeConfig,
     cancel: CancellationToken,
     dos: Arc<DosGuard>,
+    connection_limiter: Arc<ConnectionLimiter>,
     auth: WispAuthRegistry,
+    file_auth: Option<Arc<ReloadingTokenResolver>>,
     #[cfg(feature = "ws")]
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
 }
@@ -121,20 +119,32 @@ impl Runtime {
     /// Build the runtime state. Does **not** start a listener — call
     /// [`Runtime::bind`] for that.
     pub fn start(cfg: RuntimeConfig) -> Result<Self, CoreError> {
-        let dos = Arc::new(DosGuard::new());
+        let dos = Arc::new(DosGuard::from_options(&cfg.options.base)?);
         #[cfg(feature = "ws")]
         let proxy_template = build_proxy_template(&cfg.options);
-        if cfg.bench_mode {
-            info!("wispd: bench mode enabled — skipping protocol inspection, raising connection limits");
-        }
         if !cfg.options.enabled {
             warn!("wispd: wisp_wt.enabled = false — listener will not be opened");
+        }
+        let auth = WispAuthRegistry::default();
+        let file_auth = cfg
+            .options
+            .base
+            .auth
+            .token_file
+            .as_ref()
+            .map(ReloadingTokenResolver::load)
+            .transpose()?
+            .map(Arc::new);
+        if let Some(resolver) = &file_auth {
+            auth.set_file_resolver(resolver.clone());
         }
         Ok(Self {
             cfg,
             cancel: CancellationToken::new(),
             dos,
-            auth: WispAuthRegistry::default(),
+            connection_limiter: Arc::new(ConnectionLimiter::new()),
+            auth,
+            file_auth,
             #[cfg(feature = "ws")]
             proxy_template,
         })
@@ -158,6 +168,14 @@ impl Runtime {
 
     pub fn clear_auth_resolver(&self) {
         self.auth.clear_resolver();
+    }
+
+    pub fn reload_auth_tokens(&self) -> Result<bool, CoreError> {
+        let Some(resolver) = &self.file_auth else {
+            return Ok(false);
+        };
+        resolver.reload()?;
+        Ok(true)
     }
 
     pub fn register_limit_profile(&self, name: String, options: WispServerOptions) -> bool {
@@ -190,7 +208,10 @@ impl Runtime {
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         let drain_ms = self.cfg.options.base.idle_timeout_ms.unwrap_or(15_000);
-        time::sleep(Duration::from_millis(drain_ms)).await;
+        let deadline = time::Instant::now() + Duration::from_millis(drain_ms);
+        while self.connection_limiter.active() != 0 && time::Instant::now() < deadline {
+            time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Bind the msquic listener and start dispatching wisp-wt sessions.
@@ -201,34 +222,41 @@ impl Runtime {
     pub async fn bind(&self) -> Result<ServeHandle, CoreError> {
         if !self.cfg.options.enabled {
             warn!("wispd: wisp_wt.enabled = false — refusing to bind listener");
-            return Err(CoreError::Runtime(
-                "wisp_wt.enabled is false; not binding".to_owned(),
-            ));
+            return Err(CoreError::ListenerDisabled);
         }
-        // When the `ws` feature is on AND the websocket section is enabled,
-        // build an H3WsContext so the same H3 listener also services
-        // RFC 9220 WS-over-H3 (extended CONNECT :protocol=websocket). The
-        // proxy controller is shared with the H2 WS path so policy state
-        // (live rules, provider rotation) stays consistent across transports.
         #[cfg(feature = "ws")]
         let ws_ctx = if self.cfg.options.websocket.enabled {
             let template = self.proxy_template.clone();
-            Some(Arc::new(H3WsContext::from_wisp_wt_with_template_and_auth(
-                &self.cfg.options,
-                template,
-                self.auth.clone(),
-            )))
+            Some(Arc::new(
+                H3WsContext::from_wisp_wt_with_template_and_auth(
+                    &self.cfg.options,
+                    template,
+                    self.auth.clone(),
+                    self.dos.clone(),
+                    self.connection_limiter.clone(),
+                )
+                .with_shutdown_token(self.cancel.clone()),
+            ))
         } else {
             None
         };
         #[cfg(not(feature = "ws"))]
         let ws_ctx = None;
 
+        #[cfg(feature = "ws")]
+        let extras = ServeExtras {
+            proxy_template: self.proxy_template.clone(),
+        };
+        #[cfg(not(feature = "ws"))]
+        let extras = ServeExtras::default();
         let handle = serve_listener(
             self.cfg.options.clone(),
             self.dos.clone(),
             self.cancel.clone(),
             ws_ctx,
+            self.connection_limiter.clone(),
+            self.auth.clone(),
+            extras,
         )
         .await?;
         Ok(handle)
@@ -247,14 +275,22 @@ impl Runtime {
             return Ok(None);
         }
         let template = self.proxy_template.clone();
-        let ctx = Arc::new(H2ServeContext::from_wisp_wt_with_template_and_auth(
-            opts,
-            template,
-            self.auth.clone(),
-        ));
+        let ctx = Arc::new(
+            H2ServeContext::from_wisp_wt_with_template_and_auth(
+                opts,
+                template,
+                self.auth.clone(),
+                self.dos.clone(),
+                self.connection_limiter.clone(),
+            )
+            .with_shutdown_token(self.cancel.clone()),
+        );
         let cancel = self.cancel.clone();
 
-        if opts.websocket.plain {
+        if matches!(
+            opts.websocket.ingress_mode,
+            IngressMode::TrustedEdge | IngressMode::DirectPlain
+        ) {
             let Some(cfg) = WsPlainListenerConfig::try_from_wisp_wt(opts)? else {
                 return Ok(None);
             };
@@ -306,7 +342,11 @@ impl Runtime {
 /// controller with isolated state.
 #[cfg(feature = "ws")]
 pub fn build_proxy_template(opts: &WispWtServerOptions) -> Option<Arc<ProxyControllerTemplate>> {
-    if !opts.proxy_control_enabled {
+    let ws_proxy_control = opts
+        .websocket
+        .proxy_control_enabled
+        .unwrap_or(opts.proxy_control_enabled);
+    if !(opts.proxy_control_enabled || ws_proxy_control) {
         return None;
     }
     let mut providers: Vec<SharedProvider> = Vec::new();
@@ -321,6 +361,7 @@ pub fn build_proxy_template(opts: &WispWtServerOptions) -> Option<Arc<ProxyContr
     if let Some(re) = &opts.resi {
         let cfg = ResidentialProxyConfig {
             bearer_token: re.bearer_token.clone().unwrap_or_default(),
+            wireproxy_socks5: re.wireproxy_socks5.clone(),
             cookie: re.cookie.clone(),
             api_base: re.api_base.clone(),
             country: re.country.clone(),
@@ -382,5 +423,31 @@ mod tests {
         opts.base.max_proxy_rules_per_connection = 0;
         let res = RuntimeConfig::from_options(opts);
         assert!(matches!(res, Err(CoreError::Config(_))));
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn build_proxy_template_honors_websocket_override() {
+        use wisp_config::MullvadProviderConfig;
+
+        let mut opts = WispWtServerOptions {
+            proxy_control_enabled: false,
+            mullvad: Some(MullvadProviderConfig {
+                relay_api: "https://example.test/relays".to_owned(),
+                wireproxy_socks5: None,
+            }),
+            ..WispWtServerOptions::default()
+        };
+        opts.websocket.proxy_control_enabled = Some(true);
+        assert!(
+            build_proxy_template(&opts).is_some(),
+            "WS-only proxy_control override must still build providers"
+        );
+
+        opts.websocket.proxy_control_enabled = Some(false);
+        assert!(
+            build_proxy_template(&opts).is_none(),
+            "disabled override with global off must skip providers"
+        );
     }
 }

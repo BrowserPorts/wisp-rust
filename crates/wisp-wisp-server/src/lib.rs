@@ -15,9 +15,12 @@ mod proxy_control;
 mod stream;
 mod udp;
 
-pub use connection::{serve_connection, ServerContext, ServerError, ServerOptions, WispMessage};
+pub use connection::{
+    serve_connection, ServerContext, ServerError, ServerOptions, TransportError, WispMessage,
+};
 pub use proxy_control::{
     handle_proxy_control_text, ProxyConnectError, ProxyControlError, ProxyControlLimits,
     ProxyControlRequest, ProxyController, ProxyControllerTemplate, ProxyRouteConfig,
     ProxyRouteSnapshot, ProxyRuntimePolicy,
 };
+pub use stream::ConnectError;

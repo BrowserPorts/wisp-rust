@@ -1,24 +1,25 @@
-//! Default proxy adapters: TCP, UDP, WT-proxy. Mirrors `wisp-wt/src/proxy/*`.
+//! Default outbound proxy adapters: TCP and UDP.
 //!
-//! Backend-agnostic on purpose — the wisp-wt server (`wisp-server`) owns
-//! the bridge between the WT side (msquic adapter) and these adapters,
-//! which speak only tokio sockets and a `hickory-resolver` DNS client.
+//! Backend-agnostic on purpose — the server crate owns the bridge between the
+//! transport side and these adapters, which speak only tokio sockets and a
+//! `hickory-resolver` DNS client.
 
 #![forbid(unsafe_code)]
 
 use bytes::Bytes;
 use hickory_resolver::{
-    config::{NameServerConfigGroup, ResolverConfig, ResolverOpts},
-    TokioAsyncResolver,
+    config::{NameServerConfig, ResolverConfig, ResolverOpts, GOOGLE},
+    net::runtime::TokioRuntimeProvider,
+    TokioResolver,
 };
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
 use thiserror::Error;
 use tokio::net::{TcpStream, UdpSocket};
-use wisp_config::{DnsMethod, WispServerOptions};
+use wisp_config::{DnsMethod, DnsResultOrder, WispServerOptions};
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -40,47 +41,48 @@ pub enum ProxyError {
     Connect(#[source] std::io::Error),
     #[error("udp bind: {0}")]
     UdpBind(#[source] std::io::Error),
-    #[error("policy: {0}")]
-    Policy(&'static str),
+    #[error("host '{0}' not in domain whitelist")]
+    DomainNotWhitelisted(String),
+    #[error("loopback ip {0} not allowed")]
+    LoopbackBlocked(IpAddr),
+    #[error("private ip {0} not allowed")]
+    PrivateBlocked(IpAddr),
 }
 
 /// Connection-establishment policy gates, derived from [`WispServerOptions`].
 #[derive(Debug, Clone)]
 pub struct HostPolicy {
-    pub hostname_blacklist: Vec<String>,
-    pub hostname_whitelist: Vec<String>,
+    pub domain_blacklist: Vec<String>,
+    pub domain_whitelist: Vec<String>,
     pub ip_blacklist: Vec<IpPattern>,
     pub ip_whitelist: Vec<IpPattern>,
     pub port_blacklist: Vec<u16>,
     pub port_whitelist: Vec<u16>,
+    pub host_port_whitelist: Vec<(String, u16)>,
     pub allow_direct_ip: bool,
-    pub allow_direct_ip_with_domain_policy: bool,
     pub allow_private_ips: bool,
     pub allow_loopback_ips: bool,
 }
 
 impl HostPolicy {
     pub fn from_options(o: &WispServerOptions) -> Self {
-        // domain_blacklist / hostname_blacklist are aliases per `config.ts`.
-        let hostname_blacklist = match (&o.hostname_blacklist, &o.domain_blacklist) {
-            (Some(v), _) => v.clone(),
-            (None, Some(v)) => v.clone(),
-            _ => Vec::new(),
-        };
-        let hostname_whitelist = match (&o.hostname_whitelist, &o.domain_whitelist) {
-            (Some(v), _) => v.clone(),
-            (None, Some(v)) => v.clone(),
-            _ => Vec::new(),
-        };
+        let domain_blacklist = o.domain_blacklist.clone().unwrap_or_default();
+        let domain_whitelist = o.domain_whitelist.clone().unwrap_or_default();
         Self {
-            hostname_blacklist,
-            hostname_whitelist,
+            domain_blacklist,
+            domain_whitelist,
             ip_blacklist: patterns_from_options(o.ip_blacklist.as_deref()),
             ip_whitelist: patterns_from_options(o.ip_whitelist.as_deref()),
             port_blacklist: o.port_blacklist.clone().unwrap_or_default(),
             port_whitelist: o.port_whitelist.clone().unwrap_or_default(),
+            host_port_whitelist: o
+                .host_port_whitelist
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|rule| rule.normalized_host().map(|host| (host, rule.port)))
+                .collect(),
             allow_direct_ip: o.allow_direct_ip,
-            allow_direct_ip_with_domain_policy: o.allow_direct_ip_with_domain_policy,
             allow_private_ips: o.allow_private_ips,
             allow_loopback_ips: o.allow_loopback_ips,
         }
@@ -93,33 +95,33 @@ impl HostPolicy {
         if self.port_blacklist.contains(&port) {
             return Err(ProxyError::PortBlocked(port));
         }
-        if !self.port_whitelist.is_empty() && !self.port_whitelist.contains(&port) {
+        let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let scoped_port_allowed =
+            self.host_port_whitelist
+                .iter()
+                .any(|(allowed_host, allowed_port)| {
+                    allowed_host == &normalized_host && *allowed_port == port
+                });
+        if !self.port_whitelist.is_empty()
+            && !self.port_whitelist.contains(&port)
+            && !scoped_port_allowed
+        {
             return Err(ProxyError::PortBlocked(port));
         }
-        if !self.hostname_whitelist.is_empty()
-            && !self
-                .hostname_whitelist
-                .iter()
-                .any(|p| host_matches(host, p))
-        {
-            return Err(ProxyError::Policy("hostname not in whitelist"));
-        }
-        if self
-            .hostname_blacklist
-            .iter()
-            .any(|p| host_matches(host, p))
-        {
-            return Err(ProxyError::HostBlocked(host.to_owned()));
-        }
         if let Ok(ip) = host.parse::<IpAddr>() {
-            let has_domain_policy =
-                !self.hostname_whitelist.is_empty() || !self.hostname_blacklist.is_empty();
-            if !self.allow_direct_ip
-                && (!self.allow_direct_ip_with_domain_policy || !has_domain_policy)
-            {
+            if !self.allow_direct_ip {
                 return Err(ProxyError::HostBlocked(host.to_owned()));
             }
             self.check_ip(ip)?;
+            return Ok(());
+        }
+        if !self.domain_whitelist.is_empty()
+            && !self.domain_whitelist.iter().any(|p| host_matches(host, p))
+        {
+            return Err(ProxyError::DomainNotWhitelisted(host.to_owned()));
+        }
+        if self.domain_blacklist.iter().any(|p| host_matches(host, p)) {
+            return Err(ProxyError::HostBlocked(host.to_owned()));
         }
         Ok(())
     }
@@ -133,10 +135,10 @@ impl HostPolicy {
             return Err(ProxyError::HostBlocked(ip.to_string()));
         }
         if !self.allow_loopback_ips && ip.is_loopback() {
-            return Err(ProxyError::Policy("loopback ip not allowed"));
+            return Err(ProxyError::LoopbackBlocked(ip));
         }
         if !self.allow_private_ips && is_private(ip) {
-            return Err(ProxyError::Policy("private ip not allowed"));
+            return Err(ProxyError::PrivateBlocked(ip));
         }
         Ok(())
     }
@@ -222,15 +224,40 @@ fn host_matches(host: &str, pattern: &str) -> bool {
     }
 }
 
+/// Treats an address as non-globally-routable and therefore unsafe to proxy to.
+///
+/// For IPv6, the unique-local range `fc00::/7` (RFC 4193) and the link-local
+/// range `fe80::/10` (RFC 4291) are matched via their leading-segment masks.
 fn is_private(ip: IpAddr) -> bool {
+    const V6_ULA_MASK: u16 = 0xfe00;
+    const V6_ULA_PREFIX: u16 = 0xfc00;
+    const V6_LINK_LOCAL_MASK: u16 = 0xffc0;
+    const V6_LINK_LOCAL_PREFIX: u16 = 0xfe80;
     match canonical_ip(ip) {
         IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_link_local() || v4.is_broadcast() || v4.is_unspecified()
+            let octets = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224
         }
         IpAddr::V6(v6) => {
+            let lead = v6.segments()[0];
             v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10
+                || v6.is_multicast()
+                || (lead & V6_ULA_MASK) == V6_ULA_PREFIX
+                || (lead & V6_LINK_LOCAL_MASK) == V6_LINK_LOCAL_PREFIX
+                || v6.segments()[..4] == [0x0100, 0, 0, 0]
+                || v6.segments()[..2] == [0x2001, 0x0db8]
+                || (lead & 0xe000) != 0x2000
         }
     }
 }
@@ -238,9 +265,10 @@ fn is_private(ip: IpAddr) -> bool {
 /// Async DNS resolver backed by `hickory-resolver`.
 #[derive(Clone)]
 pub struct DnsClient {
-    resolver: Arc<TokioAsyncResolver>,
+    resolver: Arc<TokioResolver>,
     method: DnsMethod,
     connect_timeout: Duration,
+    result_order: DnsResultOrder,
 }
 
 impl DnsClient {
@@ -254,7 +282,7 @@ impl DnsClient {
             .filter_map(|s| s.parse().ok())
             .collect();
         let mut opts = ResolverOpts::default();
-        opts.cache_size = o.dns_cache_max_entries.max(64) as usize;
+        opts.cache_size = o.dns_cache_max_entries;
         if o.dns_ttl > 0 {
             opts.positive_min_ttl = Some(Duration::from_secs(o.dns_ttl));
             opts.positive_max_ttl = Some(Duration::from_secs(o.dns_ttl));
@@ -264,17 +292,31 @@ impl DnsClient {
             opts.negative_max_ttl = Some(Duration::from_secs(o.dns_negative_ttl));
         }
         let config = if servers.is_empty() {
-            ResolverConfig::default()
+            ResolverConfig::udp_and_tcp(&GOOGLE)
         } else {
-            let group = NameServerConfigGroup::from_ips_clear(&servers, 53, true);
-            ResolverConfig::from_parts(None, Vec::new(), group)
+            ResolverConfig::from_parts(
+                None,
+                Vec::new(),
+                servers
+                    .iter()
+                    .copied()
+                    .map(NameServerConfig::udp_and_tcp)
+                    .collect(),
+            )
         };
-        let resolver = TokioAsyncResolver::tokio(config, opts);
+        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .map_err(|e| ProxyError::DnsLookup {
+                host: "resolver initialization".to_owned(),
+                source: std::io::Error::other(e),
+            })?;
         let connect_timeout = Duration::from_millis(o.connect_timeout_ms.unwrap_or(10_000));
         Ok(Self {
             resolver: Arc::new(resolver),
             method,
             connect_timeout,
+            result_order: o.dns_result_order,
         })
     }
 
@@ -290,6 +332,11 @@ impl DnsClient {
                 source: std::io::Error::other(e),
             })?;
         let mut addrs: Vec<IpAddr> = lookup.iter().map(canonical_ip).collect();
+        match self.result_order {
+            DnsResultOrder::Verbatim => {}
+            DnsResultOrder::Ipv4first => addrs.sort_by_key(|ip| ip.is_ipv6()),
+            DnsResultOrder::Ipv6first => addrs.sort_by_key(|ip| ip.is_ipv4()),
+        }
         if matches!(self.method, DnsMethod::Lookup) {
             addrs.truncate(1);
         }
@@ -302,39 +349,58 @@ impl DnsClient {
 
 /// Outbound TCP connector: policy, DNS, connect, set_nodelay, keepalive.
 pub struct TcpConnector {
-    dns: DnsClient,
-    policy: HostPolicy,
+    destination: DestinationResolver,
     connect_timeout: Duration,
     keepalive: Option<Duration>,
 }
 
+/// Resolves a destination and applies the configured hostname and IP policy
+/// before a transport connects to any returned address.
+pub struct DestinationResolver {
+    dns: DnsClient,
+    policy: HostPolicy,
+}
+
+impl DestinationResolver {
+    pub fn from_options(opts: &WispServerOptions) -> Result<Self, ProxyError> {
+        Ok(Self {
+            dns: DnsClient::new(opts)?,
+            policy: HostPolicy::from_options(opts),
+        })
+    }
+
+    pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ProxyError> {
+        self.policy.check(host, port)?;
+        let ips = self.dns.resolve(host).await?;
+        for ip in &ips {
+            self.policy.check_ip(*ip)?;
+        }
+        Ok(ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect())
+    }
+}
+
 impl TcpConnector {
     pub fn from_options(opts: &WispServerOptions) -> Result<Self, ProxyError> {
-        let dns = DnsClient::new(opts)?;
-        let policy = HostPolicy::from_options(opts);
+        let destination = DestinationResolver::from_options(opts)?;
         let connect_timeout = Duration::from_millis(opts.connect_timeout_ms.unwrap_or(10_000));
-        // Borrow stream idle as the TCP keepalive interval if set.
         let keepalive = opts
             .stream_idle_timeout_ms
             .map(|ms| Duration::from_millis(ms.max(1_000)));
         Ok(Self {
-            dns,
-            policy,
+            destination,
             connect_timeout,
             keepalive,
         })
     }
 
     pub async fn connect(&self, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
-        self.policy.check(host, port)?;
-        let addrs = self.dns.resolve(host).await?;
-        for ip in &addrs {
-            self.policy.check_ip(*ip)?;
-        }
+        let addrs = self.destination.resolve(host, port).await?;
         let mut last: Option<ProxyError> = None;
-        for ip in addrs {
-            let sa = SocketAddr::new(ip, port);
-            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(sa)).await {
+        for addr in addrs {
+            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await {
                 Ok(Ok(sock)) => {
                     let _ = sock.set_nodelay(true);
                     if let Some(ka) = self.keepalive {
@@ -351,35 +417,28 @@ impl TcpConnector {
 }
 
 fn apply_keepalive(sock: &TcpStream, interval: Duration) {
-    // SockRef borrows the fd from the TcpStream without taking ownership, so
-    // the keepalive setting applies in-place and no drop reclaims the fd.
     let sk = socket2::SockRef::from(sock);
     let _ = sk.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(interval));
 }
 
 /// Outbound UDP socket: bind ephemeral, connect to peer, ready for send/recv.
 pub struct UdpConnector {
-    dns: DnsClient,
-    policy: HostPolicy,
+    destination: DestinationResolver,
 }
 
 impl UdpConnector {
     pub fn from_options(opts: &WispServerOptions) -> Result<Self, ProxyError> {
-        let dns = DnsClient::new(opts)?;
-        let policy = HostPolicy::from_options(opts);
-        Ok(Self { dns, policy })
+        Ok(Self {
+            destination: DestinationResolver::from_options(opts)?,
+        })
     }
 
     pub async fn bind(&self, host: &str, port: u16) -> Result<UdpSocket, ProxyError> {
-        self.policy.check(host, port)?;
-        let addrs = self.dns.resolve(host).await?;
-        for ip in &addrs {
-            self.policy.check_ip(*ip)?;
-        }
-        let peer = SocketAddr::new(addrs[0], port);
+        let addrs = self.destination.resolve(host, port).await?;
+        let peer = addrs[0];
         let bind_addr = match peer {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse::<SocketAddr>().unwrap(),
+            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
         };
         let sock = UdpSocket::bind(bind_addr)
             .await
@@ -417,20 +476,20 @@ mod tests {
         assert!(is_private("fe80::1".parse().unwrap()));
         assert!(!is_private("8.8.8.8".parse().unwrap()));
         assert!(!is_private("::ffff:8.8.8.8".parse().unwrap()));
-        assert!(!is_private("2001:db8::1".parse().unwrap()));
+        assert!(is_private("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
     fn policy_blocks_port_and_host() {
         let p = HostPolicy {
-            hostname_blacklist: vec!["bad.example".to_owned()],
-            hostname_whitelist: vec![],
+            domain_blacklist: vec!["bad.example".to_owned()],
+            domain_whitelist: vec![],
             ip_blacklist: vec![],
             ip_whitelist: vec![],
             port_blacklist: vec![],
             port_whitelist: vec![80, 443],
+            host_port_whitelist: vec![],
             allow_direct_ip: false,
-            allow_direct_ip_with_domain_policy: false,
             allow_private_ips: false,
             allow_loopback_ips: false,
         };
@@ -450,64 +509,64 @@ mod tests {
     }
 
     #[test]
-    fn allow_direct_ip_with_domain_policy_kicks_in() {
+    fn domain_policy_does_not_enable_direct_ip() {
         let p = HostPolicy {
-            hostname_blacklist: vec!["evil.example".to_owned()],
-            hostname_whitelist: vec![],
+            domain_blacklist: vec!["evil.example".to_owned()],
+            domain_whitelist: vec![],
             ip_blacklist: vec![],
             ip_whitelist: vec![],
             port_blacklist: vec![],
             port_whitelist: vec![80],
+            host_port_whitelist: vec![],
             allow_direct_ip: false,
-            allow_direct_ip_with_domain_policy: true,
             allow_private_ips: false,
             allow_loopback_ips: false,
         };
-        assert!(p.check("8.8.8.8", 80).is_ok());
+        assert!(p.check("8.8.8.8", 80).is_err());
     }
 
     #[test]
     fn whitelist_enforced_when_set() {
         let p = HostPolicy {
-            hostname_blacklist: vec![],
-            hostname_whitelist: vec!["*.allowed.example".to_owned()],
+            domain_blacklist: vec![],
+            domain_whitelist: vec!["*.allowed.example".to_owned()],
             ip_blacklist: vec![],
             ip_whitelist: vec![],
             port_blacklist: vec![],
             port_whitelist: vec![],
+            host_port_whitelist: vec![],
             allow_direct_ip: true,
-            allow_direct_ip_with_domain_policy: false,
             allow_private_ips: false,
             allow_loopback_ips: false,
         };
         assert!(p.check("api.allowed.example", 80).is_ok());
         assert!(matches!(
             p.check("other.example", 80),
-            Err(ProxyError::Policy(_))
+            Err(ProxyError::DomainNotWhitelisted(_))
         ));
     }
 
     #[test]
     fn policy_blocks_ipv4_mapped_ipv6_loopback_and_private() {
         let p = HostPolicy {
-            hostname_blacklist: vec![],
-            hostname_whitelist: vec![],
+            domain_blacklist: vec![],
+            domain_whitelist: vec![],
             ip_blacklist: vec![],
             ip_whitelist: vec![],
             port_blacklist: vec![],
             port_whitelist: vec![80],
+            host_port_whitelist: vec![],
             allow_direct_ip: true,
-            allow_direct_ip_with_domain_policy: false,
             allow_private_ips: false,
             allow_loopback_ips: false,
         };
         assert!(matches!(
             p.check("::ffff:127.0.0.1", 80),
-            Err(ProxyError::Policy(_))
+            Err(ProxyError::LoopbackBlocked(_))
         ));
         assert!(matches!(
             p.check("::ffff:10.0.0.1", 80),
-            Err(ProxyError::Policy(_))
+            Err(ProxyError::PrivateBlocked(_))
         ));
         assert!(p.check("::ffff:8.8.8.8", 80).is_ok());
     }
@@ -515,14 +574,14 @@ mod tests {
     #[test]
     fn ip_allowlist_supports_cidr() {
         let p = HostPolicy {
-            hostname_blacklist: vec![],
-            hostname_whitelist: vec![],
+            domain_blacklist: vec![],
+            domain_whitelist: vec![],
             ip_blacklist: vec![],
             ip_whitelist: vec![IpPattern::parse("8.8.8.0/24").unwrap()],
             port_blacklist: vec![],
             port_whitelist: vec![443],
+            host_port_whitelist: vec![],
             allow_direct_ip: true,
-            allow_direct_ip_with_domain_policy: false,
             allow_private_ips: false,
             allow_loopback_ips: false,
         };
@@ -536,14 +595,14 @@ mod tests {
     #[test]
     fn ip_blacklist_supports_ipv6_cidr() {
         let p = HostPolicy {
-            hostname_blacklist: vec![],
-            hostname_whitelist: vec![],
+            domain_blacklist: vec![],
+            domain_whitelist: vec![],
             ip_blacklist: vec![IpPattern::parse("2001:db8::/32").unwrap()],
             ip_whitelist: vec![],
             port_blacklist: vec![],
             port_whitelist: vec![443],
+            host_port_whitelist: vec![],
             allow_direct_ip: true,
-            allow_direct_ip_with_domain_policy: false,
             allow_private_ips: false,
             allow_loopback_ips: false,
         };
@@ -551,5 +610,26 @@ mod tests {
             p.check("2001:db8::1", 443),
             Err(ProxyError::HostBlocked(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn destination_resolver_checks_literal_ip_before_connect() {
+        let mut opts = WispServerOptions {
+            allow_direct_ip: true,
+            ..WispServerOptions::default()
+        };
+        let resolver = DestinationResolver::from_options(&opts).unwrap();
+        assert!(matches!(
+            resolver.resolve("127.0.0.1", 443).await,
+            Err(ProxyError::LoopbackBlocked(_))
+        ));
+
+        opts.allow_private_ips = true;
+        opts.allow_loopback_ips = true;
+        let resolver = DestinationResolver::from_options(&opts).unwrap();
+        assert_eq!(
+            resolver.resolve("127.0.0.1", 443).await.unwrap(),
+            vec!["127.0.0.1:443".parse().unwrap()]
+        );
     }
 }
