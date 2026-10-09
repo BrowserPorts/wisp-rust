@@ -1,19 +1,20 @@
 //! Dispatch a resolved H3 extended-CONNECT `:protocol = websocket` request.
 //!
-//! `wisp-server` does the protocol detection (it owns the `Request<()>`
-//! from the resolver) and hands us the `RequestStream` post-resolve. We:
-//!   1. send the 200 response on the stream (RFC 9220 §3 — H3 mirrors
-//!      H2's "no 101, just 200" for extended CONNECT)
-//!   2. split the bidi into independent send/recv halves
-//!   3. spawn a reader task: pulls h3 chunks, decodes WS frames, emits
+//! `wisp-server` performs protocol detection (it owns the `Request<()>`
+//! from the resolver) and hands over the `RequestStream` post-resolve.
+//! Dispatch then:
+//!   1. sends the 200 response on the stream (RFC 9220 §3 — extended
+//!      CONNECT over HTTP/3 responds with 200, not a 101 upgrade)
+//!   2. splits the bidi into independent send/recv halves
+//!   3. spawns a reader task: pulls h3 chunks, decodes WS frames, emits
 //!      `WispMessage` over `incoming_tx`; auto-replies to ping with pong
 //!      and forwards close requests via `ctrl_tx`
-//!   4. spawn a writer task: select!s between `wisp_rx` (server→client
+//!   4. spawns a writer task: `select!`s between `wisp_rx` (server→client
 //!      WispMessages) and `ctrl_rx` (Pong/Close), encodes and writes
-//!   5. hand the inbound stream + a `WispMessageSink` (forwarding into
-//!      `wisp_tx`) to [`wisp_wisp_server::serve_connection`] — same
-//!      entry point the H2 listener uses, so wire semantics are
-//!      identical across transports
+//!   5. hands the inbound stream + a sink (forwarding into `wisp_tx`) to
+//!      [`wisp_wisp_server::serve_connection`] — the same entry point the
+//!      HTTP/2 listener uses, so wire semantics are identical across
+//!      transports.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,28 +22,32 @@ use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures::Stream;
+use h3::error::StreamError;
 use h3::quic::BidiStream as H3BidiStream;
 use h3::server::RequestStream;
 use http::{Response, StatusCode};
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{debug, warn};
 use wisp_config::{
     endpoint_matches, endpoint_path_token, WispAuthRegistry, WispAuthTokenPolicy,
     WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
+use wisp_dos::{ConnectionLimiter, DosGuard};
 use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_wisp_server::{
-    serve_connection, ProxyControllerTemplate, ServerContext, ServerOptions, WispMessage,
+    serve_connection, ProxyControllerTemplate, ServerContext, ServerError, ServerOptions,
+    WispMessage,
 };
 
 use crate::frame::{
-    encode_close, encode_data, encode_pong, Decoder, InboundFrame, OP_BINARY, OP_TEXT,
+    encode_close, encode_data, encode_pong, Decoder, FrameError, InboundFrame, OP_BINARY, OP_TEXT,
 };
 
 const CLOSE_NORMAL: u16 = 1000;
-const CLOSE_INTERNAL_ERROR: u16 = 1011;
+const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 
 /// Per-listener shared state. Mirrors `wisp_ws_h2::H2ServeContext` so
 /// both transports project the same `ServerContext` into the wisp layer.
@@ -56,31 +61,19 @@ pub struct H3WsContext {
     /// calls `template.spawn()` to mint a fresh per-connection controller —
     /// per-tenant state isolation is enforced by construction (audit-2 #55).
     pub proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    pub dos: Arc<DosGuard>,
+    pub connection_limiter: Arc<ConnectionLimiter>,
+    pub shutdown: CancellationToken,
 }
 
 impl H3WsContext {
-    pub fn new(options: Arc<WispServerOptions>, proxy_control_enabled: bool) -> Self {
-        Self::with_template(options, proxy_control_enabled, None)
-    }
-
-    pub fn with_template(
-        options: Arc<WispServerOptions>,
-        proxy_control_enabled: bool,
-        proxy_template: Option<Arc<ProxyControllerTemplate>>,
-    ) -> Self {
-        Self::with_template_and_auth(
-            options,
-            proxy_control_enabled,
-            proxy_template,
-            WispAuthRegistry::default(),
-        )
-    }
-
     pub fn with_template_and_auth(
         options: Arc<WispServerOptions>,
         proxy_control_enabled: bool,
         proxy_template: Option<Arc<ProxyControllerTemplate>>,
         auth_registry: WispAuthRegistry,
+        dos: Arc<DosGuard>,
+        connection_limiter: Arc<ConnectionLimiter>,
     ) -> Self {
         let server_options = Arc::new(ServerOptions::from_wisp(&options, proxy_control_enabled));
         Self {
@@ -89,65 +82,71 @@ impl H3WsContext {
             proxy_control_enabled,
             auth_registry,
             proxy_template,
+            dos,
+            connection_limiter,
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    pub fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Build a context from the merged wisp config. The WS sub-section's
     /// endpoint, when present, overrides the WT endpoint in the projected
     /// `WispServerOptions` so the WS dispatcher matches the right path.
-    pub fn from_wisp_wt(cfg: &WispWtServerOptions) -> Self {
-        Self::from_wisp_wt_with_template(cfg, None)
-    }
-
-    pub fn from_wisp_wt_with_template(
-        cfg: &WispWtServerOptions,
-        proxy_template: Option<Arc<ProxyControllerTemplate>>,
-    ) -> Self {
-        Self::from_wisp_wt_with_template_and_auth(cfg, proxy_template, WispAuthRegistry::default())
-    }
-
     pub fn from_wisp_wt_with_template_and_auth(
         cfg: &WispWtServerOptions,
         proxy_template: Option<Arc<ProxyControllerTemplate>>,
         auth_registry: WispAuthRegistry,
+        dos: Arc<DosGuard>,
+        connection_limiter: Arc<ConnectionLimiter>,
     ) -> Self {
         let mut base = cfg.base.clone();
         if let Some(ep) = &cfg.websocket.endpoint {
             base.endpoint = ep.clone();
         }
+        let proxy_control_enabled = cfg
+            .websocket
+            .proxy_control_enabled
+            .unwrap_or(cfg.proxy_control_enabled);
         Self::with_template_and_auth(
             Arc::new(base),
-            cfg.proxy_control_enabled,
+            proxy_control_enabled,
             proxy_template,
             auth_registry,
+            dos,
+            connection_limiter,
         )
     }
 
     pub async fn context_for_path(&self, path: &str) -> Option<H3WsConnectionView> {
-        let (options, auth_policy) = if let Some(token) =
-            endpoint_path_token(path, &self.options.endpoint)
-        {
-            if !self.options.auth.token_path {
+        let (options, auth_policy) =
+            if let Some(token) = endpoint_path_token(path, &self.options.endpoint) {
+                if !self.options.auth.token_path {
+                    return None;
+                }
+                let resolved = tokio::time::timeout(
+                    std::time::Duration::from_millis(self.options.auth.resolver_timeout_ms),
+                    self.auth_registry.resolve(token.to_owned(), &self.options),
+                )
+                .await
+                .ok()??;
+                (Arc::new(resolved.options), resolved.policy)
+            } else if endpoint_matches(path, &self.options.endpoint) {
+                if self.options.auth.required {
+                    return None;
+                }
+                let base = self
+                    .auth_registry
+                    .profile(WISP_BASE_LIMIT_PROFILE)
+                    .map(Arc::new)
+                    .unwrap_or_else(|| self.options.clone());
+                (base, WispAuthTokenPolicy::default())
+            } else {
                 return None;
-            }
-            let resolved = self
-                .auth_registry
-                .resolve(token.to_owned(), &self.options)
-                .await?;
-            (Arc::new(resolved.options), resolved.policy)
-        } else if endpoint_matches(path, &self.options.endpoint) {
-            if self.options.auth.required {
-                return None;
-            }
-            let base = self
-                .auth_registry
-                .profile(WISP_BASE_LIMIT_PROFILE)
-                .map(Arc::new)
-                .unwrap_or_else(|| self.options.clone());
-            (base, WispAuthTokenPolicy::default())
-        } else {
-            return None;
-        };
+            };
         let server_options = if Arc::ptr_eq(&options, &self.options) {
             self.server_options.clone()
         } else {
@@ -178,10 +177,10 @@ pub struct H3WsConnectionView {
 
 #[derive(Debug, Error)]
 pub enum H3WsError {
-    #[error("send 200 response failed: {0}")]
-    SendResponse(String),
-    #[error("wisp serve_connection error: {0}")]
-    Wisp(String),
+    #[error("send 200 response failed")]
+    SendResponse(#[source] StreamError),
+    #[error("wisp serve_connection error")]
+    Wisp(#[from] ServerError),
 }
 
 /// Concrete type alias for the bidi stream we get from h3 over msquic.
@@ -197,30 +196,36 @@ pub async fn serve_h3_websocket(
     view: H3WsConnectionView,
     client_advertises_v2: bool,
 ) -> Result<(), H3WsError> {
-    // 1) 200 OK — RFC 9220 §3 (and 8441 §4 for the H2 mirror).
-    let resp = Response::builder()
-        .status(StatusCode::OK)
-        .body(())
-        .expect("static 200 response");
+    let mut response = Response::builder().status(StatusCode::OK);
+    if client_advertises_v2
+        && !matches!(
+            view.server_options.wisp_version,
+            wisp_config::WispVersion::V1
+        )
+    {
+        response = response.header("sec-websocket-protocol", "wisp-v2");
+    }
+    let resp = response.body(()).expect("static 200 response");
     request_stream
         .send_response(resp)
         .await
-        .map_err(|e| H3WsError::SendResponse(format!("{e:?}")))?;
+        .map_err(H3WsError::SendResponse)?;
 
-    // 2) split — independent send / recv lets us pump in parallel.
     let (send_half, recv_half) = request_stream.split();
 
-    // Channels:
-    //  - incoming: reader → serve_connection (Wisp packets the client sent)
-    //  - wisp_out: serve_connection → writer (Wisp packets to send)
-    //  - ctrl:     reader → writer (out-of-band WS control frames: Pong, Close)
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<WispMessage, RecvErr>>(64);
     let (wisp_tx, wisp_rx) = mpsc::channel::<WispMessage>(64);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlFrame>(8);
 
     let reader_ctrl = ctrl_tx.clone();
+    let max_frame_payload = usize::try_from(
+        view.server_options
+            .max_binary_frame_bytes
+            .max(view.server_options.max_text_frame_bytes),
+    )
+    .unwrap_or(usize::MAX);
     let reader_handle = tokio::spawn(async move {
-        run_reader(recv_half, incoming_tx, reader_ctrl).await;
+        run_reader(recv_half, incoming_tx, reader_ctrl, max_frame_payload).await;
     });
 
     let writer_handle = tokio::spawn(async move {
@@ -233,8 +238,6 @@ pub async fn serve_h3_websocket(
 
     let result = serve_connection(sink, stream, server_ctx).await;
 
-    // Clean shutdown — ask writer to send a normal Close, then drop the
-    // ctrl_tx so the writer's select sees both channels closed and exits.
     let _ = ctrl_tx
         .send(ControlFrame::Close {
             code: CLOSE_NORMAL,
@@ -245,7 +248,7 @@ pub async fn serve_h3_websocket(
     let _ = writer_handle.await;
     reader_handle.abort();
 
-    result.map_err(|e| H3WsError::Wisp(e.to_string()))
+    result.map_err(H3WsError::Wisp)
 }
 
 fn build_server_ctx(
@@ -255,15 +258,12 @@ fn build_server_ctx(
     client_advertises_v2: bool,
 ) -> ServerContext {
     let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
-    let proxy_controller = ctx
-        .proxy_template
-        .as_ref()
-        .map(|t| {
-            t.spawn(
-                view.server_options.proxy_control_limits(),
-                view.auth_policy.allowed_proxy_providers.clone(),
-            )
-        });
+    let proxy_controller = ctx.proxy_template.as_ref().map(|t| {
+        t.spawn(
+            view.server_options.proxy_control_limits(),
+            view.auth_policy.allowed_proxy_providers.clone(),
+        )
+    });
     ServerContext::new(
         client_ip,
         client_hash,
@@ -271,14 +271,14 @@ fn build_server_ctx(
         view.server_options.clone(),
         proxy_controller,
         client_advertises_v2,
+        ctx.dos.clone(),
     )
+    .with_cancel(ctx.shutdown.child_token())
 }
 
-// ---------------- reader -------------------------------------------------
-
-/// Error placeholder for the inbound stream. `serve_connection`'s `RxErr`
-/// only requires `Display`; we use a small enum so a stringly-typed error
-/// shows up in logs without dragging the h3 error type across crates.
+/// Error carried on the inbound stream. [`serve_connection`]'s `RxErr`
+/// bound only requires `Display`; this keeps the h3 error type from
+/// crossing the crate boundary while still surfacing a reason in logs.
 #[derive(Debug)]
 pub struct RecvErr(String);
 
@@ -292,8 +292,9 @@ async fn run_reader(
     mut recv: RequestStream<<MsQuicBidi as H3BidiStream<Bytes>>::RecvStream, Bytes>,
     incoming_tx: mpsc::Sender<Result<WispMessage, RecvErr>>,
     ctrl_tx: mpsc::Sender<ControlFrame>,
+    max_frame_payload: usize,
 ) {
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::with_max_payload(max_frame_payload);
     loop {
         let chunk = match recv.recv_data().await {
             Ok(Some(buf)) => {
@@ -334,25 +335,31 @@ async fn run_reader(
                         return;
                     }
                 }
-                Ok(Some(InboundFrame::Pong)) => {
-                    // No state to update; we never send pings.
-                }
-                Ok(Some(InboundFrame::Close { .. })) => {
-                    let _ = ctrl_tx
-                        .send(ControlFrame::Close {
-                            code: CLOSE_NORMAL,
-                            reason: Bytes::new(),
-                        })
-                        .await;
+                Ok(Some(InboundFrame::Pong)) => {}
+                Ok(Some(InboundFrame::Close { payload })) => {
+                    let (code, reason) = if payload.len() >= 2 {
+                        (
+                            u16::from_be_bytes([payload[0], payload[1]]),
+                            payload.slice(2..),
+                        )
+                    } else {
+                        (CLOSE_NORMAL, Bytes::new())
+                    };
+                    let _ = ctrl_tx.send(ControlFrame::Close { code, reason }).await;
                     let _ = incoming_tx.send(Err(RecvErr("client close".into()))).await;
                     return;
                 }
                 Ok(None) => break,
                 Err(e) => {
                     warn!(error = %e, "h3 ws: frame decode error");
+                    let code = if matches!(e, FrameError::PayloadTooLarge(_)) {
+                        CLOSE_MESSAGE_TOO_BIG
+                    } else {
+                        CLOSE_PROTOCOL_ERROR
+                    };
                     let _ = ctrl_tx
                         .send(ControlFrame::Close {
-                            code: CLOSE_INTERNAL_ERROR,
+                            code,
                             reason: Bytes::from_static(b"frame error"),
                         })
                         .await;
@@ -363,8 +370,6 @@ async fn run_reader(
         }
     }
 }
-
-// ---------------- writer -------------------------------------------------
 
 #[derive(Debug)]
 enum ControlFrame {
@@ -378,9 +383,6 @@ async fn run_writer(
     mut ctrl_rx: mpsc::Receiver<ControlFrame>,
 ) {
     loop {
-        // tokio::select biases nothing — both arms are equally important.
-        // Control frames take priority on tie via `biased;` so a Close
-        // request is honored even if data is queued.
         tokio::select! {
             biased;
             ctrl = ctrl_rx.recv() => {
@@ -398,9 +400,6 @@ async fn run_writer(
                         return;
                     }
                     None => {
-                        // ctrl channel dropped — peer-side initiated shutdown
-                        // and serve_connection is winding down. Drain any
-                        // residual data, finish, and exit.
                         while let Some(msg) = wisp_rx.recv().await {
                             let frame = encode_message(msg);
                             if send.send_data(frame).await.is_err() {
@@ -421,9 +420,6 @@ async fn run_writer(
                         }
                     }
                     None => {
-                        // serve_connection's sink dropped. Finish the stream
-                        // and exit; ctrl will still be drained by the
-                        // outer drop in serve_h3_websocket.
                         let _ = send.finish().await;
                         return;
                     }
@@ -440,11 +436,7 @@ fn encode_message(msg: WispMessage) -> Bytes {
     }
 }
 
-// ---------------- Stream adapter -----------------------------------------
-
 /// `Stream<Item = Result<WispMessage, RecvErr>>` over an mpsc receiver.
-/// We do not use `tokio-stream::ReceiverStream` to keep the workspace
-/// dep set minimal — this is a five-line impl.
 struct WispMessageStream {
     rx: mpsc::Receiver<Result<WispMessage, RecvErr>>,
 }

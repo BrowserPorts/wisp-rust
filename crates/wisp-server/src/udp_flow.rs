@@ -1,82 +1,60 @@
-//! UDP flow registry. Mirrors `WispWtUdpFlow` (`wisp-wt/src/wt/server.ts`).
+//! UDP flow registry.
 //!
-//! Each open UDP_OPEN frame creates a `UdpFlow` keyed by a server-assigned
-//! `flow_id`. Inbound packets from the client (via datagram OR — when 0x09
-//! PER_FLOW_UDP_UNI is negotiated — a per-flow uni stream) are pushed onto the
-//! flow's `tx`. The send pump on the flow forwards them to the upstream UDP
-//! socket. Replies from the socket go back as datagrams (with the negotiated
-//! priority class when 0x0a is on) or, in per-flow-uni mode, as chunks on the
-//! flow's server→client uni stream.
+//! Each UDP_OPEN frame creates a flow keyed by a server-assigned `flow_id`.
+//! Inbound datagrams from the client are routed onto the flow's `upstream_tx`;
+//! a per-flow send pump forwards them to the upstream UDP socket, and socket
+//! replies travel back to the client as datagrams. Closing a flow cancels its
+//! pump tasks via the flow's [`CancellationToken`].
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-/// What carrier the client opened the flow with. Server reuses the same
-/// carrier for replies so the framing is symmetric.
+/// Live per-flow handle: the channel that feeds client datagrams to the
+/// upstream send pump, plus the token that shuts the flow's pumps down.
+pub struct UdpFlowHandle {
+    pub upstream_tx: mpsc::Sender<Bytes>,
+    pub cancel: CancellationToken,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdpCarrier {
-    Datagram,
-    PerFlowUni,
+pub enum RouteOutcome {
+    Queued,
+    Full,
+    Closed,
+    Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UdpPriorityClass {
-    Bulk = 0,
-    #[default]
-    Normal = 1,
-    Interactive = 2,
-}
-
-#[derive(Debug)]
-pub struct UdpFlow {
-    pub flow_id: u32,
-    pub carrier: UdpCarrier,
-    pub priority: UdpPriorityClass,
-    pub tx: mpsc::Sender<Bytes>,
-}
-
-/// Registry of UDP flows for a single connection.
-#[derive(Debug, Default)]
+/// Registry of active UDP flows for a single connection.
+#[derive(Default)]
 pub struct UdpFlowRegistry {
+    flows: DashMap<u32, UdpFlowHandle>,
     next_id: AtomicU32,
-    flows: DashMap<u32, Arc<UdpFlow>>,
 }
 
 impl UdpFlowRegistry {
     pub fn new() -> Self {
-        Self {
-            next_id: AtomicU32::new(1),
-            flows: DashMap::new(),
+        Self::default()
+    }
+
+    /// Reserve a fresh non-zero flow id not currently in use.
+    pub fn alloc_id(&self) -> u32 {
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            if id != 0 && !self.flows.contains_key(&id) {
+                return id;
+            }
         }
     }
 
-    pub fn allocate(
-        &self,
-        carrier: UdpCarrier,
-        priority: UdpPriorityClass,
-        send_buffer: usize,
-    ) -> (Arc<UdpFlow>, mpsc::Receiver<Bytes>) {
-        let flow_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(send_buffer);
-        let flow = Arc::new(UdpFlow {
-            flow_id,
-            carrier,
-            priority,
-            tx,
-        });
-        self.flows.insert(flow_id, flow.clone());
-        (flow, rx)
+    pub fn insert(&self, id: u32, handle: UdpFlowHandle) {
+        self.flows.insert(id, handle);
     }
 
-    pub fn get(&self, flow_id: u32) -> Option<Arc<UdpFlow>> {
-        self.flows.get(&flow_id).map(|e| e.clone())
-    }
-
-    pub fn remove(&self, flow_id: u32) -> Option<Arc<UdpFlow>> {
-        self.flows.remove(&flow_id).map(|(_, v)| v)
+    pub fn remove(&self, flow_id: u32) -> Option<UdpFlowHandle> {
+        self.flows.remove(&flow_id).map(|(_, h)| h)
     }
 
     pub fn len(&self) -> usize {
@@ -87,9 +65,31 @@ impl UdpFlowRegistry {
         self.flows.is_empty()
     }
 
-    /// Drop all flows. Senders on the held mpsc channels go away, which the
-    /// pump tasks observe as graceful shutdown.
-    pub fn clear(&self) {
+    /// Attempt to forward a client datagram without blocking the connection
+    /// demultiplexer behind a saturated flow.
+    pub fn route(&self, flow_id: u32, payload: Bytes) -> RouteOutcome {
+        let Some(entry) = self.flows.get(&flow_id) else {
+            return RouteOutcome::Unknown;
+        };
+        match entry.upstream_tx.try_send(payload) {
+            Ok(()) => RouteOutcome::Queued,
+            Err(mpsc::error::TrySendError::Full(_)) => RouteOutcome::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => RouteOutcome::Closed,
+        }
+    }
+
+    /// Cancel and remove a single flow.
+    pub fn close(&self, flow_id: u32) {
+        if let Some((_, h)) = self.flows.remove(&flow_id) {
+            h.cancel.cancel();
+        }
+    }
+
+    /// Cancel every flow and clear the registry.
+    pub fn shutdown_all(&self) {
+        for entry in self.flows.iter() {
+            entry.value().cancel.cancel();
+        }
         self.flows.clear();
     }
 }
@@ -98,32 +98,98 @@ impl UdpFlowRegistry {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn allocate_assigns_monotonic_ids() {
+    fn handle(capacity: usize) -> (UdpFlowHandle, mpsc::Receiver<Bytes>) {
+        let (upstream_tx, rx) = mpsc::channel(capacity);
+        (
+            UdpFlowHandle {
+                upstream_tx,
+                cancel: CancellationToken::new(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn alloc_id_is_non_zero_and_unique() {
         let reg = UdpFlowRegistry::new();
-        let (a, _) = reg.allocate(UdpCarrier::Datagram, UdpPriorityClass::Normal, 8);
-        let (b, _) = reg.allocate(UdpCarrier::Datagram, UdpPriorityClass::Normal, 8);
-        assert!(b.flow_id > a.flow_id);
-        assert_eq!(reg.len(), 2);
+        let a = reg.alloc_id();
+        let b = reg.alloc_id();
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert_ne!(a, b);
     }
 
     #[tokio::test]
-    async fn remove_deletes_flow() {
+    async fn route_forwards_to_upstream_tx() {
         let reg = UdpFlowRegistry::new();
-        let (flow, _) = reg.allocate(UdpCarrier::PerFlowUni, UdpPriorityClass::Interactive, 8);
-        let id = flow.flow_id;
-        assert!(reg.get(id).is_some());
-        let taken = reg.remove(id).unwrap();
-        assert_eq!(taken.flow_id, id);
-        assert!(reg.get(id).is_none());
+        let id = reg.alloc_id();
+        let (h, mut rx) = handle(1);
+        reg.insert(id, h);
+        assert_eq!(
+            reg.route(id, Bytes::from_static(b"hello")),
+            RouteOutcome::Queued
+        );
+        assert_eq!(rx.recv().await.unwrap().as_ref(), b"hello");
     }
 
-    #[tokio::test]
-    async fn tx_round_trips_payload() {
+    #[test]
+    fn route_reports_backpressure_and_unknown_flows() {
         let reg = UdpFlowRegistry::new();
-        let (flow, mut rx) = reg.allocate(UdpCarrier::Datagram, UdpPriorityClass::Normal, 8);
-        flow.tx.send(Bytes::from_static(b"hello")).await.unwrap();
-        let got = rx.recv().await.unwrap();
-        assert_eq!(got.as_ref(), b"hello");
+        let id = reg.alloc_id();
+        let (h, _rx) = handle(1);
+        reg.insert(id, h);
+        assert_eq!(
+            reg.route(id, Bytes::from_static(b"first")),
+            RouteOutcome::Queued
+        );
+        assert_eq!(
+            reg.route(id, Bytes::from_static(b"second")),
+            RouteOutcome::Full
+        );
+        assert_eq!(
+            reg.route(id + 1, Bytes::from_static(b"unknown")),
+            RouteOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn route_reports_closed_pump() {
+        let reg = UdpFlowRegistry::new();
+        let id = reg.alloc_id();
+        let (h, rx) = handle(1);
+        drop(rx);
+        reg.insert(id, h);
+        assert_eq!(
+            reg.route(id, Bytes::from_static(b"closed")),
+            RouteOutcome::Closed
+        );
+    }
+
+    #[test]
+    fn close_cancels_and_removes() {
+        let reg = UdpFlowRegistry::new();
+        let id = reg.alloc_id();
+        let (h, _rx) = handle(1);
+        let token = h.cancel.clone();
+        reg.insert(id, h);
+        assert_eq!(reg.len(), 1);
+        reg.close(id);
+        assert!(token.is_cancelled());
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn shutdown_all_cancels_every_flow() {
+        let reg = UdpFlowRegistry::new();
+        let (h1, _r1) = handle(1);
+        let (h2, _r2) = handle(1);
+        let t1 = h1.cancel.clone();
+        let t2 = h2.cancel.clone();
+        reg.insert(reg.alloc_id(), h1);
+        reg.insert(reg.alloc_id(), h2);
+        reg.shutdown_all();
+        assert!(t1.is_cancelled());
+        assert!(t2.is_cancelled());
+        assert!(reg.is_empty());
     }
 }

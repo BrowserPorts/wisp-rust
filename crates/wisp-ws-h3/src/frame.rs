@@ -1,13 +1,10 @@
 //! Minimal RFC 6455 frame codec for the post-extended-CONNECT H3 path.
 //!
-//! Why a hand-rolled codec instead of `tokio-websockets`: tokio-websockets
-//! takes an `AsyncRead + AsyncWrite`. The h3 `RequestStream` exposes
-//! `recv_data().await` and `send_data().await` on owned `Bytes`, with no
-//! poll-based AsyncRead/Write. Threading those into an adapter would mean
-//! storing pinned futures inside the adapter for both halves and managing
-//! cancellation of in-flight `send_data` futures across `poll_write`s. The
-//! WS framing we actually need is small enough (~150 lines of frame logic)
-//! that doing it directly is simpler than the adapter.
+//! The h3 `RequestStream` exposes `recv_data().await`/`send_data().await`
+//! over owned `Bytes` rather than a poll-based `AsyncRead + AsyncWrite`, so
+//! a general WebSocket library that wants an `AsyncRead + AsyncWrite` does
+//! not fit without an adapter that pins in-flight send futures. The small
+//! amount of framing required here is implemented directly instead.
 //!
 //! Coverage:
 //!  - server→client: text/binary final frames, no fragmentation, no mask
@@ -17,9 +14,8 @@
 //!    fragmented (RFC 6455 §5.5) — enforced
 //!  - mask key XOR is required on every client→server frame (RFC 6455
 //!    §5.3) — enforced
-//!  - 64-bit length frames over `MAX_FRAME_PAYLOAD` are rejected to keep
-//!    the receive accumulator bounded; matches the `max_binary_frame_bytes`
-//!    cap we already enforce one layer above.
+//!  - payloads over the configured decoder limit are rejected before they
+//!    enter the receive accumulator.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -31,9 +27,9 @@ pub const OP_CLOSE: u8 = 0x8;
 pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xA;
 
-/// Hard cap on a single payload — same default as `wisp_config`'s
-/// `max_binary_frame_bytes` to keep memory bounded against a malicious peer.
+/// Default cap used by callers that do not supply a runtime limit.
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+const MAX_BUFFER_OVERHEAD: usize = 14 + 125;
 
 #[derive(Debug, Error)]
 pub enum FrameError {
@@ -51,6 +47,12 @@ pub enum FrameError {
     InterleavedDataFrame,
     #[error("reserved bits set in frame header")]
     ReservedBitsSet,
+    #[error("text frame is not valid UTF-8")]
+    InvalidUtf8,
+    #[error("close frame payload is invalid")]
+    InvalidClosePayload,
+    #[error("payload length uses a non-canonical encoding")]
+    NonCanonicalLength,
     #[error("opcode 0x{0:x} is not recognized")]
     UnknownOpcode(u8),
 }
@@ -78,18 +80,35 @@ pub struct Decoder {
     rx: BytesMut,
     msg_buf: BytesMut,
     msg_opcode: Option<u8>,
+    max_payload: usize,
+    pending_error: Option<FrameError>,
 }
 
 impl Decoder {
     pub fn new() -> Self {
+        Self::with_max_payload(MAX_FRAME_PAYLOAD)
+    }
+
+    pub fn with_max_payload(max_payload: usize) -> Self {
         Self {
             rx: BytesMut::with_capacity(8 * 1024),
             msg_buf: BytesMut::new(),
             msg_opcode: None,
+            max_payload: max_payload.max(1),
+            pending_error: None,
         }
     }
 
     pub fn push(&mut self, chunk: &[u8]) {
+        let buffered = self
+            .rx
+            .len()
+            .saturating_add(self.msg_buf.len())
+            .saturating_add(chunk.len());
+        if buffered > self.max_payload.saturating_add(MAX_BUFFER_OVERHEAD) {
+            self.pending_error = Some(FrameError::PayloadTooLarge(buffered as u64));
+            return;
+        }
         self.rx.extend_from_slice(chunk);
     }
 
@@ -97,18 +116,21 @@ impl Decoder {
     /// buffer holds only a partial frame; call again after pushing more
     /// bytes.
     pub fn next_frame(&mut self) -> Result<Option<InboundFrame>, FrameError> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
         loop {
-            let Some((parsed, consumed)) = parse_one(&self.rx)? else {
+            let Some((parsed, consumed)) = parse_one(&self.rx, self.max_payload)? else {
                 return Ok(None);
             };
             let _ = self.rx.split_to(consumed);
 
-            // Control frames are independent of the data continuation state.
             match parsed.opcode {
                 OP_CLOSE => {
                     if !parsed.fin {
                         return Err(FrameError::FragmentedControlFrame);
                     }
+                    validate_close_payload(&parsed.payload)?;
                     return Ok(Some(InboundFrame::Close {
                         payload: parsed.payload.freeze(),
                     }));
@@ -129,7 +151,7 @@ impl Decoder {
                     if self.msg_opcode.is_none() {
                         return Err(FrameError::UnexpectedContinuation);
                     }
-                    if self.msg_buf.len() + parsed.payload.len() > MAX_FRAME_PAYLOAD {
+                    if self.msg_buf.len() + parsed.payload.len() > self.max_payload {
                         return Err(FrameError::PayloadTooLarge(
                             (self.msg_buf.len() + parsed.payload.len()) as u64,
                         ));
@@ -138,18 +160,17 @@ impl Decoder {
                     if parsed.fin {
                         let opcode = self.msg_opcode.take().expect("opcode set above");
                         let body = self.msg_buf.split().freeze();
-                        return Ok(Some(finalize_data(opcode, body)));
+                        return Ok(Some(finalize_data(opcode, body)?));
                     }
-                    // Need more frames to complete the message.
                 }
                 OP_TEXT | OP_BINARY => {
                     if self.msg_opcode.is_some() {
                         return Err(FrameError::InterleavedDataFrame);
                     }
                     if parsed.fin {
-                        return Ok(Some(finalize_data(parsed.opcode, parsed.payload.freeze())));
+                        return Ok(Some(finalize_data(parsed.opcode, parsed.payload.freeze())?));
                     }
-                    if parsed.payload.len() > MAX_FRAME_PAYLOAD {
+                    if parsed.payload.len() > self.max_payload {
                         return Err(FrameError::PayloadTooLarge(parsed.payload.len() as u64));
                     }
                     self.msg_opcode = Some(parsed.opcode);
@@ -167,18 +188,29 @@ impl Default for Decoder {
     }
 }
 
-fn finalize_data(opcode: u8, payload: Bytes) -> InboundFrame {
+fn finalize_data(opcode: u8, payload: Bytes) -> Result<InboundFrame, FrameError> {
     if opcode == OP_TEXT {
-        match String::from_utf8(payload.to_vec()) {
-            Ok(s) => InboundFrame::Text(s),
-            // Per RFC the connection should be closed; we drop the payload
-            // and return an empty text frame. The Wisp layer above tolerates
-            // a stray empty text since it only routes text→proxy_control.
-            Err(_) => InboundFrame::Text(String::new()),
-        }
+        String::from_utf8(payload.to_vec())
+            .map(InboundFrame::Text)
+            .map_err(|_| FrameError::InvalidUtf8)
     } else {
-        InboundFrame::Binary(payload)
+        Ok(InboundFrame::Binary(payload))
     }
+}
+
+fn validate_close_payload(payload: &[u8]) -> Result<(), FrameError> {
+    if payload.len() == 1 {
+        return Err(FrameError::InvalidClosePayload);
+    }
+    if payload.len() < 2 {
+        return Ok(());
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    let code_allowed = matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999);
+    if !code_allowed || std::str::from_utf8(&payload[2..]).is_err() {
+        return Err(FrameError::InvalidClosePayload);
+    }
+    Ok(())
 }
 
 struct ParsedFrame {
@@ -187,7 +219,7 @@ struct ParsedFrame {
     payload: BytesMut,
 }
 
-fn parse_one(buf: &[u8]) -> Result<Option<(ParsedFrame, usize)>, FrameError> {
+fn parse_one(buf: &[u8], max_payload: usize) -> Result<Option<(ParsedFrame, usize)>, FrameError> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -211,6 +243,9 @@ fn parse_one(buf: &[u8]) -> Result<Option<(ParsedFrame, usize)>, FrameError> {
                 return Ok(None);
             }
             let n = u16::from_be_bytes([buf[header_len], buf[header_len + 1]]) as u64;
+            if n < 126 {
+                return Err(FrameError::NonCanonicalLength);
+            }
             header_len += 2;
             n
         }
@@ -221,11 +256,15 @@ fn parse_one(buf: &[u8]) -> Result<Option<(ParsedFrame, usize)>, FrameError> {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&buf[header_len..header_len + 8]);
             header_len += 8;
-            u64::from_be_bytes(bytes)
+            let n = u64::from_be_bytes(bytes);
+            if n <= u16::MAX as u64 || n >> 63 != 0 {
+                return Err(FrameError::NonCanonicalLength);
+            }
+            n
         }
         _ => unreachable!("len_field is 7 bits"),
     };
-    if payload_len > MAX_FRAME_PAYLOAD as u64 {
+    if payload_len > max_payload as u64 {
         return Err(FrameError::PayloadTooLarge(payload_len));
     }
     if (opcode == OP_CLOSE || opcode == OP_PING || opcode == OP_PONG) && payload_len > 125 {
@@ -362,20 +401,68 @@ mod tests {
     #[test]
     fn rejects_unmasked_client_frame() {
         let mut d = Decoder::new();
-        // Manually construct an unmasked frame.
         let buf = [0x82, 0x05, b'h', b'e', b'l', b'l', b'o'];
         d.push(&buf);
         let err = d.next_frame().unwrap_err();
-        matches!(err, FrameError::UnmaskedClientFrame);
+        assert!(matches!(err, FrameError::UnmaskedClientFrame));
     }
 
     #[test]
     fn rejects_fragmented_control_frame() {
         let mut d = Decoder::new();
-        // Ping with FIN=0: invalid.
         d.push(&masked(OP_PING, false, b""));
         let err = d.next_frame().unwrap_err();
-        matches!(err, FrameError::FragmentedControlFrame);
+        assert!(matches!(err, FrameError::FragmentedControlFrame));
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_text() {
+        let mut d = Decoder::new();
+        d.push(&masked(OP_TEXT, true, &[0xff]));
+        assert!(matches!(d.next_frame(), Err(FrameError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn rejects_invalid_close_payload() {
+        let mut d = Decoder::new();
+        d.push(&masked(OP_CLOSE, true, &[0]));
+        assert!(matches!(
+            d.next_frame(),
+            Err(FrameError::InvalidClosePayload)
+        ));
+    }
+
+    #[test]
+    fn configured_payload_limit_is_applied() {
+        let mut d = Decoder::with_max_payload(4);
+        d.push(&masked(OP_BINARY, true, b"12345"));
+        assert!(matches!(
+            d.next_frame(),
+            Err(FrameError::PayloadTooLarge(5))
+        ));
+    }
+
+    #[test]
+    fn receive_accumulator_is_bounded() {
+        let mut d = Decoder::with_max_payload(4);
+        d.push(&[0; 144]);
+        assert!(matches!(
+            d.next_frame(),
+            Err(FrameError::PayloadTooLarge(144))
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_length() {
+        let mut frame = vec![0x82, 0x80 | 126, 0, 1];
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+        frame.push(b'x' ^ 1);
+        let mut d = Decoder::new();
+        d.push(&frame);
+        assert!(matches!(
+            d.next_frame(),
+            Err(FrameError::NonCanonicalLength)
+        ));
     }
 
     #[test]
@@ -411,8 +498,6 @@ mod tests {
     #[test]
     fn encode_close_round_trips_through_decoder() {
         let f = encode_close(1000, b"bye");
-        // Server-sent close is unmasked — decoder rejects unmasked frames,
-        // so we only verify the wire shape.
         assert_eq!(f[0], 0x88);
         assert_eq!(f[1], 5);
         assert_eq!(u16::from_be_bytes([f[2], f[3]]), 1000);

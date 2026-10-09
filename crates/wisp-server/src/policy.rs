@@ -1,18 +1,17 @@
 //! Pre-upgrade policy stack: origin, IP, DoS gates that must run before the
 //! server responds to the H3 extended CONNECT.
 //!
-//! Mirrors the equivalent block in `wisp-wt/src/wt/server.ts` that runs
-//! inside the upgrade handler. The Bun WT binding bypassed origin
-//! enforcement because it didn't surface request headers; with `h3` we
-//! enforce unconditionally — this is one of the two Bun-dropped features
-//! the Rust port restores.
+//! Origin enforcement runs unconditionally here: because `h3` surfaces the
+//! request headers at upgrade time, every extended CONNECT is checked against
+//! the origin policy before the session is accepted.
 
 use http::{header, HeaderMap, HeaderValue, StatusCode};
 use std::sync::Arc;
-use wisp_config::WispServerOptions;
+use wisp_config::{is_client_ip_allowed, WispServerOptions};
 use wisp_dos::{is_connection_start_allowed, DosGuard};
 use wisp_iphash::hash_client_ip;
-use wisp_origin::{is_origin_allowed, origin_from_headers, policy_headers};
+use wisp_origin::{is_origin_allowed, origin_from_headers, origin_headers_valid, policy_headers};
+use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
 
 fn build_policy_headers(origin: Option<&str>, options: &WispServerOptions) -> HeaderMap {
     let (vary, acao) = policy_headers(origin, options);
@@ -65,15 +64,82 @@ impl PreUpgradePolicy {
         client_ip: &str,
     ) -> Result<Option<String>, PreUpgradeRejection> {
         let origin = origin_from_headers(headers);
+        if !origin_headers_valid(headers) {
+            emit_report(
+                ReportErrorType::OriginBlocked,
+                ReportInput {
+                    context: Some(ConnectionContext {
+                        client_ip: Some(client_ip.to_owned()),
+                        transport: Some(Transport::Wt),
+                        ..Default::default()
+                    }),
+                    transport_close_code: Some(403),
+                    ..Default::default()
+                },
+            );
+            return Err(PreUpgradeRejection {
+                status: StatusCode::FORBIDDEN,
+                headers: build_policy_headers(None, &self.options),
+                reason: "invalid origin headers",
+            });
+        }
         if !is_origin_allowed(origin, &self.options) {
+            emit_report(
+                ReportErrorType::OriginBlocked,
+                ReportInput {
+                    context: Some(ConnectionContext {
+                        client_ip: Some(client_ip.to_owned()),
+                        transport: Some(Transport::Wt),
+                        origin: origin.map(|s| s.to_owned()),
+                        ..Default::default()
+                    }),
+                    origin: origin.map(|s| s.to_owned()),
+                    transport_close_code: Some(403),
+                    ..Default::default()
+                },
+            );
             return Err(PreUpgradeRejection {
                 status: StatusCode::FORBIDDEN,
                 headers: build_policy_headers(origin, &self.options),
                 reason: "origin policy",
             });
         }
+        if !is_client_ip_allowed(client_ip, &self.options) {
+            emit_report(
+                ReportErrorType::ClientBlocked,
+                ReportInput {
+                    context: Some(ConnectionContext {
+                        client_ip: Some(client_ip.to_owned()),
+                        transport: Some(Transport::Wt),
+                        origin: origin.map(|s| s.to_owned()),
+                        ..Default::default()
+                    }),
+                    transport_close_code: Some(403),
+                    ..Default::default()
+                },
+            );
+            return Err(PreUpgradeRejection {
+                status: StatusCode::FORBIDDEN,
+                headers: build_policy_headers(origin, &self.options),
+                reason: "client IP policy",
+            });
+        }
         let client_hash = hash_client_ip(Some(client_ip), self.iphash_secret.as_deref());
         if !is_connection_start_allowed(client_ip, &self.options, &self.dos) {
+            emit_report(
+                ReportErrorType::ConnectionRateLimited,
+                ReportInput {
+                    context: Some(ConnectionContext {
+                        client_ip: Some(client_ip.to_owned()),
+                        client_ip_hash: client_hash.clone(),
+                        transport: Some(Transport::Wt),
+                        origin: origin.map(|s| s.to_owned()),
+                    }),
+                    transport_close_code: Some(429),
+                    limit_type: Some("connection_start".to_owned()),
+                    ..Default::default()
+                },
+            );
             return Err(PreUpgradeRejection {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: build_policy_headers(origin, &self.options),
@@ -106,7 +172,6 @@ mod tests {
 
     #[test]
     fn rejects_blank_origin_by_default() {
-        // Default config enforces block_blank_origins = true.
         let p = PreUpgradePolicy::new(opts(), Arc::new(DosGuard::new()));
         let rej = p.check(&HeaderMap::new(), "1.2.3.4").unwrap_err();
         assert_eq!(rej.status, StatusCode::FORBIDDEN);

@@ -1,14 +1,12 @@
 //! msquic engine bootstrap: registration, configuration, listener.
 //!
-//! All Wispmark-critical tuning lives here:
-//! - BBR (CongestionControlAlgorithm = 1) — neither Quinn nor quic-go ships
-//!   BBR yet; msquic does.
+//! Transport tuning lives here:
+//! - BBR (CongestionControlAlgorithm = 1).
 //! - RFC 9221 datagrams enabled.
 //! - 64 MiB connection flow-control window, 6 MiB per-stream recv window.
 //! - Pacing + send buffering on.
 //! - MTU discovery 1248..1500.
-//! - LowLatency execution profile by default; bench mode switches to
-//!   MaxThroughput via [`EngineConfig::bench_mode`].
+//! - LowLatency execution profile.
 
 use msquic::{
     BufferRef, Configuration, Credential, CredentialConfig, CredentialFlags, ExecutionProfile,
@@ -17,7 +15,8 @@ use msquic::{
 use std::sync::Arc;
 use thiserror::Error;
 
-const BBR_ALGO: u16 = 1; // QUIC_CONGESTION_CONTROL_ALGORITHM_BBR
+/// `QUIC_CONGESTION_CONTROL_ALGORITHM_BBR`.
+const BBR_ALGO: u16 = 1;
 const ALPN_H3: &str = "h3";
 
 #[derive(Debug, Error)]
@@ -32,16 +31,13 @@ pub enum EngineError {
     Listener(#[source] Status),
 }
 
-/// Caller-controlled knobs for the engine. Defaults match the Wispmark plan.
+/// Caller-controlled knobs for the engine.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub registration_name: String,
     pub alpns: Vec<String>,
     pub cert_path: String,
     pub key_path: String,
-    /// Switch to MaxThroughput execution profile when true (mirrors the
-    /// `WISP_WT_BENCH_MODE` env var the TS reference observes).
-    pub bench_mode: bool,
     /// Peer-initiated bidi streams allowed per connection.
     pub peer_bidi_stream_count: u16,
     /// Peer-initiated uni streams allowed per connection.
@@ -67,7 +63,6 @@ impl Default for EngineConfig {
             alpns: vec![ALPN_H3.to_owned()],
             cert_path: String::new(),
             key_path: String::new(),
-            bench_mode: false,
             peer_bidi_stream_count: 4096,
             peer_unidi_stream_count: 1024,
             stream_recv_window_default: 6 * 1024 * 1024,
@@ -84,21 +79,17 @@ impl Default for EngineConfig {
 pub struct MsQuicEngine {
     pub registration: Arc<Registration>,
     pub configuration: Arc<Configuration>,
+    pub client_configuration: Arc<Configuration>,
 }
 
 impl MsQuicEngine {
     pub fn new(cfg: &EngineConfig) -> Result<Self, EngineError> {
-        let profile = if cfg.bench_mode {
-            ExecutionProfile::MaxThroughput
-        } else {
-            ExecutionProfile::LowLatency
-        };
         let reg_cfg = RegistrationConfig::new()
             .set_app_name(cfg.registration_name.clone())
-            .set_execution_profile(profile);
+            .set_execution_profile(ExecutionProfile::LowLatency);
         let registration = Registration::new(&reg_cfg).map_err(EngineError::Registration)?;
 
-        let settings = wispmark_settings(cfg);
+        let settings = transport_settings(cfg);
 
         let alpn_refs: Vec<BufferRef> = cfg
             .alpns
@@ -118,9 +109,16 @@ impl MsQuicEngine {
             .load_credential(&cred)
             .map_err(EngineError::Credentials)?;
 
+        let client_configuration = Configuration::open(&registration, &alpn_refs, Some(&settings))
+            .map_err(EngineError::Configuration)?;
+        client_configuration
+            .load_credential(&CredentialConfig::new_client())
+            .map_err(EngineError::Credentials)?;
+
         Ok(Self {
             registration: Arc::new(registration),
             configuration: Arc::new(configuration),
+            client_configuration: Arc::new(client_configuration),
         })
     }
 
@@ -138,7 +136,7 @@ impl MsQuicEngine {
     }
 }
 
-fn wispmark_settings(cfg: &EngineConfig) -> Settings {
+fn transport_settings(cfg: &EngineConfig) -> Settings {
     Settings::new()
         .set_PeerBidiStreamCount(cfg.peer_bidi_stream_count)
         .set_PeerUnidiStreamCount(cfg.peer_unidi_stream_count)
@@ -162,9 +160,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_apply_wispmark_tuning() {
+    fn settings_apply_transport_tuning() {
         let cfg = EngineConfig::default();
-        let s = wispmark_settings(&cfg);
+        let s = transport_settings(&cfg);
         let raw = s.as_ffi_ref();
         assert_eq!(raw.PeerBidiStreamCount, 4096);
         assert_eq!(raw.PeerUnidiStreamCount, 1024);
@@ -178,14 +176,5 @@ mod tests {
         assert_eq!(raw.MaximumMtu, 1500);
         assert_eq!(raw.CongestionControlAlgorithm, BBR_ALGO);
         assert_eq!(raw.ServerResumptionLevel(), 1);
-    }
-
-    #[test]
-    fn bench_mode_switches_profile() {
-        let cfg = EngineConfig {
-            bench_mode: true,
-            ..EngineConfig::default()
-        };
-        assert!(cfg.bench_mode);
     }
 }

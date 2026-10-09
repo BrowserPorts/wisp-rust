@@ -1,7 +1,7 @@
 //! wisp-wt frame and stream encoders.
 //!
 //! Three negotiable extensions ([`extension::UDP`],
-//! [`extension::WEBTRANSPORT_PROXY`], [`extension::STELLITE_PROXY_CONTROL`])
+//! [`extension::WEBTRANSPORT_PROXY`], [`extension::WISP_PROXY_CONTROL`])
 //! gate wisp-specific routing features. Everything else (stream priority,
 //! datagram priority class, server→client uni responses, per-flow UDP uni
 //! streams) is baked into the base protocol unconditionally — every
@@ -106,12 +106,12 @@ pub mod datagram_class {
 
 /// Raw numeric ids for the negotiable extensions. Prefer the typed
 /// [`Extension`] impls (e.g. [`Udp`], [`WebTransportProxy`],
-/// [`StelliteProxyControl`]) for new code — these constants exist so that
+/// [`ProxyControl`]) for new code — these constants exist so that
 /// frame-dispatch code that matches on a raw byte stays readable.
 pub mod extension {
     pub const UDP: u8 = 0x01;
     pub const WEBTRANSPORT_PROXY: u8 = 0x02;
-    pub const STELLITE_PROXY_CONTROL: u8 = 0x03;
+    pub const WISP_PROXY_CONTROL: u8 = 0x03;
 }
 
 /// A negotiable wisp-wt extension.
@@ -163,12 +163,12 @@ impl Extension for WebTransportProxy {
     const NAME: &'static str = "WEBTRANSPORT_PROXY";
 }
 
-/// 0x03 — Stellite-specific control channel for proxy-side coordination
+/// 0x03 — Wisp control channel for proxy-side coordination
 /// outside of the wisp-wt frame catalog.
-pub struct StelliteProxyControl;
-impl Extension for StelliteProxyControl {
-    const ID: u8 = extension::STELLITE_PROXY_CONTROL;
-    const NAME: &'static str = "STELLITE_PROXY_CONTROL";
+pub struct ProxyControl;
+impl Extension for ProxyControl {
+    const ID: u8 = extension::WISP_PROXY_CONTROL;
+    const NAME: &'static str = "WISP_PROXY_CONTROL";
 }
 
 /// Server-side builder for the extension set advertised in INFO. Add typed
@@ -337,8 +337,6 @@ pub struct Datagram {
     pub payload: Bytes,
 }
 
-// -------------------------------------------------------------------- frame --
-
 pub fn encode_frame(frame_type: u8, payload: &[u8]) -> Bytes {
     let body_len = 1 + payload.len();
     let mut out = BytesMut::with_capacity(4 + body_len);
@@ -357,8 +355,6 @@ pub fn decode_frame_body(body: &[u8]) -> Result<Frame> {
         payload: Bytes::copy_from_slice(&body[1..]),
     })
 }
-
-// --------------------------------------------------------------- extensions --
 
 pub fn encode_extensions(entries: &[ExtensionEntry]) -> Bytes {
     let total: usize = entries.iter().map(|e| 5 + e.payload.len()).sum();
@@ -405,8 +401,6 @@ pub fn extension_set(entries: &[ExtensionEntry]) -> std::collections::HashSet<u8
     entries.iter().map(|e| e.id).collect()
 }
 
-// --------------------------------------------------------------------- INFO --
-
 pub fn encode_info_frame(extensions: &[ExtensionEntry]) -> Bytes {
     let ext = encode_extensions(extensions);
     encode_frame(frame_type::INFO, &ext)
@@ -418,13 +412,9 @@ pub fn parse_info_payload(payload: &[u8]) -> Result<InfoFrame> {
     })
 }
 
-// -------------------------------------------------------------------- READY --
-
 pub fn encode_ready_frame() -> Bytes {
     encode_frame(frame_type::READY, &[])
 }
-
-// -------------------------------------------------------------------- CLOSE --
 
 pub fn encode_close_frame(reason: u8) -> Bytes {
     encode_frame(frame_type::CLOSE, &[reason])
@@ -437,8 +427,6 @@ pub fn parse_close_payload(payload: &[u8]) -> Result<u8> {
     Ok(payload[0])
 }
 
-// ------------------------------------------------------------------ CONTROL --
-
 pub fn encode_control_frame(text: &str) -> Bytes {
     encode_frame(frame_type::CONTROL, text.as_bytes())
 }
@@ -448,8 +436,6 @@ pub fn parse_control_payload(payload: &[u8]) -> Result<String> {
         .map(|s| s.to_owned())
         .map_err(|_| WireError::ControlNotUtf8)
 }
-
-// ----------------------------------------------------------------- UDP_OPEN --
 
 pub fn encode_udp_open_frame(hostname: &str, port: u16) -> Bytes {
     let host = hostname.as_bytes();
@@ -479,8 +465,6 @@ pub fn parse_udp_open_payload(payload: &[u8]) -> Result<UdpOpenFrame> {
     Ok(UdpOpenFrame { port, hostname })
 }
 
-// --------------------------------------------------------------- UDP_OPENED --
-
 pub fn encode_udp_opened_frame(flow_id: u32) -> Bytes {
     let mut payload = BytesMut::with_capacity(4);
     payload.put_u32_le(flow_id);
@@ -495,8 +479,6 @@ pub fn parse_udp_opened_payload(payload: &[u8]) -> Result<u32> {
         payload[0], payload[1], payload[2], payload[3],
     ]))
 }
-
-// ---------------------------------------------------------------- UDP_CLOSE --
 
 pub fn encode_udp_close_frame(flow_id: u32, reason: u8) -> Bytes {
     let mut payload = BytesMut::with_capacity(5);
@@ -514,8 +496,6 @@ pub fn parse_udp_close_payload(payload: &[u8]) -> Result<UdpClose> {
         reason: payload[4],
     })
 }
-
-// ------------------------------------------------------------- WT_PROXY_OPEN --
 
 pub fn encode_wt_proxy_open_frame(url: &str) -> Bytes {
     let bytes = url.as_bytes();
@@ -541,8 +521,6 @@ pub fn parse_wt_proxy_open_payload(payload: &[u8]) -> Result<String> {
         .map_err(|_| WireError::WtProxyOpenUrlNotUtf8)
 }
 
-// ----------------------------------------------------------- WT_PROXY_OPENED --
-
 pub fn encode_wt_proxy_opened_frame(session_id: u32) -> Bytes {
     let mut payload = BytesMut::with_capacity(4);
     payload.put_u32_le(session_id);
@@ -557,8 +535,6 @@ pub fn parse_wt_proxy_opened_payload(payload: &[u8]) -> Result<u32> {
         payload[0], payload[1], payload[2], payload[3],
     ]))
 }
-
-// ------------------------------------------------------------ WT_PROXY_CLOSE --
 
 pub fn encode_wt_proxy_close_frame(session_id: u32, code: u32, reason: &str) -> Bytes {
     let r = reason.as_bytes();
@@ -592,8 +568,6 @@ pub fn parse_wt_proxy_close_payload(payload: &[u8]) -> Result<WtProxyClose> {
         reason,
     })
 }
-
-// ----------------------------------------------------------- bidi headers ----
 
 /// Encode the priority-prefixed TCP bidi header.
 pub fn encode_tcp_stream_header(hostname: &str, port: u16, priority: i32) -> Bytes {
@@ -663,8 +637,6 @@ pub fn try_parse_bidi_stream_header(buf: &[u8]) -> Result<Option<(BidiStreamHead
     }
 }
 
-// --------------------------------------------------------------- datagrams --
-
 /// Encode a class- and kind-prefixed datagram.
 pub fn encode_datagram(class: u8, kind: u8, flow_id: u32, payload: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(6 + payload.len());
@@ -686,8 +658,6 @@ pub fn parse_datagram(raw: &[u8]) -> Result<Datagram> {
         payload: Bytes::copy_from_slice(&raw[6..]),
     })
 }
-
-// ---------------------------------------------------- per-flow UDP uni stream --
 
 /// 4-byte prelude that opens a per-flow UDP uni stream.
 pub fn encode_udp_flow_uni_prelude(flow_id: u32) -> Bytes {
@@ -772,7 +742,7 @@ mod tests {
                 payload: Bytes::from_static(&[0xde, 0xad]),
             },
             ExtensionEntry {
-                id: extension::STELLITE_PROXY_CONTROL,
+                id: extension::WISP_PROXY_CONTROL,
                 payload: Bytes::new(),
             },
         ];
@@ -785,11 +755,11 @@ mod tests {
         assert!(parsed_ext[0].payload.is_empty());
         assert_eq!(parsed_ext[1].id, extension::WEBTRANSPORT_PROXY);
         assert_eq!(parsed_ext[1].payload.as_ref(), &[0xde, 0xad]);
-        assert_eq!(parsed_ext[2].id, extension::STELLITE_PROXY_CONTROL);
+        assert_eq!(parsed_ext[2].id, extension::WISP_PROXY_CONTROL);
         let set = extension_set(&parsed_ext);
         assert!(set.contains(&extension::UDP));
         assert!(set.contains(&extension::WEBTRANSPORT_PROXY));
-        assert!(set.contains(&extension::STELLITE_PROXY_CONTROL));
+        assert!(set.contains(&extension::WISP_PROXY_CONTROL));
     }
 
     #[test]
@@ -819,6 +789,18 @@ mod tests {
     }
 
     #[test]
+    fn wt_proxy_open_rejects_truncated_and_non_utf8_urls() {
+        assert!(matches!(
+            parse_wt_proxy_open_payload(&[4, 0, b'h']),
+            Err(WireError::WtProxyOpenUrlTooShort)
+        ));
+        assert!(matches!(
+            parse_wt_proxy_open_payload(&[1, 0, 0xff]),
+            Err(WireError::WtProxyOpenUrlNotUtf8)
+        ));
+    }
+
+    #[test]
     fn wt_proxy_opened_roundtrip() {
         let f = encode_wt_proxy_opened_frame(0xcafe_d00d);
         let parsed = decode_frame_body(&f[4..]).unwrap();
@@ -844,7 +826,6 @@ mod tests {
             0xdead_beef,
             b"abc",
         );
-        // class=02, kind=00, flow=ef be ad de, payload=abc
         assert_eq!(hex(&d), "0200efbeadde616263");
         let parsed = parse_datagram(&d).unwrap();
         assert_eq!(parsed.class, datagram_class::INTERACTIVE);
@@ -865,6 +846,16 @@ mod tests {
         assert_eq!(parsed.class, datagram_class::NORMAL);
         assert_eq!(parsed.kind, datagram_kind::WT_PROXY);
         assert_eq!(parsed.flow_id, 1);
+    }
+
+    #[test]
+    fn datagram_rejects_every_truncated_header() {
+        for len in 0..6 {
+            assert!(matches!(
+                parse_datagram(&[0; 6][..len]),
+                Err(WireError::DatagramTooShort)
+            ));
+        }
     }
 
     #[test]
@@ -900,6 +891,16 @@ mod tests {
     fn bidi_header_short_returns_none() {
         let buf = [0u8; 4];
         assert!(try_parse_bidi_stream_header(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn wt_proxy_sub_header_waits_for_complete_session_id() {
+        let header = encode_wt_proxy_sub_stream_header(7, 0);
+        for len in 5..header.len() {
+            assert!(try_parse_bidi_stream_header(&header[..len])
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
@@ -939,20 +940,19 @@ mod tests {
         let mut reg = ExtensionRegistry::new();
         reg.register::<Udp>()
             .register::<WebTransportProxy>()
-            .register::<StelliteProxyControl>();
+            .register::<ProxyControl>();
         assert!(reg.contains::<Udp>());
         assert!(reg.contains::<WebTransportProxy>());
-        assert!(reg.contains::<StelliteProxyControl>());
+        assert!(reg.contains::<ProxyControl>());
         assert_eq!(reg.entries().len(), 3);
 
-        // Client only advertises UDP + STELLITE_PROXY_CONTROL.
         let mut client_ids = std::collections::HashSet::new();
         client_ids.insert(Udp::ID);
-        client_ids.insert(StelliteProxyControl::ID);
+        client_ids.insert(ProxyControl::ID);
         let negotiated = reg.intersect_ids(&client_ids);
         assert!(negotiated.contains(&Udp::ID));
         assert!(!negotiated.contains(&WebTransportProxy::ID));
-        assert!(negotiated.contains(&StelliteProxyControl::ID));
+        assert!(negotiated.contains(&ProxyControl::ID));
     }
 
     #[test]

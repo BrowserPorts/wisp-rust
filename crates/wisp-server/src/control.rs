@@ -15,7 +15,8 @@ use wisp_dos::is_control_message_allowed;
 use wisp_wire::{
     decode_frame_body, frame_type, parse_close_payload, parse_control_payload,
     parse_udp_close_payload, parse_udp_open_payload, parse_wt_proxy_close_payload,
-    parse_wt_proxy_open_payload, UdpClose, UdpOpenFrame, WireError, WtProxyClose,
+    parse_wt_proxy_open_payload, ProxyControl, Udp, UdpClose, UdpOpenFrame, WebTransportProxy,
+    WireError, WtProxyClose,
 };
 
 use crate::handshake::{ControlIo, ControlIoError};
@@ -31,7 +32,8 @@ pub enum ControlError {
     RateLimited,
 }
 
-/// Why the control loop returned. Matches the TS server's terminal cases.
+/// Why the control loop returned: one of the three terminal cases for a
+/// control bidi.
 #[derive(Debug, Clone)]
 pub enum ControlOutcome {
     /// Peer sent a CLOSE frame with the given reason byte.
@@ -48,7 +50,7 @@ pub trait ControlSink: Send {
     async fn on_control_text(&mut self, text: String);
     async fn on_udp_open(&mut self, frame: UdpOpenFrame);
     async fn on_udp_close(&mut self, frame: UdpClose);
-    async fn on_wt_proxy_open(&mut self, url: url::Url);
+    async fn on_wt_proxy_open(&mut self, url: String);
     async fn on_wt_proxy_close(&mut self, frame: WtProxyClose);
 }
 
@@ -70,7 +72,6 @@ impl<'a> SessionDispatch<'a> {
                 Err(ControlIoError::Closed) => return ControlOutcome::PeerEof,
                 Err(e) => return ControlOutcome::Error(e.to_string()),
             };
-            // Per-frame rate limit (mirrors maxControlMessagesPer{Connection,Ip}).
             if !is_control_message_allowed(
                 &self.ctx.client_ip,
                 &self.ctx.conn_dos,
@@ -89,33 +90,47 @@ impl<'a> SessionDispatch<'a> {
                     return ControlOutcome::PeerClose { reason };
                 }
                 frame_type::CONTROL => {
+                    if !self.ctx.has::<ProxyControl>() {
+                        return ControlOutcome::Error(
+                            "proxy control extension was not negotiated".to_owned(),
+                        );
+                    }
                     if let Ok(text) = parse_control_payload(&parsed.payload) {
                         sink.on_control_text(text).await;
                     }
+                }
+                frame_type::UDP_OPEN if !self.ctx.has::<Udp>() => {
+                    return ControlOutcome::Error("UDP extension was not negotiated".to_owned());
                 }
                 frame_type::UDP_OPEN => match parse_udp_open_payload(&parsed.payload) {
                     Ok(frame) => sink.on_udp_open(frame).await,
                     Err(e) => return ControlOutcome::Error(e.to_string()),
                 },
+                frame_type::UDP_CLOSE if !self.ctx.has::<Udp>() => {
+                    return ControlOutcome::Error("UDP extension was not negotiated".to_owned());
+                }
                 frame_type::UDP_CLOSE => match parse_udp_close_payload(&parsed.payload) {
                     Ok(frame) => sink.on_udp_close(frame).await,
                     Err(e) => return ControlOutcome::Error(e.to_string()),
                 },
+                frame_type::WT_PROXY_OPEN if !self.ctx.has::<WebTransportProxy>() => {
+                    return ControlOutcome::Error(
+                        "WebTransport proxy extension was not negotiated".to_owned(),
+                    );
+                }
                 frame_type::WT_PROXY_OPEN => match parse_wt_proxy_open_payload(&parsed.payload) {
-                    Ok(url_str) => match url::Url::parse(&url_str) {
-                        Ok(url) => sink.on_wt_proxy_open(url).await,
-                        Err(e) => {
-                            return ControlOutcome::Error(format!("WT_PROXY_OPEN bad url: {e}"))
-                        }
-                    },
+                    Ok(url) => sink.on_wt_proxy_open(url).await,
                     Err(e) => return ControlOutcome::Error(e.to_string()),
                 },
+                frame_type::WT_PROXY_CLOSE if !self.ctx.has::<WebTransportProxy>() => {
+                    return ControlOutcome::Error(
+                        "WebTransport proxy extension was not negotiated".to_owned(),
+                    );
+                }
                 frame_type::WT_PROXY_CLOSE => match parse_wt_proxy_close_payload(&parsed.payload) {
                     Ok(frame) => sink.on_wt_proxy_close(frame).await,
                     Err(e) => return ControlOutcome::Error(e.to_string()),
                 },
-                // Unknown frames are ignored — matches TS behavior, lets the
-                // peer roll out new frame types ahead of the server.
                 _ => {}
             }
         }
@@ -132,6 +147,7 @@ mod tests {
     use wisp_dos::DosGuard;
     use wisp_wire::{
         encode_close_frame, encode_control_frame, encode_udp_close_frame, encode_udp_open_frame,
+        encode_wt_proxy_open_frame, Extension,
     };
 
     struct ChanIo {
@@ -152,6 +168,8 @@ mod tests {
         controls: Vec<String>,
         udp_opens: Vec<UdpOpenFrame>,
         udp_closes: Vec<UdpClose>,
+        wt_opens: Vec<String>,
+        wt_closes: Vec<WtProxyClose>,
     }
     #[async_trait::async_trait]
     impl ControlSink for Recorder {
@@ -164,8 +182,12 @@ mod tests {
         async fn on_udp_close(&mut self, frame: UdpClose) {
             self.udp_closes.push(frame);
         }
-        async fn on_wt_proxy_open(&mut self, _: url::Url) {}
-        async fn on_wt_proxy_close(&mut self, _: WtProxyClose) {}
+        async fn on_wt_proxy_open(&mut self, url: String) {
+            self.wt_opens.push(url);
+        }
+        async fn on_wt_proxy_close(&mut self, frame: WtProxyClose) {
+            self.wt_closes.push(frame);
+        }
     }
 
     fn make_ctx() -> SessionContext {
@@ -190,7 +212,9 @@ mod tests {
         tx.send(body(&encode_close_frame(0x42))).unwrap();
         let mut io = ChanIo { rx };
         let mut rec = Recorder::default();
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
+        ctx.negotiated.insert(ProxyControl::ID);
+        ctx.negotiated.insert(Udp::ID);
         let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
         assert!(matches!(
             outcome,
@@ -206,12 +230,47 @@ mod tests {
     #[tokio::test]
     async fn returns_peer_eof_when_channel_closes() {
         let (_tx, rx) = mpsc::unbounded_channel();
-        // Drop tx → next recv returns None.
         drop(_tx);
         let mut io = ChanIo { rx };
         let mut rec = Recorder::default();
         let ctx = make_ctx();
         let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
         assert!(matches!(outcome, ControlOutcome::PeerEof));
+    }
+
+    #[tokio::test]
+    async fn rejects_unnegotiated_wt_proxy_open() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(body(&encode_wt_proxy_open_frame(
+            "https://upstream.example/wisp-wt",
+        )))
+        .unwrap();
+        tx.send(body(&encode_close_frame(0x02))).unwrap();
+        let mut io = ChanIo { rx };
+        let mut rec = Recorder::default();
+        let ctx = make_ctx();
+        let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
+        assert!(matches!(outcome, ControlOutcome::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatches_negotiated_wt_proxy_frames() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(body(&encode_wt_proxy_open_frame(
+            "https://upstream.example/wisp-wt/token",
+        )))
+        .unwrap();
+        tx.send(body(&wisp_wire::encode_wt_proxy_close_frame(9, 4, "bye")))
+            .unwrap();
+        tx.send(body(&encode_close_frame(0x02))).unwrap();
+        let mut io = ChanIo { rx };
+        let mut rec = Recorder::default();
+        let mut ctx = make_ctx();
+        ctx.negotiated.insert(WebTransportProxy::ID);
+        let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
+        assert!(matches!(outcome, ControlOutcome::PeerClose { .. }));
+        assert_eq!(rec.wt_opens, vec!["https://upstream.example/wisp-wt/token"]);
+        assert_eq!(rec.wt_closes.len(), 1);
+        assert_eq!(rec.wt_closes[0].session_id, 9);
     }
 }

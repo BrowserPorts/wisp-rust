@@ -2,7 +2,7 @@
 //!
 //! Sequence:
 //!   1. read client INFO
-//!   2. intersect 0x01–0x03 extension sets
+//!   2. intersect the client set with implemented server extensions
 //!   3. send server INFO and READY
 //!
 //! There is no extra round trip — KEY_AUTH / MOTD / PASSWORD_AUTH are gone.
@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use wisp_wire::{
     decode_frame_body, encode_info_frame, encode_ready_frame, frame_type, parse_extensions,
-    parse_info_payload, ExtensionRegistry, StelliteProxyControl, Udp, WebTransportProxy, WireError,
+    parse_info_payload, ExtensionRegistry, Udp, WireError,
 };
 
 use crate::session::SessionContext;
@@ -51,15 +51,10 @@ pub struct HandshakeOutcome {
     pub negotiated: HashSet<u8>,
 }
 
-/// Build the default server-side extension registry: advertise all three
-/// wisp-specific routing extensions. Callers can mutate the result before
-/// passing it to [`negotiate_handshake_with`] to suppress an extension at
-/// runtime.
+/// Build the default registry with only fully implemented extensions.
 pub fn default_server_registry() -> ExtensionRegistry {
     let mut reg = ExtensionRegistry::new();
-    reg.register::<Udp>()
-        .register::<WebTransportProxy>()
-        .register::<StelliteProxyControl>();
+    reg.register::<Udp>();
     reg
 }
 
@@ -69,7 +64,12 @@ pub async fn negotiate_handshake(
     io: &mut dyn ControlIo,
     ctx: &mut SessionContext,
 ) -> Result<HandshakeOutcome, HandshakeError> {
-    negotiate_handshake_with(io, ctx, &default_server_registry()).await
+    let registry = if ctx.options.allow_udp_streams {
+        default_server_registry()
+    } else {
+        ExtensionRegistry::new()
+    };
+    negotiate_handshake_with(io, ctx, &registry).await
 }
 
 /// Run the handshake on `io` advertising a caller-supplied registry.
@@ -103,7 +103,9 @@ mod tests {
     use tokio::sync::mpsc;
     use wisp_config::WispServerOptions;
     use wisp_dos::DosGuard;
-    use wisp_wire::{encode_frame, encode_info_frame, Extension, ExtensionEntry};
+    use wisp_wire::{
+        encode_frame, encode_info_frame, Extension, ExtensionEntry, WebTransportProxy,
+    };
 
     struct ChanIo {
         rx: mpsc::UnboundedReceiver<Bytes>,
@@ -162,12 +164,9 @@ mod tests {
 
         let outcome = negotiate_handshake(&mut server_io, &mut ctx).await.unwrap();
         assert!(outcome.negotiated.contains(&Udp::ID));
-        assert!(outcome.negotiated.contains(&WebTransportProxy::ID));
-        assert!(!outcome.negotiated.contains(&StelliteProxyControl::ID));
+        assert!(!outcome.negotiated.contains(&WebTransportProxy::ID));
         assert!(ctx.has::<Udp>());
-        assert!(!ctx.has::<StelliteProxyControl>());
 
-        // Server writes INFO then READY.
         let server_info = client_io.read_frame().await.unwrap();
         let parsed = decode_frame_body(&server_info[4..]).unwrap();
         assert_eq!(parsed.frame_type, frame_type::INFO);
@@ -192,7 +191,6 @@ mod tests {
     async fn custom_registry_suppresses_extension() {
         let (mut server_io, mut client_io) = pair();
         let mut ctx = make_ctx();
-        // Server only advertises UDP — no WT proxy, no stellite control.
         let mut registry = ExtensionRegistry::new();
         registry.register::<Udp>();
 
@@ -215,5 +213,27 @@ mod tests {
             .unwrap();
         assert!(outcome.negotiated.contains(&Udp::ID));
         assert!(!outcome.negotiated.contains(&WebTransportProxy::ID));
+    }
+
+    #[tokio::test]
+    async fn configured_registry_negotiates_wt_proxy() {
+        let (mut server_io, mut client_io) = pair();
+        let mut ctx = make_ctx();
+        let mut registry = ExtensionRegistry::new();
+        registry.register::<WebTransportProxy>();
+
+        let client_info = encode_info_frame(&[ExtensionEntry {
+            id: WebTransportProxy::ID,
+            payload: Bytes::new(),
+        }]);
+        client_io
+            .write_frame(strip_len(&client_info))
+            .await
+            .unwrap();
+        let outcome = negotiate_handshake_with(&mut server_io, &mut ctx, &registry)
+            .await
+            .unwrap();
+        assert!(outcome.negotiated.contains(&WebTransportProxy::ID));
+        assert!(ctx.has::<WebTransportProxy>());
     }
 }
