@@ -6,7 +6,10 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
+use base64::Engine;
+use clap::{Parser, Subcommand};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tokio::signal;
 use tracing::info;
 use wisp_core::{Runtime, RuntimeConfig};
@@ -17,6 +20,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Parser, Debug)]
 #[command(name = "wispd", version, about = "wisp-wt over msquic")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to the wisp-wt TOML config.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -24,11 +30,17 @@ struct Cli {
     /// Tracing log level (overrides RUST_LOG).
     #[arg(long, default_value = "info")]
     log_level: String,
+}
 
-    /// Switch the msquic execution profile to MaxThroughput and disable
-    /// protocol inspection. For Wispmark runs.
-    #[arg(long)]
-    bench_mode: bool,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Parse and validate a configuration without binding listeners.
+    CheckConfig {
+        #[arg(value_name = "PATH")]
+        config: PathBuf,
+    },
+    /// Generate a bearer token and its token-file SHA-256 value.
+    GenerateToken,
 }
 
 fn init_tracing(level: &str) {
@@ -37,11 +49,33 @@ fn init_tracing(level: &str) {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_level);
+    match &cli.command {
+        Some(Command::CheckConfig { config }) => {
+            let cfg = RuntimeConfig::from_toml(config)
+                .with_context(|| format!("failed to load config from {}", config.display()))?;
+            validate_standalone_auth(&cfg)?;
+            let _runtime = Runtime::start(cfg).context("runtime validation")?;
+            println!("configuration is valid");
+            return Ok(());
+        }
+        Some(Command::GenerateToken) => {
+            let mut bytes = [0_u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            println!("token={token}");
+            println!("sha256={}", hex::encode(Sha256::digest(token.as_bytes())));
+            return Ok(());
+        }
+        None => {}
+    }
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all().build()?.block_on(async_main(cli))
+}
 
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let cfg = match &cli.config {
         Some(path) => RuntimeConfig::from_toml(path)
             .with_context(|| format!("failed to load config from {}", path.display()))?,
@@ -51,11 +85,10 @@ async fn main() -> anyhow::Result<()> {
                 .context("default options validate")?
         }
     }
-    .with_bench_mode(cli.bench_mode)
     .with_log_level(&cli.log_level);
+    validate_standalone_auth(&cfg)?;
 
     info!(
-        bench_mode = cfg.bench_mode,
         host = %cfg.options.host,
         port = cfg.options.port,
         endpoint = %cfg.options.base.endpoint,
@@ -64,9 +97,6 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime = Runtime::start(cfg).context("runtime start")?;
 
-    // Launch the WS-over-H2 listener first when configured: it has no
-    // msquic dependency, so it can come up even if WT is disabled (the
-    // Wispmark `wisp-wt-rust-ws` variant exercises this configuration).
     #[cfg(feature = "ws")]
     let ws_handle = runtime.bind_ws().context("bind ws-h2 listener")?;
     #[cfg(feature = "ws")]
@@ -102,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    wait_for_shutdown_signal().await;
+    wait_for_shutdown_signal(&runtime).await?;
     info!("wispd: shutdown signal received, draining");
     #[cfg(feature = "quic")]
     if let Some(h) = wt_handle {
@@ -111,26 +141,42 @@ async fn main() -> anyhow::Result<()> {
     runtime.shutdown().await;
     #[cfg(feature = "ws")]
     if let Some(h) = ws_handle {
-        // Cancellation in `runtime.shutdown()` already poisoned the
-        // listener loop; awaiting just makes drain ordering explicit.
         let _ = h.await;
     }
     info!("wispd: drained, exiting");
     Ok(())
 }
 
+fn validate_standalone_auth(cfg: &RuntimeConfig) -> anyhow::Result<()> {
+    if cfg.options.base.auth.required && cfg.options.base.auth.token_file.is_none() {
+        anyhow::bail!("standalone authentication requires wisp.auth.token_file");
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() {
+async fn wait_for_shutdown_signal(runtime: &Runtime) -> anyhow::Result<()> {
     use signal::unix::{signal as unix_signal, SignalKind};
-    let mut sigint = unix_signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    let mut sigterm = unix_signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    tokio::select! {
-        _ = sigint.recv() => {},
-        _ = sigterm.recv() => {},
+    let mut sigint = unix_signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = unix_signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sighup = unix_signal(SignalKind::hangup()).context("install SIGHUP handler")?;
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => return Ok(()),
+            _ = sigterm.recv() => return Ok(()),
+            _ = sighup.recv() => {
+                match runtime.reload_auth_tokens() {
+                    Ok(true) => info!("wispd: reloaded authentication tokens"),
+                    Ok(false) => info!("wispd: no authentication token file configured"),
+                    Err(error) => tracing::error!(%error, "wispd: token reload rejected; previous tokens remain active"),
+                }
+            }
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-    let _ = signal::ctrl_c().await;
+async fn wait_for_shutdown_signal(_runtime: &Runtime) -> anyhow::Result<()> {
+    signal::ctrl_c().await.context("install Ctrl-C handler")?;
+    Ok(())
 }
