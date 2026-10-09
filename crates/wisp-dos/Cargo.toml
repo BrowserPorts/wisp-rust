@@ -10,3 +10,6 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 wisp-config = { path = "../wisp-config" }
 wisp-iphash = { path = "../wisp-iphash" }
+redis = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

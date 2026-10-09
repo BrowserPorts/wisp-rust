@@ -21,6 +21,9 @@ rand = { workspace = true }
 h3 = { workspace = true }
 h3-webtransport = { workspace = true }
 h3-datagram = { workspace = true }
+web-transport-quinn = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls = { workspace = true }
 msquic = { workspace = true }
 wisp-wire = { path = "../wisp-wire" }
 wisp-config = { path = "../wisp-config" }

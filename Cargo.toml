@@ -52,15 +52,20 @@ dashmap = "6.1"
 crossbeam = "0.8"
 parking_lot = "0.12"
 socket2 = { version = "0.5", features = ["all"] }
-hickory-resolver = "0.24"
+sha1_smol = "1"
+base64 = "0.22"
+hickory-resolver = "0.26.1"
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0"
+redis = { version = "0.32", default-features = false, features = ["script"] }
 
 # QUIC / HTTP/3 / WebTransport
 msquic = "=2.5.1-beta"
 h3 = "0.0.8"
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
+web-transport-quinn = { version = "0.11.12", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8"
 
 # H2 / WS
 hyper = { version = "1.5", features = ["http2", "server"] }
@@ -69,7 +74,7 @@ http-body-util = "0.1"
 tokio-websockets = { version = "0.13", default-features = false, features = ["server", "fastrand", "sha1_smol"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1", features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

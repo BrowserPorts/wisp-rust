@@ -10,6 +10,7 @@ wisp-wisp = { path = "../wisp-wisp" }
 wisp-wisp-server = { path = "../wisp-wisp-server" }
 wisp-config = { path = "../wisp-config" }
 wisp-iphash = { path = "../wisp-iphash" }
+wisp-dos = { path = "../wisp-dos" }
 wisp-quic-msquic = { path = "../wisp-quic-msquic" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
