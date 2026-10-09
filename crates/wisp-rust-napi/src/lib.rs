@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use napi::bindgen_prelude::Function;
+use napi::bindgen_prelude::{Function, Promise};
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
@@ -14,7 +14,7 @@ use wisp_config::{
     WispAuthTokenPolicy, WispServerOptions, WispWtConfigToml, WispWtServerOptions,
     WISP_BASE_LIMIT_PROFILE,
 };
-use wisp_core::{Runtime, RuntimeConfig};
+use wisp_core::{Runtime, RuntimeConfig, ServeHandle};
 use wisp_wisp_server::{
     ProxyControlLimits, ProxyControlRequest, ProxyControllerTemplate, ProxyRouteConfig,
     ProxyRuntimePolicy,
@@ -23,12 +23,14 @@ use wisp_wisp_server::{
 #[napi(js_name = "WispRust")]
 pub struct WispRust {
     state: Arc<Mutex<WispRustState>>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct WispRustState {
     config: RuntimeConfig,
     runtime: Option<Runtime>,
     ws_handle: Option<JoinHandle<()>>,
+    wt_handle: Option<ServeHandle>,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
     pending_routes: HashMap<String, ProxyRouteConfig>,
     configured_auth_tokens: HashMap<String, WispAuthTokenPolicy>,
@@ -38,7 +40,7 @@ struct WispRustState {
     pending_blocked_ips: HashSet<String>,
 }
 
-type AuthHandler = Arc<ThreadsafeFunction<String, Value, String, Status, false>>;
+type AuthHandler = Arc<ThreadsafeFunction<String, Promise<Value>, String, Status, false>>;
 
 struct NapiAuthResolver {
     tokens: HashMap<String, WispAuthTokenPolicy>,
@@ -54,9 +56,13 @@ impl WispAuthResolver for NapiAuthResolver {
                 return static_policy;
             }
             let handler = handler?;
-            let val = handler.call_async_catch(token).await.ok()?;
+            let promise = handler.call_async_catch(token).await.ok()?;
+            let val = promise.await.ok()?;
             if val.is_null() || val == Value::Bool(false) {
                 return None;
+            }
+            if val == Value::Bool(true) {
+                return Some(WispAuthTokenPolicy::default());
             }
             serde_json::from_value(val).ok()
         })
@@ -69,6 +75,7 @@ impl WispRustState {
             config,
             runtime: None,
             ws_handle: None,
+            wt_handle: None,
             proxy_template: None,
             pending_routes: HashMap::new(),
             configured_auth_tokens: HashMap::new(),
@@ -87,6 +94,7 @@ impl WispRust {
         let config = RuntimeConfig::from_options(WispWtServerOptions::default()).map_err(js_err)?;
         Ok(Self {
             state: Arc::new(Mutex::new(WispRustState::new(config))),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -95,6 +103,7 @@ impl WispRust {
         let config = RuntimeConfig::from_toml(Path::new(&path)).map_err(js_err)?;
         Ok(Self {
             state: Arc::new(Mutex::new(WispRustState::new(config))),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -106,6 +115,7 @@ impl WispRust {
         let config = RuntimeConfig::from_options(options).map_err(js_err)?;
         Ok(Self {
             state: Arc::new(Mutex::new(WispRustState::new(config))),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -114,47 +124,71 @@ impl WispRust {
         let config = runtime_config_from_value(config)?;
         Ok(Self {
             state: Arc::new(Mutex::new(WispRustState::new(config))),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     #[napi]
     pub async fn start(&self) -> Result<Value> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let (runtime, template, ws_handle, wt_enabled) = {
+            let guard = self.state.lock();
+            if guard.runtime.is_some() {
+                return Ok(status_value(&guard));
+            }
+            let runtime = Runtime::start(guard.config.clone()).map_err(js_err)?;
+            let template = runtime.proxy_template();
+            apply_configured_auth(&runtime, &guard)?;
+            if let Some(template) = template.as_ref() {
+                apply_pending(template, &guard)?;
+            }
+            let ws_handle = runtime.bind_ws().map_err(js_err)?;
+            let wt_enabled = guard.config.options.enabled;
+            (runtime, template, ws_handle, wt_enabled)
+        };
+        let wt_handle = if wt_enabled {
+            match runtime.bind().await {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    runtime.shutdown().await;
+                    if let Some(handle) = ws_handle {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                    return Err(js_err(error));
+                }
+            }
+        } else {
+            None
+        };
         let mut guard = self.state.lock();
-        if guard.runtime.is_some() {
-            return Ok(status_value(&guard));
-        }
-
-        let runtime = Runtime::start(guard.config.clone()).map_err(js_err)?;
-        let template = runtime.proxy_template();
-        apply_configured_auth(&runtime, &guard)?;
-        if let Some(template) = template.as_ref() {
-            apply_pending(template, &guard)?;
-        }
-        let ws_handle = runtime.bind_ws().map_err(js_err)?;
-
         guard.proxy_template = template;
         guard.ws_handle = ws_handle;
+        guard.wt_handle = wt_handle;
         guard.runtime = Some(runtime);
         Ok(status_value(&guard))
     }
 
     #[napi]
     pub async fn stop(&self) -> Result<Value> {
-        let (runtime, ws_handle) = {
+        let _lifecycle = self.lifecycle.lock().await;
+        let (runtime, ws_handle, wt_handle) = {
             let mut guard = self.state.lock();
             let runtime = guard.runtime.take();
             let ws_handle = guard.ws_handle.take();
+            let wt_handle = guard.wt_handle.take();
             guard.proxy_template = None;
-            (runtime, ws_handle)
+            (runtime, ws_handle, wt_handle)
         };
 
         if let Some(runtime) = runtime {
-            runtime.cancel_token().cancel();
+            runtime.shutdown().await;
         }
         if let Some(handle) = ws_handle {
             handle.abort();
             let _ = handle.await;
         }
+        drop(wt_handle);
 
         let guard = self.state.lock();
         Ok(status_value(&guard))
@@ -383,7 +417,10 @@ impl WispRust {
     #[napi]
     pub fn set_limit_profile(&self, name: String, limits: Value) -> Result<Value> {
         if !profile_name_is_valid(&name) {
-            return Err(Error::new(Status::InvalidArg, "limit profile name is invalid"));
+            return Err(Error::new(
+                Status::InvalidArg,
+                "limit profile name is invalid",
+            ));
         }
         let mut guard = self.state.lock();
         let base = guard
@@ -522,11 +559,16 @@ impl WispRust {
     #[napi]
     pub fn set_auth_token_handler(
         &self,
-        handler: Option<Function<'_, String, Value>>,
+        handler: Option<Function<'_, String, Promise<Value>>>,
     ) -> Result<Value> {
         let configured = handler.is_some();
         let auth_handler = handler
-            .map(|handler| handler.build_threadsafe_function::<String>().build().map(Arc::new))
+            .map(|handler| {
+                handler
+                    .build_threadsafe_function::<String>()
+                    .build()
+                    .map(Arc::new)
+            })
             .transpose()?;
         {
             let mut guard = self.state.lock();
@@ -587,9 +629,6 @@ fn runtime_config_from_value(value: Value) -> Result<RuntimeConfig> {
 }
 
 fn apply_config_flags(mut config: RuntimeConfig, obj: &Map<String, Value>) -> RuntimeConfig {
-    if let Some(bench_mode) = bool_field(obj, "benchMode") {
-        config = config.with_bench_mode(bench_mode);
-    }
     if let Some(log_level) = string_field(obj, "logLevel") {
         config = config.with_log_level(log_level);
     }
@@ -683,6 +722,7 @@ fn profile_name_is_valid(name: &str) -> bool {
 fn status_value(state: &WispRustState) -> Value {
     json!({
         "started": state.runtime.is_some(),
+        "webtransportEnabled": state.config.options.enabled,
         "websocketEnabled": state.config.options.websocket.enabled,
         "proxyControlEnabled": state.config.options.proxy_control_enabled,
         "providersConfigured": state.proxy_template.as_ref().map(|t| t.providers().len()).unwrap_or(0),
@@ -696,10 +736,26 @@ fn status_value(state: &WispRustState) -> Value {
 
 fn bound_urls(config: &RuntimeConfig) -> Vec<String> {
     let opts = &config.options;
-    if !opts.websocket.enabled {
-        return Vec::new();
+    let mut urls = Vec::new();
+    if opts.enabled {
+        urls.push(format!(
+            "https://{}:{}{}",
+            public_host(&opts.host),
+            opts.port,
+            opts.base.endpoint
+        ));
     }
-    let scheme = if opts.websocket.plain { "ws" } else { "wss" };
+    if !opts.websocket.enabled {
+        return urls;
+    }
+    let scheme = if matches!(
+        opts.websocket.ingress_mode,
+        wisp_config::IngressMode::TrustedEdge | wisp_config::IngressMode::DirectPlain
+    ) {
+        "ws"
+    } else {
+        "wss"
+    };
     let endpoint = opts
         .websocket
         .endpoint
@@ -710,20 +766,22 @@ fn bound_urls(config: &RuntimeConfig) -> Vec<String> {
     if let Some(bind_addr) = opts.websocket.bind_addr.as_deref() {
         if let Some((parsed_host, parsed_port)) = split_bind_addr(bind_addr) {
             host = parsed_host;
-            return vec![format!(
+            urls.push(format!(
                 "{scheme}://{}:{}{}",
                 public_host(&host),
                 parsed_port,
                 endpoint
-            )];
+            ));
+            return urls;
         }
     }
-    vec![format!(
+    urls.push(format!(
         "{scheme}://{}:{}{}",
         public_host(&host),
         port,
         endpoint
-    )]
+    ));
+    urls
 }
 
 fn split_bind_addr(bind_addr: &str) -> Option<(String, u16)> {
@@ -748,10 +806,6 @@ fn string_field(obj: &Map<String, Value>, key: &str) -> Option<String> {
     obj.get(key)
         .and_then(Value::as_str)
         .map(|value| value.to_owned())
-}
-
-fn bool_field(obj: &Map<String, Value>, key: &str) -> Option<bool> {
-    obj.get(key).and_then(Value::as_bool)
 }
 
 fn js_err(error: impl std::fmt::Display) -> Error {

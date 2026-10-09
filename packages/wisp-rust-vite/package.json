@@ -20,7 +20,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "smol-toml": "^1.6.1",
+    "smol-toml": "^1.8.0",
     "wisp-rust-napi": "file:../../crates/wisp-rust-napi"
   },
   "peerDependencies": {
@@ -28,10 +28,13 @@
   },
   "devDependencies": {
     "@rslib/core": "^0.23.2",
-    "@types/node": "^24.0.0",
+    "@types/node": "^24.13.3",
     "bun-types": "^1.4.0",
     "typescript": "^5.9.3",
-    "vite": "^8.0.0"
+    "vite": "^8.2.2"
+  },
+  "overrides": {
+    "js-yaml": "^4.3.0"
   },
   "engines": {
     "node": ">=20"

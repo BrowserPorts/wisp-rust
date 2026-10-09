@@ -30,6 +30,6 @@ export declare class WispRust {
   registerAuthToken(token: string, policy: any): any
   revokeAuthToken(token: string): any
   listAuthTokens(): any
-  setAuthTokenHandler(handler?: ((arg: string) => any) | undefined | null): any
+  setAuthTokenHandler(handler?: ((arg: string) => Promise<any>) | undefined | null): any
   authTokenPolicy(token: string): any
 }

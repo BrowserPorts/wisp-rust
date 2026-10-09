@@ -1,7 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { createServer } from "node:net";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { connect as connectTcp, createServer } from "node:net";
 import { resolve } from "node:path";
+import type { Duplex } from "node:stream";
+import { connect as connectTls } from "node:tls";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { TomlTable, TomlValue } from "smol-toml";
 import type { Plugin, ProxyOptions, UserConfig } from "vite";
@@ -12,7 +15,6 @@ export type WispRuntimeInput =
       toml?: string;
       source?: string;
       config?: Record<string, unknown>;
-      benchMode?: boolean;
       logLevel?: string;
     }
   | Record<string, unknown>;
@@ -35,6 +37,11 @@ export type ProxyRuntimePolicy = {
   defaultIpType?: string;
 };
 
+export type WispHostPortRule = {
+  host: string;
+  port: number;
+};
+
 export type WispAuthTokenPolicy = {
   limitProfile?: string;
   allowedProxyProviders?: string[];
@@ -46,8 +53,8 @@ export type WispAuthTokenPolicy = {
   ipWhitelist?: string[];
   portBlacklist?: number[];
   portWhitelist?: number[];
+  hostPortWhitelist?: WispHostPortRule[];
   allowDirectIp?: boolean;
-  allowDirectIpWithDomainPolicy?: boolean;
   allowPrivateIps?: boolean;
   allowLoopbackIps?: boolean;
 };
@@ -59,7 +66,7 @@ export type WispAuthTokenHandlerResult =
   | undefined;
 
 export type WispAuthTokenHandler = (
-  token: string
+  token: string,
 ) => WispAuthTokenHandlerResult | Promise<WispAuthTokenHandlerResult>;
 
 export type WispRust = {
@@ -112,7 +119,6 @@ export type WispRustRuntimeOptions = {
   authTokenHandler?: WispAuthTokenHandler;
   authenticatedAllowedProxyProviders?: string[];
   config?: WispRuntimeInput;
-  benchMode?: boolean;
   logLevel?: string;
   cwd?: string;
   native?: WispRustNativeModule;
@@ -125,7 +131,10 @@ export type WispRustViteOptions = WispRustRuntimeOptions & {
   autoStart?: boolean;
   startInPreview?: boolean;
   stopOnClose?: boolean;
-  configureProxy?: (proxy: ProxyOptions, context: WispRustProxyContext) => ProxyOptions;
+  configureProxy?: (
+    proxy: ProxyOptions,
+    context: WispRustProxyContext,
+  ) => ProxyOptions;
 };
 
 export type WispRustProxyContext = {
@@ -140,6 +149,40 @@ type RuntimeResult = Record<string, unknown>;
 type ClosableServer = {
   once(event: "close", listener: () => unknown): unknown;
 };
+type UpgradeServer = ClosableServer & {
+  prependListener(
+    event: "upgrade",
+    listener: (
+      request: IncomingMessage,
+      socket: Duplex,
+      head: Buffer,
+    ) => unknown,
+  ): unknown;
+};
+type BunProxySocket = {
+  send(data: string | Buffer): number;
+  close(code?: number, reason?: string): unknown;
+};
+type BunAdapterProxySocketData = {
+  open(socket: BunProxySocket): unknown;
+  message(socket: BunProxySocket, message: string | Buffer): unknown;
+  close(socket: BunProxySocket, code: number, reason: string): unknown;
+};
+type BunUpgradeApi = {
+  upgrade(
+    request: Request,
+    options: { data: BunAdapterProxySocketData },
+  ): boolean;
+};
+type BunMiddlewareStack = {
+  use(
+    handler: (
+      request: IncomingMessage,
+      response: ServerResponse,
+      next: () => unknown,
+    ) => unknown,
+  ): unknown;
+};
 type TomlRecord = Record<string, TomlValue>;
 type ProviderSection = TomlRecord | undefined;
 
@@ -148,6 +191,29 @@ const DEFAULT_MULLVAD_API = "https://api.mullvad.net/www/relays/wireguard/";
 const DEFAULT_MYSTERIUM_API = "https://api.mysteriumvpn.com";
 const DEFAULT_AUTHENTICATED_PROFILE = "authenticated";
 const DEFAULT_AUTHENTICATED_PROVIDERS = ["mullvad", "resi", "mysterium"];
+const MAX_BUN_PENDING_BYTES = 1024 * 1024;
+const BUN_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+export const DEFAULT_WISP_RUST_VITE_TOML = `
+[wisp.server]
+endpoint = "/wisp/"
+wisp_version = "auto"
+
+[wisp.auth]
+required = false
+
+[wisp.destination]
+port_whitelist = [80, 443]
+allow_direct_ip = true
+allow_private_ips = false
+allow_loopback_ips = false
+
+[wisp_websocket]
+enabled = true
+host = "127.0.0.1"
+port = 4142
+endpoint = "/wisp/"
+ingress_mode = "direct_plain"
+`;
 const MULTIPLIED_LIMIT_FIELDS = new Set([
   "streamLimitPerHost",
   "streamLimitTotal",
@@ -157,6 +223,8 @@ const MULTIPLIED_LIMIT_FIELDS = new Set([
   "maxBinaryFrameBytes",
   "maxTextFrameBytes",
   "maxPendingPacketsPerStream",
+  "maxPendingBytesPerStream",
+  "maxEgressQueueBytes",
   "maxSessionHops",
   "maxDailyHopsPerIp",
   "maxConnectionStartsPerIpPerMinute",
@@ -180,11 +248,8 @@ const MULTIPLIED_LIMIT_FIELDS = new Set([
   "proxyControlUpstreamBurst",
   "proxyControlMutationOpsPerSecond",
   "proxyControlMutationBurst",
-  "protocolInspectionMaxBytes"
+  "protocolInspectionMaxBytes",
 ]);
-
-const MAX_BUN_PENDING_BYTES = 1024 * 1024;
-const BUN_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 
 export class WispRustRuntime {
   readonly native: WispRustNativeModule;
@@ -201,7 +266,11 @@ export class WispRustRuntime {
 
   async start(): Promise<RuntimeStatus> {
     if (!this.startPromise) {
-      this.startPromise = this.instance.start();
+      const pending = this.instance.start();
+      this.startPromise = pending.catch((error) => {
+        this.startPromise = undefined;
+        throw error;
+      });
     }
     return this.startPromise;
   }
@@ -236,16 +305,19 @@ export class WispRustRuntime {
     const boundUrl = this.primaryBoundUrl();
     const endpointPath = normalizeMountPath(boundUrl.pathname);
     const mountPath = normalizeMountPath(proxyPath ?? endpointPath);
-    const target = `${boundUrl.protocol}//${boundUrl.host}`;
+    const targetProtocol = boundUrl.protocol === "wss:" ? "https:" : "http:";
+    const target = `${targetProtocol}//${boundUrl.host}`;
     return {
       boundUrl,
       proxyPath: mountPath,
       endpointPath,
-      target
+      target,
     };
   }
 
-  viteProxyOptions(options: Pick<WispRustViteOptions, "proxyPath" | "configureProxy"> = {}): {
+  viteProxyOptions(
+    options: Pick<WispRustViteOptions, "proxyPath" | "configureProxy"> = {},
+  ): {
     path: string;
     options: ProxyOptions;
   } {
@@ -258,11 +330,12 @@ export class WispRustRuntime {
       rewrite:
         context.proxyPath === context.endpointPath
           ? undefined
-          : (path) => rewriteMountPath(path, context.proxyPath, context.endpointPath)
+          : (path) =>
+              rewriteMountPath(path, context.proxyPath, context.endpointPath),
     };
     return {
       path: proxyMatchPath(context.proxyPath),
-      options: options.configureProxy?.(proxy, context) ?? proxy
+      options: options.configureProxy?.(proxy, context) ?? proxy,
     };
   }
 
@@ -340,7 +413,9 @@ export class WispRustRuntime {
 
   setAuthTokenHandler(handler?: WispAuthTokenHandler): RuntimeResult {
     return this.instance.setAuthTokenHandler(
-      handler ? async (token) => normalizeAuthHandlerResult(await handler(token)) : undefined
+      handler
+        ? async (token) => normalizeAuthHandlerResult(await handler(token))
+        : undefined,
     );
   }
 
@@ -361,7 +436,9 @@ export class WispRustRuntime {
   }
 }
 
-export function createWispRustRuntime(options: WispRustRuntimeOptions = {}): WispRustRuntime {
+export function createWispRustRuntime(
+  options: WispRustRuntimeOptions = {},
+): WispRustRuntime {
   return new WispRustRuntime(options);
 }
 
@@ -627,6 +704,7 @@ function normalizeWebSocketCloseCode(code: number): number {
 }
 
 export function wispRustVite(options: WispRustViteOptions = {}): Plugin {
+  const runtimeOptions = defaultViteRuntimeOptions(options);
   let runtime: WispRustRuntime | undefined;
   let closeRegistered = false;
   let proxyConfig: { path: string; options: ProxyOptions } | undefined;
@@ -635,36 +713,64 @@ export function wispRustVite(options: WispRustViteOptions = {}): Plugin {
   const getRuntime = (root: string): WispRustRuntime => {
     if (!runtime) {
       runtime = createWispRustRuntime({
-        ...options,
-        cwd: options.cwd ?? root,
-        resolvedWsPort
+        ...runtimeOptions,
+        cwd: runtimeOptions.cwd ?? root,
+        resolvedWsPort,
       });
     }
     return runtime;
   };
 
-  const getProxyConfig = (root: string): { path: string; options: ProxyOptions } => {
+  const getProxyConfig = (
+    root: string,
+  ): { path: string; options: ProxyOptions } => {
     if (!proxyConfig) {
-      proxyConfig = getRuntime(root).viteProxyOptions(options);
+      proxyConfig = getRuntime(root).viteProxyOptions(runtimeOptions);
     }
     return proxyConfig;
   };
 
   const setupServer = async (
     httpServer: ClosableServer | null | undefined,
-    root: string
+    root: string,
   ) => {
     const activeRuntime = getRuntime(root);
-    const shouldStart = options.autoStart ?? true;
+    const shouldStart = runtimeOptions.autoStart ?? true;
     if (shouldStart) {
       await activeRuntime.start();
     }
-    if ((options.stopOnClose ?? true) && httpServer && !closeRegistered) {
+    if (
+      (runtimeOptions.stopOnClose ?? true) &&
+      httpServer &&
+      !closeRegistered
+    ) {
       closeRegistered = true;
       httpServer.once("close", () => {
         return activeRuntime.stop().catch(() => undefined);
       });
     }
+  };
+
+  const setupBunProxy = (
+    httpServer: UpgradeServer | null | undefined,
+    root: string,
+  ) => {
+    if (!process.versions.bun || !httpServer) return;
+    const context = getRuntime(root).proxyContext(runtimeOptions.proxyPath);
+    httpServer.prependListener("upgrade", (request, socket, head) => {
+      proxyBunWebSocketUpgrade(request, socket, head, context);
+    });
+  };
+
+  const setupBunMiddlewareProxy = (
+    middlewares: BunMiddlewareStack,
+    root: string,
+  ) => {
+    if (!process.versions.bun) return;
+    const context = getRuntime(root).proxyContext(runtimeOptions.proxyPath);
+    middlewares.use((request, response, next) => {
+      proxyBunAdapterWebSocketUpgrade(request, response, next, context);
+    });
   };
 
   return {
@@ -673,34 +779,266 @@ export function wispRustVite(options: WispRustViteOptions = {}): Plugin {
     async config(config): Promise<UserConfig> {
       const root = resolve(config.root ?? process.cwd());
       resolvedWsPort =
-        options.resolvedWsPort ??
+        runtimeOptions.resolvedWsPort ??
         (await resolveFreeWsPort({
-          ...options,
-          cwd: options.cwd ?? root
+          ...runtimeOptions,
+          cwd: runtimeOptions.cwd ?? root,
         }));
       const proxy = getProxyConfig(root);
+      if (process.versions.bun) return {};
       return {
         server: {
           proxy: {
-            [proxy.path]: proxy.options
-          }
+            [proxy.path]: proxy.options,
+          },
         },
         preview: {
           proxy: {
-            [proxy.path]: proxy.options
-          }
-        }
+            [proxy.path]: proxy.options,
+          },
+        },
       };
     },
     async configureServer(server) {
       await setupServer(server.httpServer, server.config.root);
+      setupBunMiddlewareProxy(server.middlewares, server.config.root);
+      setupBunProxy(server.httpServer, server.config.root);
     },
     async configurePreviewServer(server) {
-      if (options.startInPreview ?? true) {
+      if (runtimeOptions.startInPreview ?? true) {
         await setupServer(server.httpServer, server.config.root);
+        setupBunProxy(server.httpServer, server.config.root);
       }
-    }
+    },
   };
+}
+
+function proxyBunAdapterWebSocketUpgrade(
+  request: IncomingMessage,
+  response: ServerResponse,
+  next: () => unknown,
+  context: WispRustProxyContext,
+) {
+  const requestUrl = request.url ?? "/";
+  const pathname = new URL(requestUrl, "http://wisp.invalid").pathname;
+  if (
+    request.headers.upgrade?.toLowerCase() !== "websocket" ||
+    !pathMatchesMount(pathname, context.proxyPath)
+  ) {
+    next();
+    return;
+  }
+
+  const bunRequestSymbol = Symbol.for("::adapter-bun::request::");
+  const bunResponseSymbol = Symbol.for("::adapter-bun::response::");
+  const bunServerSymbol = Symbol.for("@eslym/sveltekit-adapter-bun/server");
+  const originalRequest = (request as unknown as Record<symbol, unknown>)[
+    bunRequestSymbol
+  ];
+  const finishResponse = (response as unknown as Record<symbol, unknown>)[
+    bunResponseSymbol
+  ];
+  const bunServer = (globalThis as Record<symbol, unknown>)[bunServerSymbol];
+  if (
+    !(originalRequest instanceof Request) ||
+    typeof finishResponse !== "function" ||
+    !isBunUpgradeApi(bunServer)
+  ) {
+    next();
+    return;
+  }
+
+  const target = wispWebSocketUrl(new URL(originalRequest.url), context);
+  const protocols = (originalRequest.headers.get("sec-websocket-protocol") ?? "")
+    .split(",")
+    .map((protocol) => protocol.trim())
+    .filter(Boolean);
+  const upgraded = bunServer.upgrade(originalRequest, {
+    data: createBunProxySocketData(
+      target,
+      originalRequest.headers.get("origin"),
+      protocols,
+    ),
+  });
+  if (!upgraded) {
+    next();
+    return;
+  }
+  finishResponse(undefined);
+}
+
+function isBunUpgradeApi(value: unknown): value is BunUpgradeApi {
+  return Boolean(value && typeof value === "object" && "upgrade" in value);
+}
+
+function createBunProxySocketData(
+  target: string,
+  origin: string | null,
+  protocols: string[],
+): BunAdapterProxySocketData {
+  let downstream: BunProxySocket | undefined;
+  let upstream: WebSocket | undefined;
+  let closed = false;
+  const pending: Array<string | Buffer> = [];
+  let pendingBytes = 0;
+  let connectTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const closeDownstream = (code: number, reason: string) => {
+    if (closed) return;
+    closed = true;
+    downstream?.close(normalizeWebSocketCloseCode(code), reason);
+  };
+
+  return {
+    open(socket) {
+      downstream = socket;
+      const headers = origin ? { Origin: origin } : undefined;
+      upstream = new WebSocket(target, {
+        headers,
+        protocols,
+      });
+      upstream.binaryType = "arraybuffer";
+      connectTimer = setTimeout(() => {
+        pending.length = 0;
+        pendingBytes = 0;
+        closeDownstream(1013, "Wisp upstream connection timed out");
+        upstream?.close();
+      }, BUN_UPSTREAM_CONNECT_TIMEOUT_MS);
+      upstream.addEventListener("open", () => {
+        clearTimeout(connectTimer);
+        connectTimer = undefined;
+        for (const message of pending.splice(0)) upstream?.send(message);
+        pendingBytes = 0;
+      });
+      upstream.addEventListener("message", (event) => {
+        downstream?.send(
+          typeof event.data === "string"
+            ? event.data
+            : Buffer.from(event.data as ArrayBuffer),
+        );
+      });
+      upstream.addEventListener("error", () => {
+        clearTimeout(connectTimer);
+        connectTimer = undefined;
+        closeDownstream(1011, "Wisp upstream connection failed");
+      });
+      upstream.addEventListener("close", (event) => {
+        clearTimeout(connectTimer);
+        connectTimer = undefined;
+        closeDownstream(event.code, event.reason);
+      });
+    },
+    message(_socket, message) {
+      if (upstream?.readyState === WebSocket.OPEN) {
+        upstream.send(message);
+        return;
+      }
+      const messageBytes = bunProxyMessageBytes(message);
+      if (pendingBytes + messageBytes > MAX_BUN_PENDING_BYTES) {
+        pending.length = 0;
+        pendingBytes = 0;
+        closeDownstream(1009, "Wisp upstream queue limit exceeded");
+        upstream?.close();
+        return;
+      }
+      pending.push(message);
+      pendingBytes += messageBytes;
+    },
+    close(_socket, code, reason) {
+      if (closed) return;
+      closed = true;
+      clearTimeout(connectTimer);
+      connectTimer = undefined;
+      pending.length = 0;
+      pendingBytes = 0;
+      if (upstream && upstream.readyState < WebSocket.CLOSING) {
+        upstream.close(normalizeWebSocketCloseCode(code), reason);
+      }
+    },
+  };
+}
+
+function defaultViteRuntimeOptions(
+  options: WispRustViteOptions,
+): WispRustViteOptions {
+  if (options.tomlPath || options.toml || options.config) {
+    return options;
+  }
+  return {
+    ...options,
+    toml: DEFAULT_WISP_RUST_VITE_TOML,
+    source: "wisp-rust-vite:default",
+  };
+}
+
+function proxyBunWebSocketUpgrade(
+  request: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  context: WispRustProxyContext,
+) {
+  const requestUrl = request.url ?? "/";
+  const pathname = new URL(requestUrl, "http://wisp.invalid").pathname;
+  const proxyPath = normalizeMountPath(context.proxyPath);
+  if (
+    request.headers.upgrade?.toLowerCase() !== "websocket" ||
+    !pathMatchesMount(pathname, proxyPath)
+  ) {
+    return;
+  }
+  const upstreamUrl = context.boundUrl;
+  const upstreamPort = Number.parseInt(
+    upstreamUrl.port || (upstreamUrl.protocol === "wss:" ? "443" : "80"),
+    10,
+  );
+  const rewrittenUrl = rewriteMountPath(
+    requestUrl,
+    context.proxyPath,
+    context.endpointPath,
+  );
+  socket.pause();
+
+  const onConnected = function (this: Duplex) {
+    const requestLine = `${request.method ?? "GET"} ${rewrittenUrl} HTTP/${request.httpVersion}`;
+    const headers: string[] = [requestLine, `Host: ${upstreamUrl.host}`];
+    for (let index = 0; index < request.rawHeaders.length; index += 2) {
+      const name = request.rawHeaders[index];
+      const value = request.rawHeaders[index + 1];
+      if (!name || value === undefined || name.toLowerCase() === "host")
+        continue;
+      headers.push(`${name}: ${value}`);
+    }
+    this.write(`${headers.join("\r\n")}\r\n\r\n`);
+    if (head.length > 0) this.write(head);
+    socket.pipe(this).pipe(socket);
+    socket.resume();
+  };
+
+  const upstream =
+    upstreamUrl.protocol === "wss:"
+      ? connectTls({
+          host: upstreamUrl.hostname,
+          port: upstreamPort,
+          servername: upstreamUrl.hostname,
+        })
+      : connectTcp({ host: upstreamUrl.hostname, port: upstreamPort });
+  let connectTimedOut = false;
+  const connectTimer = setTimeout(() => {
+    connectTimedOut = true;
+    upstream.destroy();
+    socket.end("HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n");
+  }, BUN_UPSTREAM_CONNECT_TIMEOUT_MS);
+  upstream.once("connect", onConnected);
+  upstream.once("error", () => {
+    clearTimeout(connectTimer);
+    if (!connectTimedOut) {
+      socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    }
+  });
+  upstream.once("connect", () => clearTimeout(connectTimer));
+  socket.once("error", () => upstream.destroy());
+  socket.once("close", () => upstream.destroy());
+  upstream.once("close", () => socket.end());
 }
 
 export const wispRustPlugin = wispRustVite;
@@ -712,7 +1050,7 @@ function loadNative(): WispRustNativeModule {
     explicitPath,
     workspaceRoot
       ? resolve(workspaceRoot, "wisp-rust/crates/wisp-rust-napi/index.js")
-      : undefined
+      : undefined,
   ].filter((path): path is string => Boolean(path));
   for (const candidate of candidates) {
     const path =
@@ -738,44 +1076,56 @@ function isPortFree(port: number, host: string): Promise<boolean> {
   });
 }
 
-async function findFreePort(host: string, startPort: number, maxAttempts = 100): Promise<number> {
+async function findFreePort(
+  host: string,
+  startPort: number,
+  maxAttempts = 100,
+): Promise<number> {
   let candidate = startPort;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (await isPortFree(candidate, host)) return candidate;
     candidate += 1;
   }
-  return startPort;
+  throw new Error(
+    `No free port found on ${host} after ${maxAttempts} attempts from ${startPort}`,
+  );
 }
 
-async function resolveFreeWsPort(options: WispRustRuntimeOptions): Promise<number | undefined> {
-  try {
-    const ws = recordField(buildRuntimeTomlTable(options), "wisp_websocket");
-    if (!ws || ws.enabled === false) return undefined;
-    const host = typeof ws.host === "string" ? ws.host : "127.0.0.1";
-    const basePort = typeof ws.port === "number" ? ws.port : 4142;
-    return await findFreePort(host, basePort);
-  } catch {
-    return undefined;
-  }
+async function resolveFreeWsPort(
+  options: WispRustRuntimeOptions,
+): Promise<number | undefined> {
+  const ws = recordField(buildRuntimeTomlTable(options), "wisp_websocket");
+  if (!ws || ws.enabled === false) return undefined;
+  const host = typeof ws.host === "string" ? ws.host : "127.0.0.1";
+  const basePort = typeof ws.port === "number" ? ws.port : 4142;
+  return findFreePort(host, basePort);
 }
 
-function createNativeRuntime(native: WispRustNativeModule, options: WispRustRuntimeOptions): WispRust {
+function createNativeRuntime(
+  native: WispRustNativeModule,
+  options: WispRustRuntimeOptions,
+): WispRust {
   if (options.proxyConfigPath || options.authenticatedProxyConfigPath || options.trustedBunFront) {
     return native.WispRust.fromToml(
       mergedRuntimeToml(options),
-      options.source ?? options.tomlPath ?? options.proxyConfigPath ?? options.authenticatedProxyConfigPath
+      options.source ??
+        options.tomlPath ??
+        options.proxyConfigPath ??
+        options.authenticatedProxyConfigPath,
     );
   }
   if (options.tomlPath) {
     if (options.resolvedWsPort !== undefined) {
       const table = parseRuntimeToml(
         readFileSync(resolvePath(options.tomlPath, options.cwd), "utf-8"),
-        options.tomlPath
+        options.tomlPath,
       );
       applyWsPortOverride(table, options.resolvedWsPort);
       return native.WispRust.fromToml(stringifyToml(table), options.tomlPath);
     }
-    return native.WispRust.fromTomlPath(resolvePath(options.tomlPath, options.cwd));
+    return native.WispRust.fromTomlPath(
+      resolvePath(options.tomlPath, options.cwd),
+    );
   }
   if (options.toml) {
     if (options.resolvedWsPort !== undefined) {
@@ -788,19 +1138,17 @@ function createNativeRuntime(native: WispRustNativeModule, options: WispRustRunt
   if (options.config) {
     return native.WispRust.fromConfig({
       config: options.config,
-      benchMode: options.benchMode,
-      logLevel: options.logLevel
+      logLevel: options.logLevel,
     });
   }
-  if (options.benchMode !== undefined || options.logLevel !== undefined) {
+  if (options.logLevel !== undefined) {
     return native.WispRust.fromConfig({
       config: {},
-      benchMode: options.benchMode,
-      logLevel: options.logLevel
+      logLevel: options.logLevel,
     });
   }
   return native.WispRust.fromConfig({
-    config: {}
+    config: {},
   });
 }
 
@@ -809,14 +1157,22 @@ function resolvePath(path: string, cwd = process.cwd()): string {
 }
 
 function buildRuntimeTomlTable(options: WispRustRuntimeOptions): TomlTable {
-  const base = parseRuntimeToml(baseRuntimeToml(options), options.source ?? options.tomlPath);
+  const base = parseRuntimeToml(
+    baseRuntimeToml(options),
+    options.source ?? options.tomlPath,
+  );
   if (options.proxyConfigPath) {
-    mergeTomlTables(base, proxyConfigTable(resolvePath(options.proxyConfigPath, options.cwd)));
+    mergeTomlTables(
+      base,
+      proxyConfigTable(resolvePath(options.proxyConfigPath, options.cwd)),
+    );
   }
   if (options.authenticatedProxyConfigPath) {
     mergeTomlTables(
       base,
-      proxyConfigTable(resolvePath(options.authenticatedProxyConfigPath, options.cwd))
+      proxyConfigTable(
+        resolvePath(options.authenticatedProxyConfigPath, options.cwd),
+      ),
     );
   }
   if (options.trustedBunFront) applyTrustedBunFront(base);
@@ -860,16 +1216,20 @@ function baseRuntimeToml(options: WispRustRuntimeOptions): string {
   if (options.toml) {
     return options.toml;
   }
-  if (options.config || options.benchMode !== undefined || options.logLevel !== undefined) {
+  if (options.config || options.logLevel !== undefined) {
     throw new Error("proxyConfigPath requires tomlPath or toml");
   }
   return "";
 }
 
-function configureAuthenticatedProfile(instance: WispRust, options: WispRustRuntimeOptions) {
+function configureAuthenticatedProfile(
+  instance: WispRust,
+  options: WispRustRuntimeOptions,
+) {
   const handler = options.authTokenHandler;
   const multiplier = options.authenticatedLimitMultiplier;
-  const profileName = options.authenticatedProfileName ?? DEFAULT_AUTHENTICATED_PROFILE;
+  const profileName =
+    options.authenticatedProfileName ?? DEFAULT_AUTHENTICATED_PROFILE;
   const hasAuthenticatedProviderPolicy =
     Boolean(options.authenticatedProxyConfigPath) ||
     Boolean(options.authenticatedAllowedProxyProviders);
@@ -878,38 +1238,49 @@ function configureAuthenticatedProfile(instance: WispRust, options: WispRustRunt
       ? Math.max(1, Math.floor(multiplier))
       : 1;
     const baseLimits = instance.getLimits();
-    const authenticatedLimits = multiplyWispLimits(baseLimits, normalizedMultiplier);
+    const authenticatedLimits = multiplyWispLimits(
+      baseLimits,
+      normalizedMultiplier,
+    );
     instance.setLimitProfile(profileName, authenticatedLimits);
   }
   if (handler) {
     instance.setAuthTokenHandler(async (token) => {
       const policy = normalizeAuthHandlerResult(await handler(token));
       if (!policy) return null;
-      if (multiplier === undefined && !hasAuthenticatedProviderPolicy) return policy;
+      if (multiplier === undefined && !hasAuthenticatedProviderPolicy)
+        return policy;
       return {
         ...(multiplier === undefined ? {} : { limitProfile: profileName }),
         allowedProxyProviders:
-          options.authenticatedAllowedProxyProviders ?? DEFAULT_AUTHENTICATED_PROVIDERS,
-        ...policy
+          options.authenticatedAllowedProxyProviders ??
+          DEFAULT_AUTHENTICATED_PROVIDERS,
+        ...policy,
       };
     });
   }
 }
 
 function normalizeAuthHandlerResult(
-  result: WispAuthTokenHandlerResult
+  result: WispAuthTokenHandlerResult,
 ): WispAuthTokenPolicy | null {
   if (result === true) return {};
   if (!result) return null;
   return result;
 }
 
-function multiplyWispLimits(limits: RuntimeResult, multiplier: number): RuntimeResult {
+function multiplyWispLimits(
+  limits: RuntimeResult,
+  multiplier: number,
+): RuntimeResult {
   const out = JSON.parse(JSON.stringify(limits)) as RuntimeResult;
   for (const key of MULTIPLIED_LIMIT_FIELDS) {
     const val = out[key];
     if (typeof val === "number" && Number.isFinite(val) && val > 0) {
-      out[key] = Math.min(Number.MAX_SAFE_INTEGER, Math.floor(val * multiplier));
+      out[key] = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.floor(val * multiplier),
+      );
     }
   }
   return out;
@@ -948,20 +1319,23 @@ function proxyConfigTable(path: string): TomlTable {
   }
   const proxy = recordField(parsed, "proxy");
   const providers = recordField(proxy, "providers");
-  const routing = recordField(proxy, "routing") ?? recordField(parsed, "routing");
-  const mullvad = recordField(providers, "mullvad") ?? recordField(parsed, "mullvad");
+  const routing =
+    recordField(proxy, "routing") ?? recordField(parsed, "routing");
+  const mullvad =
+    recordField(providers, "mullvad") ?? recordField(parsed, "mullvad");
   const resi =
     recordField(providers, "resi") ??
     recordField(providers, "resi-proxy") ??
     recordField(providers, "mysterium") ??
     recordField(parsed, "mysterium");
   const out: TomlTable = {};
-  const forceProxy = boolField(parsed, "force_proxy") || boolField(routing, "force_proxy");
+  const forceProxy =
+    boolField(parsed, "force_proxy") || boolField(routing, "force_proxy");
   if (forceProxy) {
     out.wisp = {
       proxy: {
-        force_proxy: true
-      }
+        force_proxy: true,
+      },
     };
   }
   const mullvadToml = mullvadProviderToml(mullvad);
@@ -972,6 +1346,10 @@ function proxyConfigTable(path: string): TomlTable {
   if (resiToml) {
     out.wisp_proxy_resi = resiToml;
   }
+  if (mullvadToml || resiToml) {
+    out.wisp_proxy_control = { enabled: true };
+    out.wisp_websocket = { proxy_control_enabled: true };
+  }
   return out;
 }
 
@@ -979,7 +1357,7 @@ function mullvadProviderToml(section: ProviderSection): TomlTable | undefined {
   if (!section) return;
   const config: TomlTable = {
     enabled: true,
-    relay_api: stringField(section, "relay_api") ?? DEFAULT_MULLVAD_API
+    relay_api: stringField(section, "relay_api") ?? DEFAULT_MULLVAD_API,
   };
   const wireproxySocks5 = stringField(section, "wireproxy_socks5");
   if (wireproxySocks5) {
@@ -988,33 +1366,55 @@ function mullvadProviderToml(section: ProviderSection): TomlTable | undefined {
   return config;
 }
 
-function residentialProviderToml(section: ProviderSection): TomlTable | undefined {
+function residentialProviderToml(
+  section: ProviderSection,
+): TomlTable | undefined {
   if (!section) return;
   const bearerToken =
     stringField(section, "bearer_token") ??
     envField(section, "bearer_token_env", [
       "ST_RESI_BEARER_TOKEN",
       "MYSTERIUM_BEARER_TOKEN",
-      "ST_MYSTERIUM_BEARER_TOKEN"
+      "ST_MYSTERIUM_BEARER_TOKEN",
     ]);
+  const wireproxySocks5 = stringField(section, "wireproxy_socks5");
+  if (bearerToken && wireproxySocks5) {
+    throw new Error(
+      "Mysterium config cannot combine bearer_token and wireproxy_socks5",
+    );
+  }
+  if (wireproxySocks5) {
+    return {
+      enabled: true,
+      wireproxy_socks5: wireproxySocks5,
+    };
+  }
   if (!bearerToken) return;
   const config: TomlTable = {
     enabled: true,
     bearer_token: bearerToken,
     api_base: stringField(section, "api_base") ?? DEFAULT_MYSTERIUM_API,
     country: stringField(section, "country") ?? "US",
-    ip_type: stringField(section, "ip_type") ?? "residential"
+    ip_type: stringField(section, "ip_type") ?? "residential",
   };
   const cookie =
     stringField(section, "cookie") ??
-    envField(section, "cookie_env", ["ST_RESI_COOKIE", "MYSTERIUM_COOKIE", "ST_MYSTERIUM_COOKIE"]);
+    envField(section, "cookie_env", [
+      "ST_RESI_COOKIE",
+      "MYSTERIUM_COOKIE",
+      "ST_MYSTERIUM_COOKIE",
+    ]);
   if (cookie) {
     config.cookie = cookie;
   }
   return config;
 }
 
-function envField(section: TomlRecord, key: string, fallbacks: string[]): string | undefined {
+function envField(
+  section: TomlRecord,
+  key: string,
+  fallbacks: string[],
+): string | undefined {
   const configuredKey = stringField(section, key);
   if (configuredKey) {
     const val = process.env[configuredKey]?.trim();
@@ -1026,13 +1426,19 @@ function envField(section: TomlRecord, key: string, fallbacks: string[]): string
   }
 }
 
-function recordField(input: TomlRecord | undefined, key: string): TomlRecord | undefined {
+function recordField(
+  input: TomlRecord | undefined,
+  key: string,
+): TomlRecord | undefined {
   if (!input) return;
   const val = input[key];
   return isRecord(val) ? val : undefined;
 }
 
-function stringField(input: TomlRecord | undefined, key: string): string | undefined {
+function stringField(
+  input: TomlRecord | undefined,
+  key: string,
+): string | undefined {
   if (!input) return;
   const val = input[key];
   return typeof val === "string" && val.trim() ? val.trim() : undefined;
