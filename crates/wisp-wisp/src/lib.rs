@@ -4,8 +4,9 @@
 //! integers are little-endian.
 //!
 //! Packet types: CONNECT (0x01), DATA (0x02), CONTINUE (0x03), CLOSE (0x04),
-//! INFO (0x05). Stream types: TCP (0x01), UDP (0x02). Extensions are
-//! `[id:u8][len:u32 LE][payload]` and live inside INFO payloads.
+//! INFO (0x05), and FIN (0xF2) from the TCP Half-Close extension. Stream
+//! types: TCP (0x01), UDP (0x02). Extensions are `[id:u8][len:u32 LE][payload]`
+//! and live inside INFO payloads.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +25,8 @@ pub enum WispError {
     CloseTooShort,
     #[error("wisp INFO payload too short")]
     InfoTooShort,
+    #[error("wisp FIN payload must be empty")]
+    FinPayloadNotEmpty,
     #[error("unknown wisp packet type: {0:#x}")]
     UnknownPacketType(u8),
     #[error("wisp extension too short")]
@@ -57,6 +60,8 @@ pub mod packet_type {
     pub const CONTINUE: u8 = 0x03;
     pub const CLOSE: u8 = 0x04;
     pub const INFO: u8 = 0x05;
+    /// Valid only when [`extension_id::TCP_HALF_CLOSE`] is negotiated.
+    pub const FIN: u8 = 0xf2;
 }
 
 /// Wisp stream type bytes inside a CONNECT payload.
@@ -93,10 +98,13 @@ pub mod close_reason {
 /// transport. STREAM_OPEN_CONFIRMATION lets a client wait for the upstream
 /// connect before treating a stream as open: when negotiated, the server
 /// sends a per-stream CONTINUE as soon as the TCP connect succeeds.
+/// TCP_HALF_CLOSE carries a per-direction FIN in packet type 0xF2 so one side
+/// can finish writing while the other keeps sending.
 pub mod extension_id {
     pub const UDP: u8 = 0x01;
     pub const WISP_PROXY_CONTROL: u8 = 0x03;
     pub const STREAM_OPEN_CONFIRMATION: u8 = 0x05;
+    pub const TCP_HALF_CLOSE: u8 = 0xf2;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,12 +142,18 @@ pub struct InfoPacket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinPacket {
+    pub stream_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WispPacket {
     Connect(ConnectPacket),
     Data(DataPacket),
     Continue(ContinuePacket),
     Close(ClosePacket),
     Info(InfoPacket),
+    Fin(FinPacket),
 }
 
 impl WispPacket {
@@ -150,6 +164,7 @@ impl WispPacket {
             WispPacket::Continue(p) => p.stream_id,
             WispPacket::Close(p) => p.stream_id,
             WispPacket::Info(p) => p.stream_id,
+            WispPacket::Fin(p) => p.stream_id,
         }
     }
 }
@@ -168,6 +183,8 @@ pub fn parse_packet(buf: Bytes) -> Result<WispPacket> {
         packet_type::CONTINUE => parse_continue(stream_id, payload).map(WispPacket::Continue),
         packet_type::CLOSE => parse_close(stream_id, payload).map(WispPacket::Close),
         packet_type::INFO => parse_info(stream_id, payload).map(WispPacket::Info),
+        packet_type::FIN if payload.is_empty() => Ok(WispPacket::Fin(FinPacket { stream_id })),
+        packet_type::FIN => Err(WispError::FinPayloadNotEmpty),
         other => Err(WispError::UnknownPacketType(other)),
     }
 }
@@ -289,6 +306,13 @@ pub fn encode_close(stream_id: u32, reason: u8) -> Bytes {
     buf.put_u8(packet_type::CLOSE);
     buf.put_u32_le(stream_id);
     buf.put_u8(reason);
+    buf.freeze()
+}
+
+pub fn encode_fin(stream_id: u32) -> Bytes {
+    let mut buf = BytesMut::with_capacity(PACKET_HEADER_LEN);
+    buf.put_u8(packet_type::FIN);
+    buf.put_u32_le(stream_id);
     buf.freeze()
 }
 
@@ -425,6 +449,28 @@ mod tests {
                 reason: close_reason::PROXY_ROTATED,
             }),
             parsed,
+        );
+    }
+
+    #[test]
+    fn roundtrip_fin() {
+        let bytes = encode_fin(9);
+        assert_eq!(&bytes[..], &[0xf2, 9, 0, 0, 0]);
+        assert_eq!(
+            parse_packet(bytes).unwrap(),
+            WispPacket::Fin(FinPacket { stream_id: 9 }),
+        );
+    }
+
+    #[test]
+    fn fin_with_payload_rejects() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(packet_type::FIN);
+        buf.put_u32_le(9);
+        buf.put_u8(0);
+        assert_eq!(
+            parse_packet(buf.freeze()).unwrap_err(),
+            WispError::FinPayloadNotEmpty,
         );
     }
 

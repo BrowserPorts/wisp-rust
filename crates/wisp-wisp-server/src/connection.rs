@@ -21,8 +21,9 @@
 //! From there both versions share the same loop:
 //! routes each subsequent packet — CONNECT opens a stream, DATA forwards
 //! payload, CONTINUE updates client-side flow control (no-op server-side
-//! for the simple model), CLOSE tears down a stream, INFO is a protocol
-//! error after the initial handshake. Text-frame payloads on stream 0 are
+//! for the simple model), CLOSE tears down a stream, FIN finishes the
+//! client's side of a TCP stream when [`extension_id::TCP_HALF_CLOSE`] is
+//! negotiated, INFO is a protocol error after the initial handshake. Text-frame payloads on stream 0 are
 //! routed to the proxy-control handler when
 //! [`extension_id::WISP_PROXY_CONTROL`] is negotiated (v2 only).
 //!
@@ -49,9 +50,9 @@ use wisp_dos::{
 };
 use wisp_proxy::HostPolicy;
 use wisp_wisp::{
-    close_reason, encode_close, encode_continue, encode_info, extension_id, packet_type,
-    parse_extensions_capped, parse_packet, stream_type, ExtensionEntry, WispError, WispPacket,
-    DEFAULT_MAX_EXTENSION_ENTRIES,
+    close_reason, encode_close, encode_continue, encode_fin, encode_info, extension_id,
+    packet_type, parse_extensions_capped, parse_packet, stream_type, ExtensionEntry, WispError,
+    WispPacket, DEFAULT_MAX_EXTENSION_ENTRIES,
 };
 
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
@@ -62,8 +63,8 @@ use crate::proxy_control::{
     handle_proxy_control_text, proxy_control_error_frame, ProxyControlLimits, ProxyController,
 };
 use crate::stream::{
-    activate_writer, drop_slot, spawn_tcp_connect, write_upstream, StreamTable, TcpEvent,
-    TcpStreamSlot, WriteOutcome,
+    activate_writer, drop_slot, shutdown_upstream_write, spawn_tcp_connect, write_upstream,
+    StreamTable, TcpEvent, TcpStreamSlot, TcpStreamState, WriteOutcome,
 };
 use crate::udp::{spawn_udp_stream, UdpStreamMsg};
 
@@ -615,14 +616,18 @@ where
                                     drop_slot(slot);
                                 }
                                 caps.release(stream_id);
-                            } else if negotiated.stream_open_confirmation
+                            } else if (negotiated.stream_open_confirmation
                                 && egress_tx
                                     .send(WispMessage::Binary(encode_continue(
                                         stream_id,
                                         ctx.server_options.buffer_size,
                                     )))
                                     .await
-                                    .is_err()
+                                    .is_err())
+                                || (slot.upstream_eof
+                                    && finish_upstream_read(stream_id, &mut streams, &mut caps, &egress_tx)
+                                        .await
+                                        .is_err())
                             {
                                 serve_err = Some(ServerError::ClientClosed);
                                 break;
@@ -638,6 +643,34 @@ where
                         if let Some(slot) = streams.remove(stream_id) {
                             drop_slot(slot);
                             caps.release(stream_id);
+                        }
+                    }
+                    Some(TcpEvent::ReadEof { stream_id }) => {
+                        let Some(slot) = streams.get_mut(stream_id) else {
+                            continue;
+                        };
+                        slot.upstream_eof = true;
+                        // A FIN must not overtake the stream's open confirmation.
+                        if matches!(slot.state, TcpStreamState::Live { .. })
+                            && finish_upstream_read(stream_id, &mut streams, &mut caps, &egress_tx)
+                                .await
+                                .is_err()
+                        {
+                            serve_err = Some(ServerError::ClientClosed);
+                            break;
+                        }
+                    }
+                    Some(TcpEvent::WriteShut { stream_id }) => {
+                        let Some(slot) = streams.get_mut(stream_id) else {
+                            continue;
+                        };
+                        slot.write_shut = true;
+                        if release_finished(stream_id, &mut streams, &mut caps, &egress_tx)
+                            .await
+                            .is_err()
+                        {
+                            serve_err = Some(ServerError::ClientClosed);
+                            break;
                         }
                     }
                     None => {}
@@ -856,9 +889,13 @@ fn resolve_wisp_version(configured: WispVersion, client_advertises_v2: bool) -> 
 /// deployer opted in" so the advertised set never overstates what the
 /// server can actually execute.
 fn build_server_info(opts: &ServerOptions, proxy_control_active: bool) -> Bytes {
-    let mut exts = Vec::with_capacity(3);
+    let mut exts = Vec::with_capacity(4);
     exts.push(ExtensionEntry {
         id: extension_id::STREAM_OPEN_CONFIRMATION,
+        payload: Bytes::new(),
+    });
+    exts.push(ExtensionEntry {
+        id: extension_id::TCP_HALF_CLOSE,
         payload: Bytes::new(),
     });
     if opts.allow_udp_streams {
@@ -888,6 +925,7 @@ pub(crate) struct NegotiatedExtensions {
     pub udp: bool,
     pub proxy_control: bool,
     pub stream_open_confirmation: bool,
+    pub tcp_half_close: bool,
 }
 
 fn intersect_extensions(
@@ -900,6 +938,7 @@ fn intersect_extensions(
         match ext.id {
             extension_id::UDP if opts.allow_udp_streams => neg.udp = true,
             extension_id::STREAM_OPEN_CONFIRMATION => neg.stream_open_confirmation = true,
+            extension_id::TCP_HALF_CLOSE if ext.payload.is_empty() => neg.tcp_half_close = true,
             extension_id::WISP_PROXY_CONTROL
                 if proxy_control_active
                     && proxy_control_payload_compatible(
@@ -1201,7 +1240,12 @@ async fn handle_data(
         ));
     }
     if let Some(slot) = streams.get_mut(stream_id) {
-        match write_upstream(slot, payload, stream_id, ctx, egress, tcp_events) {
+        let outcome = if slot.client_fin {
+            WriteOutcome::DropStream(close_reason::UNKNOWN)
+        } else {
+            write_upstream(slot, payload, stream_id, ctx, egress, tcp_events)
+        };
+        match outcome {
             WriteOutcome::DropStream(reason) => {
                 egress
                     .send(WispMessage::Binary(encode_close(stream_id, reason)))
@@ -1340,6 +1384,7 @@ async fn handle_packet(
                         conn.stream_id,
                         conn.hostname.clone(),
                         conn.port,
+                        negotiated.tcp_half_close,
                         ctx.clone(),
                         egress.clone(),
                         tcp_events.clone(),
@@ -1415,6 +1460,83 @@ async fn handle_packet(
                 "repeat INFO after handshake",
             ));
         }
+        WispPacket::Fin(fin) => {
+            if !negotiated.tcp_half_close {
+                return Err(ServerError::ProtocolViolation(
+                    "FIN without negotiated TCP half-close",
+                ));
+            }
+            if fin.stream_id == 0 {
+                return Err(ServerError::ProtocolViolation(
+                    "stream_id 0 reserved for control channel",
+                ));
+            }
+            if udp_streams.contains_key(&fin.stream_id) {
+                return Err(ServerError::ProtocolViolation("FIN on a UDP stream"));
+            }
+            let Some(slot) = streams.get_mut(fin.stream_id) else {
+                return Ok(());
+            };
+            let outcome = if slot.client_fin {
+                WriteOutcome::DropStream(close_reason::UNKNOWN)
+            } else {
+                slot.client_fin = true;
+                shutdown_upstream_write(slot).await
+            };
+            if let WriteOutcome::DropStream(reason) = outcome {
+                return close_tcp_stream(fin.stream_id, reason, streams, caps, egress).await;
+            }
+            return release_finished(fin.stream_id, streams, caps, egress).await;
+        }
+    }
+    Ok(())
+}
+
+async fn close_tcp_stream(
+    stream_id: u32,
+    reason: u8,
+    streams: &mut StreamTable,
+    caps: &mut StreamCaps,
+    egress: &EgressSender,
+) -> Result<(), ServerError> {
+    egress
+        .send(WispMessage::Binary(encode_close(stream_id, reason)))
+        .await
+        .map_err(|()| ServerError::ClientClosed)?;
+    if let Some(slot) = streams.remove(stream_id) {
+        drop_slot(slot);
+    }
+    caps.release(stream_id);
+    Ok(())
+}
+
+/// Report an upstream EOF as FIN. Every DATA the reader produced is already
+/// queued on the egress ahead of it.
+async fn finish_upstream_read(
+    stream_id: u32,
+    streams: &mut StreamTable,
+    caps: &mut StreamCaps,
+    egress: &EgressSender,
+) -> Result<(), ServerError> {
+    egress
+        .send(WispMessage::Binary(encode_fin(stream_id)))
+        .await
+        .map_err(|()| ServerError::ClientClosed)?;
+    release_finished(stream_id, streams, caps, egress).await
+}
+
+/// Both directions sent FIN: the single CLOSE(0x02) ends the stream.
+async fn release_finished(
+    stream_id: u32,
+    streams: &mut StreamTable,
+    caps: &mut StreamCaps,
+    egress: &EgressSender,
+) -> Result<(), ServerError> {
+    if streams
+        .get_mut(stream_id)
+        .is_some_and(|slot| slot.finished())
+    {
+        return close_tcp_stream(stream_id, close_reason::VOLUNTARY, streams, caps, egress).await;
     }
     Ok(())
 }
@@ -1450,8 +1572,8 @@ mod serve_connection_tests {
     use wisp_dos::{tcp_byte_limits_active, DosGuard, UNLIMITED};
     use wisp_proxy::HostPolicy;
     use wisp_wisp::{
-        encode_connect, encode_data, encode_info, parse_packet, stream_type, ConnectPacket,
-        WispPacket,
+        encode_connect, encode_data, encode_info, parse_extensions, parse_packet, stream_type,
+        ClosePacket, ConnectPacket, FinPacket, WispPacket,
     };
 
     #[tokio::test]
@@ -1817,6 +1939,362 @@ mod serve_connection_tests {
         let _ = timeout(Duration::from_secs(2), handle).await;
         echo.abort();
         block_task.abort();
+    }
+
+    const HALF_CLOSE: &[u8] = &[
+        extension_id::STREAM_OPEN_CONFIRMATION,
+        extension_id::TCP_HALF_CLOSE,
+    ];
+
+    async fn send_packet(
+        in_tx: &mut fmpsc::UnboundedSender<Result<WispMessage, std::io::Error>>,
+        packet: Bytes,
+    ) {
+        in_tx.send(Ok(WispMessage::Binary(packet))).await.unwrap();
+    }
+
+    /// Runs the v2 handshake offering `ids` and returns the server's extensions.
+    async fn v2_handshake(
+        in_tx: &mut fmpsc::UnboundedSender<Result<WispMessage, std::io::Error>>,
+        out_rx: &mut fmpsc::UnboundedReceiver<WispMessage>,
+        ids: &[u8],
+    ) -> Vec<ExtensionEntry> {
+        let server = match next_packet(out_rx).await {
+            WispPacket::Info(info) => parse_extensions(info.extensions).unwrap(),
+            other => panic!("v2 must start with INFO, got {other:?}"),
+        };
+        let offered: Vec<ExtensionEntry> = ids
+            .iter()
+            .map(|&id| ExtensionEntry {
+                id,
+                payload: Bytes::new(),
+            })
+            .collect();
+        send_packet(in_tx, encode_info(2, 0, &offered)).await;
+        match next_packet(out_rx).await {
+            WispPacket::Continue(c) if c.stream_id == 0 => {}
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        server
+    }
+
+    /// Opens a TCP stream to `listener` and waits for its open confirmation.
+    async fn open_tcp(
+        in_tx: &mut fmpsc::UnboundedSender<Result<WispMessage, std::io::Error>>,
+        out_rx: &mut fmpsc::UnboundedReceiver<WispMessage>,
+        listener: &TcpListener,
+        stream_id: u32,
+    ) -> tokio::net::TcpStream {
+        send_packet(
+            in_tx,
+            encode_connect(&ConnectPacket {
+                stream_id,
+                stream_type: stream_type::TCP,
+                port: listener.local_addr().unwrap().port(),
+                hostname: "127.0.0.1".to_owned(),
+            }),
+        )
+        .await;
+        let (upstream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("upstream accept timed out")
+            .unwrap();
+        match next_packet(out_rx).await {
+            WispPacket::Continue(c) if c.stream_id == stream_id => {}
+            other => panic!("expected open confirmation, got {other:?}"),
+        }
+        upstream
+    }
+
+    async fn expect_data(
+        out_rx: &mut fmpsc::UnboundedReceiver<WispMessage>,
+        stream_id: u32,
+        expected: &[u8],
+    ) {
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            match next_packet(out_rx).await {
+                WispPacket::Data(d) if d.stream_id == stream_id => {
+                    got.extend_from_slice(&d.payload)
+                }
+                other => panic!("expected DATA on stream {stream_id}, got {other:?}"),
+            }
+        }
+        assert_eq!(got, expected);
+    }
+
+    async fn expect_quiet(out_rx: &mut fmpsc::UnboundedReceiver<WispMessage>) {
+        if let Ok(Some(msg)) = timeout(Duration::from_millis(200), out_rx.next()).await {
+            panic!("unexpected server message {msg:?}");
+        }
+    }
+
+    /// A connection-level protocol error ends the connection; its CLOSE(0) is
+    /// best effort because teardown cancels the egress writer.
+    async fn expect_protocol_violation(
+        mut out_rx: fmpsc::UnboundedReceiver<WispMessage>,
+        handle: tokio::task::JoinHandle<Result<(), ServerError>>,
+        stream_id: u32,
+    ) {
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("connection must end")
+            .unwrap();
+        assert!(matches!(result, Err(ServerError::ProtocolViolation(_))));
+        while let Some(WispMessage::Binary(b)) = out_rx.next().await {
+            match parse_packet(b).unwrap() {
+                WispPacket::Continue(c) if c.stream_id == stream_id => {}
+                other => assert_eq!(other, close(0, close_reason::CLIENT_ERROR)),
+            }
+        }
+    }
+
+    fn close(stream_id: u32, reason: u8) -> WispPacket {
+        WispPacket::Close(ClosePacket { stream_id, reason })
+    }
+
+    fn fin(stream_id: u32) -> WispPacket {
+        WispPacket::Fin(FinPacket { stream_id })
+    }
+
+    #[test]
+    fn half_close_negotiates_only_with_empty_payload() {
+        let opts = ServerOptions::from_wisp(&WispServerOptions::default(), false);
+        let info = parse_packet(build_server_info(&opts, false)).unwrap();
+        let WispPacket::Info(info) = info else {
+            panic!("server INFO must be INFO");
+        };
+        assert!(parse_extensions(info.extensions)
+            .unwrap()
+            .contains(&ExtensionEntry {
+                id: extension_id::TCP_HALF_CLOSE,
+                payload: Bytes::new(),
+            }));
+
+        let offer = |payload: &'static [u8]| {
+            vec![ExtensionEntry {
+                id: extension_id::TCP_HALF_CLOSE,
+                payload: Bytes::from_static(payload),
+            }]
+        };
+        assert!(intersect_extensions(&opts, false, offer(b"")).tcp_half_close);
+        assert!(!intersect_extensions(&opts, false, offer(b"\0")).tcp_half_close);
+        assert!(!intersect_extensions(&opts, false, Vec::new()).tcp_half_close);
+    }
+
+    #[tokio::test]
+    async fn client_fin_shuts_upstream_write_and_reading_continues() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = test_ctx(
+            loopback_test_options(listener.local_addr().unwrap().port()),
+            true,
+        );
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        let mut upstream = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+
+        send_packet(&mut in_tx, encode_data(1, b"request")).await;
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), upstream.read_to_end(&mut received))
+            .await
+            .expect("upstream never saw the FIN")
+            .unwrap();
+        assert_eq!(received, b"request");
+
+        upstream.write_all(b"response-after-fin").await.unwrap();
+        expect_data(&mut out_rx, 1, b"response-after-fin").await;
+        expect_quiet(&mut out_rx).await;
+
+        upstream.shutdown().await.unwrap();
+        assert_eq!(next_packet(&mut out_rx).await, fin(1));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::VOLUNTARY)
+        );
+        expect_quiet(&mut out_rx).await;
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn upstream_eof_sends_fin_and_client_keeps_writing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = test_ctx(
+            loopback_test_options(listener.local_addr().unwrap().port()),
+            true,
+        );
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        let mut upstream = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+
+        upstream.write_all(b"goodbye").await.unwrap();
+        upstream.shutdown().await.unwrap();
+        expect_data(&mut out_rx, 1, b"goodbye").await;
+        assert_eq!(next_packet(&mut out_rx).await, fin(1));
+        expect_quiet(&mut out_rx).await;
+
+        send_packet(&mut in_tx, encode_data(1, b"written-after-remote-fin")).await;
+        let mut received = [0u8; 24];
+        timeout(Duration::from_secs(2), upstream.read_exact(&mut received))
+            .await
+            .expect("upstream never got the late write")
+            .unwrap();
+        assert_eq!(&received, b"written-after-remote-fin");
+
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        let mut rest = Vec::new();
+        timeout(Duration::from_secs(2), upstream.read_to_end(&mut rest))
+            .await
+            .expect("upstream never saw the FIN")
+            .unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::VOLUNTARY)
+        );
+        expect_quiet(&mut out_rx).await;
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn data_or_fin_after_client_fin_closes_the_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = test_ctx(
+            loopback_test_options(listener.local_addr().unwrap().port()),
+            true,
+        );
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+
+        let _first = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        send_packet(&mut in_tx, encode_data(1, b"late")).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::UNKNOWN)
+        );
+
+        let _second = open_tcp(&mut in_tx, &mut out_rx, &listener, 3).await;
+        send_packet(&mut in_tx, encode_fin(3)).await;
+        send_packet(&mut in_tx, encode_fin(3)).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(3, close_reason::UNKNOWN)
+        );
+        expect_quiet(&mut out_rx).await;
+        assert!(!handle.is_finished());
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn without_negotiation_eof_closes_and_fin_is_a_protocol_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = test_ctx(
+            loopback_test_options(listener.local_addr().unwrap().port()),
+            true,
+        );
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        let server = v2_handshake(
+            &mut in_tx,
+            &mut out_rx,
+            &[extension_id::STREAM_OPEN_CONFIRMATION],
+        )
+        .await;
+        assert!(server.iter().any(|e| e.id == extension_id::TCP_HALF_CLOSE));
+
+        let mut upstream = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+        upstream.write_all(b"last").await.unwrap();
+        upstream.shutdown().await.unwrap();
+        expect_data(&mut out_rx, 1, b"last").await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::VOLUNTARY)
+        );
+
+        let _second = open_tcp(&mut in_tx, &mut out_rx, &listener, 3).await;
+        send_packet(&mut in_tx, encode_fin(3)).await;
+        expect_protocol_violation(out_rx, handle, 3).await;
+    }
+
+    #[tokio::test]
+    async fn fin_on_a_udp_stream_is_a_protocol_error() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ctx = test_ctx(
+            loopback_test_options(socket.local_addr().unwrap().port()),
+            true,
+        );
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(
+            &mut in_tx,
+            &mut out_rx,
+            &[extension_id::UDP, extension_id::TCP_HALF_CLOSE],
+        )
+        .await;
+        send_packet(
+            &mut in_tx,
+            encode_connect(&ConnectPacket {
+                stream_id: 1,
+                stream_type: stream_type::UDP,
+                port: socket.local_addr().unwrap().port(),
+                hostname: "127.0.0.1".to_owned(),
+            }),
+        )
+        .await;
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        expect_protocol_violation(out_rx, handle, 1).await;
+    }
+
+    #[tokio::test]
+    async fn fin_behind_a_full_write_queue_waits_and_takes_no_credit() {
+        // The first chunk outgrows the socket buffers and blocks the writer,
+        // and the rest fill its queue to capacity.
+        const CHUNK: usize = 4 * 1024 * 1024;
+        const CHUNKS: usize = 5;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(16 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let mut opts = (*loopback_test_options(listener.local_addr().unwrap().port())).clone();
+        opts.buffer_size = 8;
+        opts.continue_threshold = CHUNKS as u64 + 1;
+        opts.max_pending_packets_per_stream = CHUNKS as u64 - 1;
+        opts.max_pending_bytes_per_stream = (CHUNK * CHUNKS) as u64;
+        opts.max_binary_frame_bytes = (CHUNK * 2) as u64;
+        let ctx = test_ctx(Arc::new(opts), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        let mut upstream = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+
+        let chunk = vec![b'x'; CHUNK];
+        for _ in 0..CHUNKS {
+            send_packet(&mut in_tx, encode_data(1, &chunk)).await;
+        }
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        expect_quiet(&mut out_rx).await;
+
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(10), upstream.read_to_end(&mut received))
+            .await
+            .expect("upstream never saw the FIN")
+            .unwrap();
+        assert_eq!(received.len(), CHUNK * CHUNKS);
+
+        upstream.shutdown().await.unwrap();
+        assert_eq!(next_packet(&mut out_rx).await, fin(1));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::VOLUNTARY)
+        );
+        expect_quiet(&mut out_rx).await;
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
     }
 
     #[test]

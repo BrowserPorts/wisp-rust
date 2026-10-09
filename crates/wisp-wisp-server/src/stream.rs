@@ -7,6 +7,12 @@
 //! again. A reader task only pumps upstream → client. Pending DATA before
 //! the dial finishes is flushed through the same path once the socket is
 //! live, so order is preserved.
+//!
+//! With TCP Half-Close negotiated, a client FIN shuts down the upstream write
+//! half once everything queued ahead of it is written: inline when the half is
+//! idle, or by closing the writer's channel so the writer task drains it and
+//! then shuts down. An upstream EOF stops the reader and is reported to the
+//! mux, which sends the FIN and releases the stream once both sides are done.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::{HashMap, VecDeque};
@@ -216,6 +222,12 @@ pub(crate) enum TcpEvent {
     WriterDone {
         stream_id: u32,
     },
+    ReadEof {
+        stream_id: u32,
+    },
+    WriteShut {
+        stream_id: u32,
+    },
 }
 
 struct QueuedWrite {
@@ -224,7 +236,7 @@ struct QueuedWrite {
 }
 
 pub(crate) struct QueuedWriter {
-    tx: mpsc::Sender<QueuedWrite>,
+    tx: Option<mpsc::Sender<QueuedWrite>>,
     byte_budget: Arc<Semaphore>,
     task: JoinHandle<()>,
 }
@@ -245,6 +257,12 @@ pub(crate) enum TcpStreamState {
 pub(crate) struct TcpStreamSlot {
     pub state: TcpStreamState,
     packets_since_continue: u32,
+    /// The client sent FIN; no more DATA is valid.
+    pub client_fin: bool,
+    /// The upstream write half has been shut down.
+    pub write_shut: bool,
+    /// The upstream read half hit EOF.
+    pub upstream_eof: bool,
 }
 
 impl TcpStreamSlot {
@@ -255,7 +273,15 @@ impl TcpStreamSlot {
                 pending_bytes: 0,
             },
             packets_since_continue: 0,
+            client_fin: false,
+            write_shut: false,
+            upstream_eof: false,
         }
+    }
+
+    /// Both directions are finished and the stream can be released.
+    pub(crate) fn finished(&self) -> bool {
+        self.write_shut && self.upstream_eof
     }
 
     pub(crate) fn queue_pending(
@@ -318,6 +344,7 @@ pub(crate) fn spawn_tcp_connect(
     stream_id: u32,
     hostname: String,
     port: u16,
+    half_close: bool,
     ctx: ServerContext,
     egress: EgressSender,
     events: mpsc::Sender<TcpEvent>,
@@ -381,7 +408,7 @@ pub(crate) fn spawn_tcp_connect(
         tune_tcp(&upstream);
 
         let (up_read, write) = upstream.into_split();
-        let reader = spawn_reader(stream_id, up_read, ctx, egress, events.clone());
+        let reader = spawn_reader(stream_id, up_read, half_close, ctx, egress, events.clone());
         let _ = events
             .send(TcpEvent::Ready {
                 stream_id,
@@ -395,6 +422,7 @@ pub(crate) fn spawn_tcp_connect(
 fn spawn_reader(
     stream_id: u32,
     mut up_read: tokio::net::tcp::OwnedReadHalf,
+    half_close: bool,
     ctx: ServerContext,
     egress: EgressSender,
     events: mpsc::Sender<TcpEvent>,
@@ -409,6 +437,7 @@ fn spawn_reader(
     let last_activity = Arc::new(AtomicU64::new(0));
     tokio::spawn(async move {
         let pool = read_buffer_pool();
+        let mut eof = false;
         'read_loop: loop {
             let mut buf = pool.take();
             if buf.data.capacity() < PACKET_HEADER_LEN + READ_CHUNK {
@@ -425,6 +454,10 @@ fn spawn_reader(
                     }
                 }
                 res = up_read.read_buf(&mut buf.data) => match res {
+                    Ok(0) if half_close => {
+                        eof = true;
+                        break;
+                    }
                     Ok(0) => {
                         send_close(&egress, &ctx.cancel, stream_id, close_reason::VOLUNTARY).await;
                         break;
@@ -471,6 +504,10 @@ fn spawn_reader(
                         if send_res.is_err() {
                             break;
                         }
+                        if peer_closed && half_close {
+                            eof = true;
+                            break;
+                        }
                         if peer_closed {
                             send_close(&egress, &ctx.cancel, stream_id, close_reason::VOLUNTARY).await;
                             break;
@@ -480,6 +517,20 @@ fn spawn_reader(
                         warn!(stream_id, error = %e, "wisp tcp upstream read error");
                         send_close(&egress, &ctx.cancel, stream_id, close_reason::NETWORK_ERROR).await;
                         break;
+                    }
+                }
+            }
+        }
+        // The stream stays open for writing, so its idle timeout still runs.
+        if eof && events.send(TcpEvent::ReadEof { stream_id }).await.is_ok() {
+            loop {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => break,
+                    _ = idle_wait(idle) => {
+                        if idle_exceeded(&last_activity, start, idle) {
+                            send_close(&egress, &ctx.cancel, stream_id, close_reason::TRANSFER_TIMEOUT).await;
+                            break;
+                        }
                     }
                 }
             }
@@ -670,6 +721,9 @@ pub(crate) fn write_upstream(
     let Some(writer) = queued.as_ref() else {
         return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
     };
+    let Some(tx) = writer.tx.as_ref() else {
+        return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
+    };
     let permit_count = u32::try_from(payload.len().max(1)).unwrap_or(u32::MAX);
     let Ok(permit) = writer
         .byte_budget
@@ -678,7 +732,7 @@ pub(crate) fn write_upstream(
     else {
         return WriteOutcome::DropStream(close_reason::CONN_THROTTLED);
     };
-    match writer.tx.try_send(QueuedWrite {
+    match tx.try_send(QueuedWrite {
         data: payload,
         _permit: permit,
     }) {
@@ -738,7 +792,46 @@ pub(crate) async fn activate_writer(
             WriteOutcome::Ok => {}
         }
     }
+    if slot.client_fin {
+        return shutdown_upstream_write(slot).await;
+    }
     WriteOutcome::Ok
+}
+
+/// Client FIN path. An idle write half is shut down here; a queued writer
+/// loses its sender, so it shuts the half down after writing what it holds.
+/// A connecting stream is shut down by [`activate_writer`] after its pending
+/// DATA.
+pub(crate) async fn shutdown_upstream_write(slot: &mut TcpStreamSlot) -> WriteOutcome {
+    let TcpStreamState::Live {
+        write,
+        queued,
+        inspection_buf,
+        ..
+    } = &mut slot.state
+    else {
+        return WriteOutcome::Ok;
+    };
+    if inspection_buf
+        .as_ref()
+        .is_some_and(|buffer| !buffer.is_empty())
+    {
+        return WriteOutcome::DropStream(close_reason::HOST_BLOCKED);
+    }
+    if let Some(mut write_half) = write.take() {
+        if write_half.shutdown().await.is_err() {
+            return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
+        }
+        slot.write_shut = true;
+        return WriteOutcome::Ok;
+    }
+    match queued.as_mut() {
+        Some(writer) => {
+            writer.tx = None;
+            WriteOutcome::Ok
+        }
+        None => WriteOutcome::DropStream(close_reason::NETWORK_ERROR),
+    }
 }
 
 fn spawn_writer(
@@ -778,25 +871,39 @@ fn spawn_writer(
                 write_batch_cancel(&mut write, &mut batch, &ctx.cancel)
                     .await
                     .map_err(|()| close_reason::NETWORK_ERROR)?;
-                let Some(queued) = (tokio::select! {
+                let queued = tokio::select! {
                     biased;
-                    _ = ctx.cancel.cancelled() => None,
+                    _ = ctx.cancel.cancelled() => return Ok(false),
                     queued = rx.recv() => queued,
-                }) else {
+                };
+                let Some(queued) = queued else {
                     break;
                 };
                 batch.push_back(queued);
             }
-            Ok(())
+            // A closed channel is the client's FIN, queued behind its DATA.
+            write
+                .shutdown()
+                .await
+                .map_err(|_| close_reason::NETWORK_ERROR)?;
+            Ok(true)
         };
 
-        if let Err(reason) = run.await {
-            send_close(&egress, &ctx.cancel, stream_id, reason).await;
+        match run.await {
+            Ok(true) => {
+                let _ = events.send(TcpEvent::WriteShut { stream_id }).await;
+            }
+            Ok(false) => {
+                let _ = events.send(TcpEvent::WriterDone { stream_id }).await;
+            }
+            Err(reason) => {
+                send_close(&egress, &ctx.cancel, stream_id, reason).await;
+                let _ = events.send(TcpEvent::WriterDone { stream_id }).await;
+            }
         }
-        let _ = events.send(TcpEvent::WriterDone { stream_id }).await;
     });
     Some(QueuedWriter {
-        tx,
+        tx: Some(tx),
         byte_budget,
         task,
     })
