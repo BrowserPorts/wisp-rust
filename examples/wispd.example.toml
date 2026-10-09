@@ -4,8 +4,6 @@
 #   * Wisp v2 over WebSocket   ([wisp_websocket])  — port 4242
 #   * Wisp v2 over WebTransport ([wisp_wt])        — port 4243 (UDP/HTTP3)
 #
-# Every key is optional; defaults match the TS reference implementation
-# (wisp-wt/src/toml.ts). Sections use `#[serde(deny_unknown_fields)]` —
 # typos cause `wispd` to refuse to start rather than silently ignore.
 #
 # Run:    wispd --config /etc/wispd/wispd.toml
@@ -16,13 +14,19 @@
 # ============================================================================
 [wisp.server]
 endpoint            = "/wisp/"        # request path the upgrade must match (normalized; trailing slash optional)
-buffer_size         = 65536           # READY frame: per-stream client→server flow-control window in bytes
-continue_threshold  = 32768           # CONTINUE frame fires once this many bytes have been consumed
+buffer_size         = 256                                                                      
+continue_threshold  = 230                                                                       
 allow_tcp_streams   = true
 allow_udp_streams   = true
 stream_limit_per_host = -1            # -1 = unlimited; per-(connection, host:port) concurrent stream cap
 stream_limit_total  = 4096            # per-connection concurrent stream cap across all destinations
 wisp_version        = "v2"            # "v1" | "v2"; v2 enables extensions, CONTINUE flow control, multi-stream priority
+
+[wisp.auth]
+required            = true
+token_path          = true
+token_file          = "/etc/wispd/tokens.toml"
+resolver_timeout_ms = 1000
 
 # ============================================================================
 # [wisp.destination] — what the proxy is allowed to dial
@@ -30,10 +34,9 @@ wisp_version        = "v2"            # "v1" | "v2"; v2 enables extensions, CONT
 [wisp.destination]
 domain_blacklist    = ["*.internal.example.com"]
 domain_whitelist    = []              # empty = no whitelist (allow-all subject to blacklist)
-hostname_blacklist  = []              # alias of domain_blacklist; kept for backwards-compat
 port_whitelist      = [80, 443]       # restrict outbound ports; HTTP + HTTPS only by default
+host_port_whitelist = []
 allow_direct_ip                       = false   # reject `1.2.3.4:443` style hosts; require DNS name
-allow_direct_ip_with_domain_policy    = false   # if true, IPs are subject to domain_* policy via PTR (slow)
 allow_private_ips                     = false   # block RFC 1918 / fc00::/7
 allow_loopback_ips                    = false   # block 127.0.0.0/8, ::1
 
@@ -43,7 +46,7 @@ allow_loopback_ips                    = false   # block 127.0.0.0/8, ::1
 [wisp.origin]
 origin_whitelist     = ["https://app.example.com"]
 origin_blacklist     = []
-block_blank_origins  = true           # reject requests with no Origin header (Restored on WT in wisp-rust; bun bypassed this.)
+block_blank_origins  = true                                                  
 
 # ============================================================================
 # [wisp.client] — peer identification
@@ -52,7 +55,7 @@ block_blank_origins  = true           # reject requests with no Origin header (R
 client_ip_blacklist  = []
 client_ip_whitelist  = []
 parse_real_ip        = true                                 # honor X-Forwarded-For / Forwarded
-parse_real_ip_from   = ["127.0.0.1", "10.0.0.0/8"]           # only trust those headers from these hops
+parse_real_ip_from   = ["127.0.0.1", "10.0.0.0/8"]                                     
 
 # ============================================================================
 # [wisp.dns] — resolver behavior
@@ -60,7 +63,7 @@ parse_real_ip_from   = ["127.0.0.1", "10.0.0.0/8"]           # only trust those 
 [wisp.dns]
 dns_ttl                                 = 60      # seconds; positive cache TTL cap
 dns_negative_ttl                        = 5       # seconds; NXDOMAIN cache TTL
-dns_method                              = "resolve"  # "lookup" (system getaddrinfo) | "resolve" (hickory resolver)
+dns_method                              = "resolve"                                                      
 dns_servers                             = []      # empty + auto = system resolver; non-empty overrides
 dns_result_order                        = "ipv4first" # "ipv4first" | "ipv6first" | "verbatim"
 dns_cache_max_entries                   = 4096
@@ -77,7 +80,9 @@ max_connections_per_ip                           = 32
 max_binary_frame_bytes                           = 1048576    # 1 MiB
 max_text_frame_bytes                             = 65536
 max_host_bytes                                   = 253        # RFC 1035 max DNS name length
-max_pending_packets_per_stream                   = 64
+max_pending_packets_per_stream                   = 512
+max_pending_bytes_per_stream                     = 8388608
+max_egress_queue_bytes                           = 33554432
 max_connection_starts_per_ip_per_minute          = 600
 max_connection_starts_per_minute                 = 60000
 max_tcp_stream_opens_per_connection_per_minute   = 1200
@@ -103,11 +108,10 @@ max_proxy_rule_field_bytes                       = 512
 # [wisp.rate_limit] — distributed limiter backend (memory or Redis)
 # ============================================================================
 [wisp.rate_limit]
-backend                                = "memory"            # "memory" | "redis"
+backend                                = "redis"                                 
 redis_url                              = "redis://127.0.0.1:6379/0"
-redis_key_prefix                       = "wispd:"
-redis_hash_tag                         = "{wispd}"           # forces hash-tag cluster colocation
-redis_fail_open                        = true                # if Redis is unreachable, allow rather than reject
+redis_key_prefix                       = "wispd"
+redis_hash_tag                         = "rate-limit"                                                      
 proxy_control_upstream_ops_per_second  = 10
 proxy_control_upstream_burst           = 20
 proxy_control_mutation_ops_per_second  = 2
@@ -127,30 +131,18 @@ handshake_timeout_ms   = 15000    # WS upgrade / WT extended-CONNECT must comple
 # ============================================================================
 [wisp.protocol_inspection]
 enabled                  = true
-allowed_protocols        = ["http", "https", "http2", "ws", "h3"]
+allowed_protocols        = ["http", "https", "http2", "ws"]
 max_bytes                = 8192
 timeout_ms               = 250
 allow_h2c                = false   # plain HTTP/2 prior knowledge (no TLS)
 allow_tls_without_alpn   = true
-allow_quic_initial       = true    # QUIC v1 long-header Initial packet
+allow_quic_initial       = false                                                        
 
-# ============================================================================
-# [wisp.security] — auto-ban policy on policy violations
-# ============================================================================
-[wisp.security]
-localhost_violation_ban_ms = 3600000   # 1 h ban for clients attempting to dial loopback/private
-security_violation_ban_ms  = 600000    # 10 min ban for other policy hits
-
-# ============================================================================
-# [wisp.proxy] — chained-proxy / multi-hop policy
-# ============================================================================
 [wisp.proxy]
-force_proxy           = false
-max_session_hops      = 4              # int | "none" | "null" | "unset"
-max_daily_hops_per_ip = "none"
+force_proxy = false
 
 # ============================================================================
-# [wisp_websocket] — Wisp v2 over WebSocket (TLS via hyper + tokio-websockets)
+# ============================================================================
 # ============================================================================
 [wisp_websocket]
 enabled               = true
@@ -160,11 +152,10 @@ bind_addr             = "0.0.0.0:4242" # explicit bind; overrides host/port if s
 cert_path             = "/etc/wispd/tls/fullchain.pem"
 key_path              = "/etc/wispd/tls/privkey.pem"
 endpoint              = "/wisp/"       # override [wisp.server].endpoint for this transport
-proxy_control_enabled = true           # advertise STELLITE_PROXY_CONTROL (ext 0x03)
-plain                 = false          # true = serve ws:// (no TLS); useful behind a TLS terminator
+proxy_control_enabled = true                                                    
+ingress_mode          = "direct_tls"                                                                    
 
 # ============================================================================
-# [wisp_proxy_control] — STELLITE_PROXY_CONTROL extension toggle
 # ============================================================================
 [wisp_proxy_control]
 enabled = true
@@ -180,7 +171,9 @@ endpoint           = "/wisp/"          # the extended-CONNECT :path
 cert_path          = "/etc/wispd/tls/fullchain.pem"
 key_path           = "/etc/wispd/tls/privkey.pem"
 max_datagram_bytes = 1200              # RFC 9221 max; msquic caps to MTU minus overhead
-wt_engine          = "msquic"          # accepted for TS-compat ("bun" | "fails" parse, but always msquic in wisp-rust)
+webtransport_proxy_enabled         = false
+max_proxy_sessions_per_connection = 4
+max_proxy_substreams_per_session   = 64
 
 # ============================================================================
 # [wisp_proxy_mullvad] — optional Mullvad WireGuard SOCKS5 backend
@@ -189,8 +182,8 @@ wt_engine          = "msquic"          # accepted for TS-compat ("bun" | "fails"
 # ============================================================================
 [wisp_proxy_mullvad]
 enabled           = false
-relay_api         = "https://api.mullvad.net/app/v1/relays"
-wireproxy_socks5  = "127.0.0.1:1080"
+relay_api         = "https://api.mullvad.net/www/relays/wireguard/"
+wireproxy_socks5  = "127.0.0.1:40000"
 
 # ============================================================================
 # [wisp_proxy_resi] — optional residential / partner HTTP-API proxy backend

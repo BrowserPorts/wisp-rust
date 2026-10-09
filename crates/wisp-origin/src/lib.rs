@@ -1,8 +1,7 @@
-//! Origin header parsing and allow/deny policy. Mirrors `wisp-wt/src/origin.ts`.
+//! Origin header parsing and allow/deny policy.
 //!
-//! The TS port silently disabled this on Bun because the Bun WT binding does
-//! not expose request headers. msquic + the `h3` crate give us
-//! `http::Request<()>` with full headers, so this policy is unconditional.
+//! msquic and the `h3` crate give us `http::Request<()>` with full headers, so
+//! this policy is always enforced.
 
 #![forbid(unsafe_code)]
 
@@ -32,9 +31,6 @@ enum Pattern {
 
 fn serialize_origin(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
-    // url::Origin::ascii_serialization yields e.g. "https://example.com" or
-    // "https://example.com:8443"; the special "null" origin is exposed via the
-    // is_tuple()==false branch.
     let origin = url.origin();
     if !origin.is_tuple() {
         return None;
@@ -61,11 +57,8 @@ fn parse_pattern(entry: &str) -> Option<Pattern> {
     if trimmed == "null" {
         return Some(Pattern::Null);
     }
-    // Wildcard form: scheme://*.host[:port]
-    if let Some(rest) = trimmed.strip_prefix(&trimmed[..trimmed.find("://")? + 3]) {
-        let scheme = &trimmed[..trimmed.find("://")?];
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
         if let Some(after_star) = rest.strip_prefix("*.") {
-            // Split host:port
             let (host, port) = match after_star.rsplit_once(':') {
                 Some((h, p)) => (h, p.parse::<u16>().ok()),
                 None => (after_star, None),
@@ -74,14 +67,6 @@ fn parse_pattern(entry: &str) -> Option<Pattern> {
                 return None;
             }
             let scheme_lc = scheme.to_ascii_lowercase();
-            // Audit fix #8: canonicalize default ports out at parse time.
-            // `url::Url::port()` returns `None` for default ports
-            // (`:443` for https, `:80` for http) per WHATWG URL serialization.
-            // If a deployer wrote `https://*.example.com:443`, we previously
-            // stored `port: Some(443)` and then never matched browser-sent
-            // `https://api.example.com` (where url.port() is None) — a
-            // silent fail-closed. Folding the default port to `None` at
-            // pattern-parse time makes both forms equivalent.
             let port = match (scheme_lc.as_str(), port) {
                 ("https", Some(443))
                 | ("http", Some(80))
@@ -173,6 +158,14 @@ pub fn origin_from_headers(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
+pub fn origin_headers_valid(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(http::header::ORIGIN).iter();
+    let Some(first) = values.next() else {
+        return true;
+    };
+    values.next().is_none() && first.to_str().is_ok()
+}
+
 pub fn is_origin_allowed(origin: Option<&str>, options: &WispServerOptions) -> bool {
     let parsed = parse_origin_header(origin);
     if matches!(parsed, ParsedOrigin::Invalid(_)) {
@@ -232,8 +225,21 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_origin_headers_are_invalid() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::ORIGIN,
+            "https://one.example".parse().expect("header"),
+        );
+        headers.append(
+            http::header::ORIGIN,
+            "https://two.example".parse().expect("header"),
+        );
+        assert!(!origin_headers_valid(&headers));
+    }
+
+    #[test]
     fn invalid_origin_with_path_rejected() {
-        // Per TS reference, anything with a path or query becomes invalid.
         let s = "https://example.com/foo";
         match parse_origin_header(Some(s)) {
             ParsedOrigin::Invalid(_) => {}
@@ -276,16 +282,12 @@ mod tests {
 
     #[test]
     fn wildcard_with_default_port_in_pattern_matches_canonical_origin() {
-        // Audit fix #8 regression: `https://*.example.com:443` written by a
-        // deployer must match what browsers actually send
-        // (`https://api.example.com`, no explicit port).
         let mut o = opts();
         o.origin_whitelist = Some(vec!["https://*.example.com:443".to_owned()]);
         assert!(is_origin_allowed(Some("https://api.example.com"), &o));
         let mut o2 = opts();
         o2.origin_whitelist = Some(vec!["http://*.example.com:80".to_owned()]);
         assert!(is_origin_allowed(Some("http://api.example.com"), &o2));
-        // Non-default port still distinguishes.
         let mut o3 = opts();
         o3.origin_whitelist = Some(vec!["https://*.example.com:8443".to_owned()]);
         assert!(!is_origin_allowed(Some("https://api.example.com"), &o3));

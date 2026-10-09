@@ -1,25 +1,29 @@
-//! Client-IP normalization and SHA-256 hashing. Mirrors `wisp-wt/src/ip-hash.ts`.
+//! Client-IP normalization and SHA-256 hashing.
 //!
 //! IPv4 → exact dotted-quad. IPv6 → first 4 hex groups + `:0:0:0:0/64` mask
 //! (so the hash never identifies a single IPv6 device, just a /64).
+//!
+//! Input that does not parse as an IP address is unidentifiable: normalization
+//! returns `None` so malformed header text is never hashed as an identity.
 
 #![forbid(unsafe_code)]
 
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Normalize a client IP into a stable identity key, or `None` when the input
+/// is not a parseable IP address. Callers must treat `None` as unidentifiable
+/// (apply the strictest limit / reject) rather than substituting a default.
 pub fn normalize_client_ip(ip: &str) -> Option<String> {
     let mut val = ip.trim().to_ascii_lowercase();
     if val.is_empty() {
         return None;
     }
-    // Strip brackets around IPv6 literal.
     if val.starts_with('[') {
         if let Some(close) = val.find(']') {
             val = val[1..close].to_owned();
         }
     }
-    // ::ffff:1.2.3.4 collapses to 1.2.3.4.
     if let Some(rest) = val.strip_prefix("::ffff:") {
         if rest.parse::<Ipv4Addr>().is_ok() {
             return Some(rest.to_owned());
@@ -28,7 +32,7 @@ pub fn normalize_client_ip(ip: &str) -> Option<String> {
     match val.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => Some(v4.to_string()),
         Ok(IpAddr::V6(v6)) => Some(mask_ipv6_to_64(v6)),
-        Err(_) => Some(val),
+        Err(_) => None,
     }
 }
 
@@ -40,8 +44,8 @@ fn mask_ipv6_to_64(addr: Ipv6Addr) -> String {
     )
 }
 
-/// Base64url-encoded SHA-256 of normalized IP. Same format as the TS reference
-/// (`createHash('sha256').update(normalized).digest('base64url')`).
+/// Base64url-encoded SHA-256 (or HMAC-SHA256 when a secret is supplied) of the
+/// normalized IP. Returns `None` when the input is absent or not a parseable IP.
 pub fn hash_client_ip(ip: Option<&str>, secret: Option<&[u8]>) -> Option<String> {
     let normalized = normalize_client_ip(ip?)?;
     let digest = match secret {
@@ -58,7 +62,6 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    // Inline HMAC-SHA256: outer = SHA(opad ⊕ K' || SHA(ipad ⊕ K' || msg)).
     const BLOCK: usize = 64;
     let mut k = [0u8; BLOCK];
     if key.len() > BLOCK {
@@ -134,6 +137,20 @@ mod tests {
             normalize_client_ip("2001:db8:1234:5678:abcd:ef01:2345:6789").as_deref(),
             Some("2001:0db8:1234:5678:0000:0000:0000:0000/64")
         );
+    }
+
+    #[test]
+    fn non_ip_string_returns_none() {
+        assert_eq!(normalize_client_ip("not-an-ip"), None);
+        assert_eq!(normalize_client_ip("example.com"), None);
+        assert_eq!(normalize_client_ip("999.999.999.999"), None);
+        assert_eq!(normalize_client_ip("   "), None);
+    }
+
+    #[test]
+    fn non_ip_string_is_not_hashed() {
+        assert_eq!(hash_client_ip(Some("not-an-ip"), None), None);
+        assert_eq!(hash_client_ip(None, None), None);
     }
 
     #[test]

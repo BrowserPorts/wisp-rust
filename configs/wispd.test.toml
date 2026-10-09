@@ -1,29 +1,23 @@
-# wispd benchmark config (wispmark `wisp-rust-ws` row).
 #
-# Purpose: measure the raw mux/relay path on equal footing with the other
 # benchmarked servers (mrrowisp, epoxy), which disable their equivalents. Every
-# rate/DoS limiter is set to -1 ("unlimited"), which maps to the u64::MAX
-# sentinel and takes a zero-cost fast path in wisp-dos (no bucket lookup, no
-# per-IP key allocation on the per-chunk / per-datagram hot path). A large
-# *finite* value would still pay that cost on every relayed chunk. TOML integers
-# are i64, so u64::MAX can't be written directly — -1 is the disable knob. NOT
-# for production use.
-#
-# The wispmark harness (../wispmark/server.xsh) points wispd at this file and
-# serves a plain ws:// listener on 127.0.0.1:6001, relaying to the echo server
-# on 127.0.0.1:6002.
 
 [wisp.server]
 endpoint = "/"
+buffer_size = 256
+continue_threshold = 230
 
 [wisp.origin]
 block_blank_origins = false
+
+[wisp.auth]
+required = false
 
 [wisp.protocol_inspection]
 enabled = false
 
 [wisp.destination]
 port_whitelist     = [6002]
+allow_direct_ip    = true
 allow_loopback_ips = true
 allow_private_ips  = true
 
@@ -42,12 +36,16 @@ max_control_messages_per_connection_per_minute = -1
 max_control_messages_per_ip_per_minute         = -1
 max_connections        = 0
 max_connections_per_ip = 0
+max_pending_packets_per_stream = 512
+max_pending_bytes_per_stream   = 16777216
+max_egress_queue_bytes         = 33554432
 
 [wisp.timeouts]
 idle_timeout_ms = 2000
+stream_idle_timeout_ms = 2000
 
 [wisp_websocket]
-enabled = true
-plain   = true
-host    = "127.0.0.1"
-port    = 6001
+enabled      = true
+ingress_mode = "direct_plain"
+host         = "127.0.0.1"
+port         = 6001

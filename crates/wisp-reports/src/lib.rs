@@ -1,5 +1,8 @@
-//! Wisp security/report categorization. Mirrors `wisp-wt/src/reports.ts` —
-//! same string codes so existing log aggregators continue to work.
+//! Wisp security/report categorization and emission.
+//!
+//! The string report codes are stable wire identifiers so existing log
+//! aggregators continue to work. Call [`emit_report`] from admit/reject/close
+//! paths; it serializes a [`Report`] onto the `wisp_reports` tracing target.
 
 #![forbid(unsafe_code)]
 
@@ -312,12 +315,38 @@ pub fn create_report(error_type: ReportErrorType, input: ReportInput) -> Report 
     }
 }
 
+/// Build a report and emit it on the `wisp_reports` tracing target as JSON.
+/// Call this from admit/reject/close paths so aggregators can scrape stable
+/// `report_code` values without parsing free-form log lines.
+pub fn emit_report(error_type: ReportErrorType, input: ReportInput) {
+    let report = create_report(error_type, input);
+    match serde_json::to_string(&report) {
+        Ok(json) => {
+            tracing::info!(
+                target: "wisp_reports",
+                report_code = report.report_code,
+                category = ?report.category,
+                report = %json,
+                "wisp report"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "wisp_reports",
+                report_code = report.report_code,
+                error = %error,
+                "failed to serialize wisp report"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn report_codes_match_ts() {
+    fn report_codes_are_stable() {
         assert_eq!(
             ReportErrorType::OriginBlocked.definition().report_code,
             "WISP_ORIGIN_BLOCKED"
@@ -329,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn categories_match_ts() {
+    fn categories_are_stable() {
         assert!(matches!(
             ReportErrorType::DatagramDropped.definition().category,
             ReportCategory::RateLimit
@@ -368,6 +397,18 @@ mod tests {
             s.contains("\"error_type\":\"host_policy_blocked\""),
             "{}",
             s
+        );
+    }
+
+    #[test]
+    fn emit_report_does_not_panic() {
+        emit_report(
+            ReportErrorType::OriginBlocked,
+            ReportInput {
+                origin: Some("https://example.test".to_owned()),
+                transport: Some(Transport::Ws),
+                ..Default::default()
+            },
         );
     }
 }

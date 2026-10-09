@@ -1,11 +1,10 @@
-//! HTTP/HTTPS/H2c/WS/H3 packet inspection. Mirrors `wisp-wt/src/inspection.ts`.
+//! HTTP/HTTPS/H2c/WS/H3 packet inspection.
 //!
-//! The TS module does full TLS ClientHello + HPACK + QUIC Initial decode. The
-//! Rust port ships a focused subset that detects the common shapes (HTTP/1.x
-//! request line, HTTP/2 connection preface, TLS ClientHello marker, WebSocket
-//! Upgrade) so the server can gate against `protocol_inspection_allowed_protocols`
-//! without writing a full HPACK decoder. Returns `NeedMore` until enough bytes
-//! are buffered or the configured `protocol_inspection_max_bytes` cap is hit.
+//! Ships a focused subset that detects the common shapes (HTTP/1.x request
+//! line, HTTP/2 connection preface, TLS ClientHello marker, WebSocket Upgrade)
+//! so the server can gate against `protocol_inspection_allowed_protocols`
+//! without a full HPACK decoder. Returns `NeedMore` until enough bytes are
+//! buffered or the configured `protocol_inspection_max_bytes` cap is hit.
 
 #![forbid(unsafe_code)]
 
@@ -77,8 +76,12 @@ pub fn inspect(buf: &[u8], options: &WispServerOptions) -> InspectionDecision {
     if buf.is_empty() {
         return InspectionDecision::NeedMore;
     }
+    if (buf.len() as u64) > options.protocol_inspection_max_bytes {
+        return InspectionDecision::Block {
+            reason: BlockReason::BufferExhausted,
+        };
+    }
 
-    // HTTP/2 preface (h2c).
     if buf.len() < HTTP2_PREFACE.len() && HTTP2_PREFACE.starts_with(buf) {
         return InspectionDecision::NeedMore;
     }
@@ -91,23 +94,31 @@ pub fn inspect(buf: &[u8], options: &WispServerOptions) -> InspectionDecision {
         );
     }
 
-    // TLS ClientHello: 0x16 record type, version major 0x03 (SSL3+).
     if buf[0] == 0x16 {
         if buf.len() < 5 {
             return InspectionDecision::NeedMore;
         }
         if buf[1] == 0x03 {
-            let alpn_known = scan_tls_alpn(buf);
-            let detected = alpn_known
-                .as_ref()
-                .and_then(|name| match name.as_slice() {
-                    b"http/1.1" => Some(DetectedProtocol::Https),
-                    b"h2" => Some(DetectedProtocol::Http2),
-                    b"h3" => Some(DetectedProtocol::H3),
-                    _ => None,
-                })
-                .unwrap_or(DetectedProtocol::Https);
-            if alpn_known.is_none() && !options.protocol_inspection_allow_tls_without_alpn {
+            let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            let total = 5_usize.saturating_add(record_len);
+            if total as u64 > options.protocol_inspection_max_bytes {
+                return InspectionDecision::Block {
+                    reason: BlockReason::BufferExhausted,
+                };
+            }
+            if buf.len() < total {
+                return InspectionDecision::NeedMore;
+            }
+            let alpn = match parse_tls_alpn(&buf[..total]) {
+                Ok(value) => value,
+                Err(()) => {
+                    return InspectionDecision::Block {
+                        reason: BlockReason::ProtocolNotAllowed,
+                    };
+                }
+            };
+            let detected = alpn.unwrap_or(DetectedProtocol::Https);
+            if alpn.is_none() && !options.protocol_inspection_allow_tls_without_alpn {
                 return InspectionDecision::Block {
                     reason: BlockReason::TlsWithoutAlpnDisallowed,
                 };
@@ -116,27 +127,25 @@ pub fn inspect(buf: &[u8], options: &WispServerOptions) -> InspectionDecision {
         }
     }
 
-    // QUIC long-header Initial: first byte top two bits are 0b11 and packet
-    // type in the next two is 0b00 — i.e. (b & 0xF0) == 0xC0.
-    if (buf[0] & 0xF0) == 0xC0 {
-        if !options.protocol_inspection_allow_quic_initial {
-            return InspectionDecision::Block {
-                reason: BlockReason::QuicInitialDisallowed,
-            };
-        }
-        return gate(
-            DetectedProtocol::H3,
-            options,
-            false,
-            BlockReason::ProtocolNotAllowed,
-        );
-    }
-
-    // HTTP/1.x request line.
     if let Some(end) = find_crlf(buf) {
         let line = &buf[..end];
         if looks_like_http1_line(line) {
-            let is_ws = scan_for_ws_upgrade(buf);
+            if !buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                if (buf.len() as u64) >= options.protocol_inspection_max_bytes {
+                    return InspectionDecision::Block {
+                        reason: BlockReason::BufferExhausted,
+                    };
+                }
+                return InspectionDecision::NeedMore;
+            }
+            let is_ws = match scan_for_ws_upgrade(buf) {
+                Ok(value) => value,
+                Err(()) => {
+                    return InspectionDecision::Block {
+                        reason: BlockReason::ProtocolNotAllowed,
+                    };
+                }
+            };
             let protocol = if is_ws {
                 DetectedProtocol::Ws
             } else {
@@ -144,13 +153,11 @@ pub fn inspect(buf: &[u8], options: &WispServerOptions) -> InspectionDecision {
             };
             return gate(protocol, options, false, BlockReason::ProtocolNotAllowed);
         }
-        // Header line found but not an HTTP/1.x request line → unknown plaintext.
         return InspectionDecision::Block {
             reason: BlockReason::ProtocolNotAllowed,
         };
     }
 
-    // Not enough bytes yet — request more, up to `max_bytes`.
     if (buf.len() as u64) >= options.protocol_inspection_max_bytes {
         return InspectionDecision::Block {
             reason: BlockReason::BufferExhausted,
@@ -188,7 +195,6 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 }
 
 fn looks_like_http1_line(line: &[u8]) -> bool {
-    // Crude: METHOD SP TARGET SP HTTP/1.x
     let s = match std::str::from_utf8(line) {
         Ok(s) => s,
         Err(_) => return false,
@@ -203,84 +209,109 @@ fn looks_like_http1_line(line: &[u8]) -> bool {
     ) && (version.starts_with("HTTP/1.0") || version.starts_with("HTTP/1.1"))
 }
 
-fn scan_for_ws_upgrade(buf: &[u8]) -> bool {
-    // Look (case-insensitive) for "Upgrade: websocket".
-    let needle = b"upgrade: websocket";
-    if buf.len() < needle.len() {
-        return false;
-    }
-    for i in 0..=buf.len() - needle.len() {
-        let mut ok = true;
-        for j in 0..needle.len() {
-            let c = buf[i + j];
-            let lower = if c.is_ascii_uppercase() { c + 32 } else { c };
-            if lower != needle[j] {
-                ok = false;
-                break;
-            }
+fn scan_for_ws_upgrade(buf: &[u8]) -> Result<bool, ()> {
+    let Ok(headers) = std::str::from_utf8(buf) else {
+        return Err(());
+    };
+    let mut upgrade = false;
+    let mut connection = false;
+    for line in headers.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
         }
-        if ok {
-            return true;
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(());
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || value.bytes().any(|byte| byte < b' ' && byte != b'\t')
+        {
+            return Err(());
+        }
+        if name.eq_ignore_ascii_case("upgrade") {
+            upgrade |= value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("websocket"));
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection |= value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
         }
     }
-    false
+    Ok(upgrade && connection)
 }
 
-/// Very small TLS ALPN extension scanner. Returns the first ALPN protocol if
-/// found. We avoid a full ClientHello parser by sweeping for the ALPN
-/// extension marker (0x00, 0x10) in the extension block; this is a best-effort
-/// detector, not a security boundary (the server still terminates TLS via
-/// msquic; this only informs `protocol_inspection_allowed_protocols`).
-fn scan_tls_alpn(buf: &[u8]) -> Option<Vec<u8>> {
-    // Skip TLS record header (5) + handshake header (4) + version (2) + random (32) = 43.
+fn parse_tls_alpn(buf: &[u8]) -> Result<Option<DetectedProtocol>, ()> {
+    if buf.len() < 9 || buf[0] != 0x16 || buf[5] != 0x01 {
+        return Err(());
+    }
+    let handshake_len =
+        (usize::from(buf[6]) << 16) | (usize::from(buf[7]) << 8) | usize::from(buf[8]);
+    if handshake_len.saturating_add(9) > buf.len() {
+        return Err(());
+    }
     let mut i = 43;
     if buf.len() <= i {
-        return None;
+        return Err(());
     }
-    // session_id
-    let sid_len = *buf.get(i)? as usize;
+    let sid_len = usize::from(*buf.get(i).ok_or(())?);
     i += 1 + sid_len;
-    // cipher_suites
-    let cs_len = u16::from_be_bytes([*buf.get(i)?, *buf.get(i + 1)?]) as usize;
+    let cs_len = u16::from_be_bytes([*buf.get(i).ok_or(())?, *buf.get(i + 1).ok_or(())?]) as usize;
     i += 2 + cs_len;
-    // compression_methods
-    let cm_len = *buf.get(i)? as usize;
+    let cm_len = usize::from(*buf.get(i).ok_or(())?);
     i += 1 + cm_len;
-    // extensions length
-    let ext_total = u16::from_be_bytes([*buf.get(i)?, *buf.get(i + 1)?]) as usize;
+    let ext_total =
+        u16::from_be_bytes([*buf.get(i).ok_or(())?, *buf.get(i + 1).ok_or(())?]) as usize;
     i += 2;
-    let end = i + ext_total;
-    while i + 4 <= end && i + 4 <= buf.len() {
+    let end = i.checked_add(ext_total).ok_or(())?;
+    if end > buf.len() {
+        return Err(());
+    }
+    while i < end {
+        if i + 4 > end {
+            return Err(());
+        }
         let ext_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
         let ext_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
         let body_start = i + 4;
-        let body_end = body_start + ext_len;
-        if body_end > buf.len() {
-            return None;
+        let body_end = body_start.checked_add(ext_len).ok_or(())?;
+        if body_end > end {
+            return Err(());
         }
         if ext_type == 0x0010 {
-            // ALPN: u16 list length, then [u8 len][protocol].
             if ext_len < 2 {
-                return None;
+                return Err(());
             }
             let list_len = u16::from_be_bytes([buf[body_start], buf[body_start + 1]]) as usize;
             let mut j = body_start + 2;
-            if j + list_len > body_end {
-                return None;
+            if j.checked_add(list_len).ok_or(())? != body_end {
+                return Err(());
             }
-            if j + 1 > buf.len() {
-                return None;
+            while j < body_end {
+                let plen = usize::from(*buf.get(j).ok_or(())?);
+                j += 1;
+                let protocol_end = j.checked_add(plen).ok_or(())?;
+                if plen == 0 || protocol_end > body_end {
+                    return Err(());
+                }
+                let detected = match &buf[j..protocol_end] {
+                    b"http/1.1" => Some(DetectedProtocol::Https),
+                    b"h2" => Some(DetectedProtocol::Http2),
+                    b"h3" => Some(DetectedProtocol::H3),
+                    _ => None,
+                };
+                if detected.is_some() {
+                    return Ok(detected);
+                }
+                j = protocol_end;
             }
-            let plen = buf[j] as usize;
-            j += 1;
-            if j + plen <= buf.len() {
-                return Some(buf[j..j + plen].to_vec());
-            }
-            return None;
+            return Ok(None);
         }
         i = body_end;
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -302,11 +333,38 @@ mod tests {
 
     #[test]
     fn detects_websocket() {
-        let buf = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
+        let buf = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
         assert_eq!(
             inspect(buf, &opts()),
             InspectionDecision::Allow(DetectedProtocol::Ws)
         );
+    }
+
+    #[test]
+    fn waits_for_complete_http_headers_before_classifying() {
+        let buf = b"GET / HTTP/1.1\r\nHost: example.com\r\n";
+        assert_eq!(inspect(buf, &opts()), InspectionDecision::NeedMore);
+    }
+
+    #[test]
+    fn websocket_cannot_pass_as_http_from_a_partial_header() {
+        let mut options = opts();
+        options.protocol_inspection_allowed_protocols = vec![AllowedProtocol::Http];
+        let partial = b"GET / HTTP/1.1\r\nHost: example.com\r\n";
+        assert_eq!(inspect(partial, &options), InspectionDecision::NeedMore);
+        let complete = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
+        assert!(matches!(
+            inspect(complete, &options),
+            InspectionDecision::Block {
+                reason: BlockReason::ProtocolNotAllowed
+            }
+        ));
+    }
+
+    #[test]
+    fn waits_for_the_full_tls_record() {
+        let buf = [0x16, 0x03, 0x03, 0x00, 0x20, 0x01];
+        assert_eq!(inspect(&buf, &opts()), InspectionDecision::NeedMore);
     }
 
     #[test]
@@ -331,15 +389,10 @@ mod tests {
     }
 
     #[test]
-    fn quic_initial_blocked_by_default() {
+    fn quic_shape_on_tcp_is_not_classified_as_h3() {
         let buf = [0xC0u8; 64];
         let r = inspect(&buf, &opts());
-        assert!(matches!(
-            r,
-            InspectionDecision::Block {
-                reason: BlockReason::QuicInitialDisallowed
-            }
-        ));
+        assert_eq!(r, InspectionDecision::NeedMore);
     }
 
     #[test]

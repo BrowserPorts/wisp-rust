@@ -1,31 +1,35 @@
 [wisp.server]
-wisp_version = "v2"
+wisp_version = "auto"
+
+[wisp.auth]
+required            = false
+token_path          = true
+resolver_timeout_ms = 1000
 
 [wisp.destination]
 port_whitelist    = [80, 443]
+host_port_whitelist = [{ host = "highschool-game1.g123-puyo.com", port = 13002 }]
 
-# The distributed Redis limiter is not implemented yet; "redis" is rejected at
-# startup. Use "memory" (per-instance) until it lands. Behind a load balancer,
-# per-IP/global limits are enforced per instance, not shared across the fleet.
 [wisp.rate_limit]
-backend       = "memory"
-redis_fail_open = false
+backend = "memory"
 
 [wisp_websocket]
 enabled               = true
 host                  = "0.0.0.0"
 port                  = 4242
 endpoint              = "/wisp/"
+cert_path             = "/etc/wispd/tls/fullchain.pem"
+key_path              = "/etc/wispd/tls/privkey.pem"
 proxy_control_enabled = true
-plain                 = true
+ingress_mode          = "direct_tls"
 
 [wisp_proxy_control]
 enabled = true
 
 [wisp_proxy_mullvad]
-enabled          = false
-relay_api        = "https://api.mullvad.net/app/v1/relays"
-wireproxy_socks5 = "127.0.0.1:1080"
+enabled          = true
+relay_api        = "https://api.mullvad.net/www/relays/wireguard/"
+wireproxy_socks5 = "127.0.0.1:40000"
 
 [wisp_proxy_resi]
 enabled      = false
