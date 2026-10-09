@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 *.node
+*.dylib
+LICENSE-msquic
+THIRD-PARTY-NOTICES-msquic
 .DS_Store
 dist/
 *.log
@@ -12,4 +15,11 @@ node_modules/
 *.tsbuildinfo
 .env
 .env.*
+.agent/
+.agents/
 .claude/
+.cursor/
+AGENTS.md
+CLAUDE.md
+scripts/
+
