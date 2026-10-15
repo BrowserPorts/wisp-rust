@@ -27,3 +27,6 @@ http-body-util = { workspace = true }
 tokio-websockets = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["client"] }

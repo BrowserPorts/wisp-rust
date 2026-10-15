@@ -270,3 +270,94 @@ fn text_body(text: &'static str) -> Body {
         .map_err(|never| match never {})
         .boxed()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accept_h2_connection;
+    use hyper_util::rt::TokioExecutor;
+    use wisp_config::WispServerOptions;
+    use wisp_dos::{ConnectionLimiter, DosGuard};
+    use wisp_iphash::{hash_client_ip, IpHashBans};
+    use wisp_reports::{set_report_hook, Report};
+
+    type Client = hyper::client::conn::http2::SendRequest<Empty<Bytes>>;
+
+    fn context(ip_bans: Arc<IpHashBans>) -> Arc<H2ServeContext> {
+        let mut options = WispServerOptions {
+            block_blank_origins: false,
+            ..WispServerOptions::default()
+        };
+        options.auth.required = false;
+        Arc::new(
+            H2ServeContext::with_template_and_auth(
+                Arc::new(options),
+                false,
+                None,
+                wisp_config::WispAuthRegistry::default(),
+                Arc::new(DosGuard::new()),
+                Arc::new(ConnectionLimiter::new()),
+            )
+            .with_ip_bans(ip_bans),
+        )
+    }
+
+    /// An in-process HTTP/2 client wired straight into the server's
+    /// per-connection driver, as the post-TLS stream the listener would hand it.
+    async fn connect(ctx: Arc<H2ServeContext>) -> Client {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(accept_h2_connection(server_io, "127.0.0.1".to_owned(), ctx));
+        let (client, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(client_io))
+            .await
+            .expect("h2 client handshake");
+        tokio::spawn(connection);
+        client
+    }
+
+    /// Send the extended CONNECT a browser sends and return the status. The
+    /// server's SETTINGS may not have arrived yet, so retry while the client
+    /// still refuses to send `:protocol`.
+    async fn extended_connect(client: &mut Client) -> StatusCode {
+        for _ in 0..50 {
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri("https://localhost/wisp")
+                .extension(Protocol::from_static("websocket"))
+                .body(Empty::<Bytes>::new())
+                .expect("build extended CONNECT");
+            match client.send_request(request).await {
+                Ok(response) => return response.status(),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        panic!("extended CONNECT never reached the server");
+    }
+
+    #[tokio::test]
+    async fn refuses_banned_client_with_403_and_reports_it() {
+        let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+        set_report_hook(Some(Arc::new(move |report: &Report| {
+            if report.error_type == ReportErrorType::IpHashBanned {
+                let _ = report_tx.send(report.ip_hash.clone());
+            }
+        })));
+
+        let bans = Arc::new(IpHashBans::new());
+        let ctx = context(bans.clone());
+
+        let mut client = connect(ctx.clone()).await;
+        assert_eq!(extended_connect(&mut client).await, StatusCode::OK);
+
+        let banned = hash_client_ip(Some("127.0.0.1"), None).unwrap();
+        bans.replace([banned.clone()]);
+        let mut client = connect(ctx.clone()).await;
+        assert_eq!(extended_connect(&mut client).await, StatusCode::FORBIDDEN);
+        assert_eq!(report_rx.recv().await, Some(Some(banned)));
+
+        bans.replace(Vec::<String>::new());
+        let mut client = connect(ctx).await;
+        assert_eq!(extended_connect(&mut client).await, StatusCode::OK);
+        set_report_hook(None);
+    }
+}
