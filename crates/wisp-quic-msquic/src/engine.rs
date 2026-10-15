@@ -84,10 +84,15 @@ impl Default for EngineConfig {
 }
 
 /// Owned msquic bootstrap. Hold one per process; drop to tear down.
+///
+/// Field order is load-bearing: msquic's `RegistrationClose` blocks until every
+/// configuration, listener and connection opened under it is closed, so the
+/// registration has to be dropped after the configurations. Declared the other
+/// way round, dropping the engine hangs forever.
 pub struct MsQuicEngine {
-    pub registration: Arc<Registration>,
     pub configuration: Arc<Configuration>,
     pub client_configuration: Arc<Configuration>,
+    pub registration: Arc<Registration>,
 }
 
 impl MsQuicEngine {
@@ -124,9 +129,9 @@ impl MsQuicEngine {
             .map_err(EngineError::Credentials)?;
 
         Ok(Self {
-            registration: Arc::new(registration),
             configuration: Arc::new(configuration),
             client_configuration: Arc::new(client_configuration),
+            registration: Arc::new(registration),
         })
     }
 

@@ -101,9 +101,15 @@ pub enum ServeError {
 
 /// Live serve state. Drop, or call [`ServeHandle::shutdown`], to stop the
 /// listener and let in-flight sessions finish.
+///
+/// Teardown blocks until msquic has closed every connection, so it needs other
+/// runtime threads to drop the cancelled sessions: call it from a multi-thread
+/// runtime or off the runtime.
 pub struct ServeHandle {
-    _engine: Arc<MsQuicEngine>,
+    // The listener must close before the engine: the engine's registration
+    // waits for every listener and connection opened under it.
     listener: Listener,
+    _engine: Arc<MsQuicEngine>,
     cancel: CancellationToken,
 }
 
@@ -243,8 +249,8 @@ pub async fn serve(
     ));
 
     Ok(ServeHandle {
-        _engine: engine,
         listener,
+        _engine: engine,
         cancel,
     })
 }
