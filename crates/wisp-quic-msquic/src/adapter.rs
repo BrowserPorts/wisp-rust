@@ -43,6 +43,7 @@ use msquic::{
 };
 use parking_lot::{Mutex, RwLock};
 use std::{
+    collections::HashSet,
     ffi::c_void,
     future::Future,
     net::SocketAddr,
@@ -170,19 +171,106 @@ impl FinState {
     }
 }
 
-fn submit_stream_send(stream: &Stream, item: &SendItem) -> Result<(), Status> {
+/// Everything msquic reads after `StreamSend` or `DatagramSend` has returned.
+///
+/// Both calls keep the pointer to the `QUIC_BUFFER` array instead of copying
+/// it (`SendRequest->Buffers = Buffers` in msquic's api.c), and a worker
+/// thread reads the array, and the bytes it describes, later on: until
+/// SEND_COMPLETE for a stream, until the final state change for a datagram. A
+/// descriptor on the caller's stack dangles the moment the call returns, so
+/// msquic copied from whatever the stack held next. A garbage length overruns
+/// its send buffer, which corrupted the heap and crashed unrelated code in the
+/// process (rustls, `bytes`) as SIGSEGV or SIGBUS.
+///
+/// The descriptor and the payload therefore share one heap allocation, handed
+/// to msquic as the client context and released when msquic returns it.
+struct PinnedSend {
+    descriptor: [msquic::BufferRef; 1],
+    /// Owns the memory `descriptor` points at.
+    payload: Bytes,
+}
+
+impl PinnedSend {
+    /// Pin `payload` and return the address to pass as the client context.
+    fn pin(payload: Bytes) -> *mut Self {
+        let descriptor = [msquic::BufferRef::from(payload.as_ref())];
+        Box::into_raw(Box::new(Self {
+            descriptor,
+            payload,
+        }))
+    }
+
+    /// The buffers to pass to msquic: none for an empty payload, which is how a
+    /// FIN-only send is expressed.
+    ///
+    /// # Safety
+    /// `pinned` must come from [`PinnedSend::pin`] and not have been released.
+    unsafe fn buffers<'a>(pinned: *const Self) -> &'a [msquic::BufferRef] {
+        let this = unsafe { &*pinned };
+        &this.descriptor[..usize::from(!this.payload.is_empty())]
+    }
+}
+
+/// Sends msquic has not completed yet, by address. They normally leave through
+/// [`InFlightSends::complete`]. A handle closed before msquic reports
+/// completion never gets that event, so [`ReleaseInFlight`] frees what is left
+/// once the handle's callback context is dropped, which happens after the
+/// close call has returned and msquic no longer touches the buffers.
+#[derive(Default)]
+struct InFlightSends(Mutex<HashSet<usize>>);
+
+impl InFlightSends {
+    fn track(&self, pinned: *mut PinnedSend) {
+        self.0.lock().insert(pinned as usize);
+    }
+
+    /// Release a send msquic completed. Does nothing for an address that is
+    /// not tracked, so the box can never be freed twice.
+    fn complete(&self, client_context: *const c_void) {
+        if self.0.lock().remove(&(client_context as usize)) {
+            // SAFETY: the address came from `PinnedSend::pin` and was still
+            // tracked, so this is its only release.
+            unsafe { drop(Box::from_raw(client_context as *mut PinnedSend)) };
+        }
+    }
+
+    fn release_all(&self) {
+        for address in self.0.lock().drain() {
+            // SAFETY: as in `complete`; draining removes the only record.
+            unsafe { drop(Box::from_raw(address as *mut PinnedSend)) };
+        }
+    }
+}
+
+/// Moved into a handle's callback closure so the leftovers are released when
+/// the closure, and with it the handle's context, is dropped.
+struct ReleaseInFlight(Arc<InFlightSends>);
+
+impl Drop for ReleaseInFlight {
+    fn drop(&mut self) {
+        self.0.release_all();
+    }
+}
+
+fn submit_stream_send(
+    stream: &Stream,
+    sends: &InFlightSends,
+    item: &SendItem,
+) -> Result<(), Status> {
     let mut flags = SendFlags::NONE;
     if item.fin {
         flags |= SendFlags::FIN;
     }
-    let leaked: *const Bytes = Box::into_raw(Box::new(item.bytes.clone()));
-    let buf = msquic::BufferRef::from(item.bytes.as_ref());
-    let bufs = [buf];
-    // SAFETY: the buffer references the boxed Bytes, which is released by
-    let result = unsafe { stream.send(&bufs, flags, leaked.cast()) };
+    let pinned = PinnedSend::pin(item.bytes.clone());
+    // Tracked before the call: SEND_COMPLETE can fire on a worker thread
+    // before `send` returns.
+    sends.track(pinned);
+    // SAFETY: `pinned` stays allocated until `complete` or `release_all`, which
+    // only run after msquic reports the send finished or the handle is closed.
+    let result = unsafe { stream.send(PinnedSend::buffers(pinned), flags, pinned.cast()) };
     if result.is_err() {
-        // SAFETY: matches the Box::into_raw above.
-        unsafe { drop(Box::from_raw(leaked as *mut Bytes)) };
+        // msquic does not report completion for a send it refused.
+        sends.complete(pinned.cast());
     }
     result
 }
@@ -201,6 +289,8 @@ pub(crate) struct ConnectionState {
     /// `ConnectionErrorIncoming` to h3.
     closed: Arc<RwLock<Option<ConnectionErrorIncoming>>>,
     datagram_cancel: CancellationToken,
+    /// Datagrams handed to msquic and not yet in a final state.
+    datagram_sends: Arc<InFlightSends>,
     connected: AtomicBool,
     connected_notify: Notify,
     /// Runtime that owns this connection's async side. msquic delivers events
@@ -275,6 +365,7 @@ impl MsQuicConnection {
             datagram_tx,
             closed: Arc::new(RwLock::new(None)),
             datagram_cancel: CancellationToken::new(),
+            datagram_sends: Arc::default(),
             connected: AtomicBool::new(false),
             connected_notify: Notify::new(),
             runtime,
@@ -284,7 +375,10 @@ impl MsQuicConnection {
         let cb_conn = connection.clone();
         let cb_max = max_datagram_size.clone();
         let cb_enabled = datagram_send_enabled.clone();
+        let release_datagrams = ReleaseInFlight(state.datagram_sends.clone());
         connection.set_callback_handler(move |_conn_ref, event| {
+            // Lives and dies with the connection's callback context.
+            let _ = &release_datagrams;
             let hook = std::panic::AssertUnwindSafe(|| {
                 on_connection_event(&cb_state, &cb_conn, &cb_max, &cb_enabled, event);
             });
@@ -356,6 +450,7 @@ async fn wait_for_connected(state: &ConnectionState) -> Result<(), AdapterError>
 
 fn send_datagram_inner(
     connection: &Arc<Connection>,
+    sends: &InFlightSends,
     enabled: &RwLock<bool>,
     max_size: &RwLock<u16>,
     payload: Bytes,
@@ -372,13 +467,18 @@ fn send_datagram_inner(
     if matches!(class, DatagramClass::Interactive) {
         flags |= SendFlags::DGRAM_PRIORITY;
     }
-    let leaked: *const Bytes = Box::into_raw(Box::new(payload.clone()));
-    let buf = msquic::BufferRef::from(payload.as_ref());
-    let bufs = [buf];
-    let res = unsafe { connection.datagram_send(&bufs, flags, leaked as *const c_void) };
+    let pinned = PinnedSend::pin(payload);
+    // Tracked before the call, as for streams: the final state change can
+    // arrive on a worker thread before `datagram_send` returns.
+    sends.track(pinned);
+    // SAFETY: `pinned` stays allocated until the final state change or the
+    // connection handle is closed; see `PinnedSend`.
+    let res = unsafe {
+        connection.datagram_send(PinnedSend::buffers(pinned), flags, pinned as *const c_void)
+    };
     if let Err(e) = res {
-        // SAFETY: matches the Box::into_raw above; we own the alloc.
-        unsafe { drop(Box::from_raw(leaked as *mut Bytes)) };
+        // msquic reports nothing for a datagram it refused.
+        sends.complete(pinned as *const c_void);
         return Err(AdapterError::MsQuic(e));
     }
     Ok(())
@@ -435,18 +535,17 @@ fn on_connection_event(
         }
         ConnectionEvent::DatagramSendStateChanged {
             client_context,
-            state,
+            state: send_state,
         } => {
             use msquic::DatagramSendState::{
                 Acknowledged, AcknowledgedSpurious, Canceled, LostDiscarded,
             };
             let is_final = matches!(
-                state,
+                send_state,
                 Acknowledged | AcknowledgedSpurious | LostDiscarded | Canceled
             );
             if is_final && !client_context.is_null() {
-                // SAFETY: pointer came from Box::into_raw in send_datagram_inner.
-                unsafe { drop(Box::from_raw(client_context as *mut Bytes)) };
+                state.datagram_sends.complete(client_context);
             }
         }
         ConnectionEvent::ShutdownInitiatedByPeer { error_code } => {
@@ -495,8 +594,14 @@ fn install_stream(
     state.streams.insert(stream_id, chans);
 
     let cb_state = state.clone();
+    let sends = Arc::new(InFlightSends::default());
+    let cb_sends = sends.clone();
+    let release_sends = ReleaseInFlight(sends.clone());
     stream.set_callback_handler(move |_, ev| {
-        let hook = std::panic::AssertUnwindSafe(|| on_stream_event(&cb_state, stream_id, ev));
+        // Lives and dies with the stream's callback context.
+        let _ = &release_sends;
+        let hook =
+            std::panic::AssertUnwindSafe(|| on_stream_event(&cb_state, &cb_sends, stream_id, ev));
         match std::panic::catch_unwind(hook) {
             Ok(result) => result,
             Err(_) => {
@@ -512,7 +617,7 @@ fn install_stream(
     state.runtime.spawn(async move {
         while let Some(item) = send_rx.recv().await {
             let completed = send_complete.notified();
-            if submit_stream_send(&send_stream, &item).is_err() {
+            if submit_stream_send(&send_stream, &sends, &item).is_err() {
                 break;
             }
             completed.await;
@@ -530,13 +635,13 @@ fn install_stream(
 
 fn on_stream_event(
     state: &ConnectionState,
+    sends: &InFlightSends,
     key: u64,
     event: StreamEvent<'_>,
 ) -> Result<(), Status> {
     if let StreamEvent::SendComplete { client_context, .. } = event {
         if !client_context.is_null() {
-            // SAFETY: pointer came from Box::into_raw in the send worker.
-            unsafe { drop(Box::from_raw(client_context as *mut Bytes)) };
+            sends.complete(client_context);
         }
         if let Some(chans) = state.streams.get(&key) {
             chans.send_complete.notify_one();
@@ -1063,6 +1168,7 @@ impl quic::Connection<Bytes> for MsQuicConnection {
 #[derive(Clone)]
 pub struct MsQuicDatagramSender {
     connection: Arc<Connection>,
+    sends: Arc<InFlightSends>,
     enabled: Arc<RwLock<bool>>,
     max_size: Arc<RwLock<u16>>,
 }
@@ -1109,6 +1215,7 @@ impl SendDatagram<Bytes> for MsQuicDatagramSender {
         let class = encoded_datagram_class(&payload);
         send_datagram_inner(
             &self.connection,
+            &self.sends,
             &self.enabled,
             &self.max_size,
             payload,
@@ -1164,6 +1271,7 @@ impl DatagramConnectionExt<Bytes> for MsQuicConnection {
     fn send_datagram_handler(&self) -> Self::SendDatagramHandler {
         MsQuicDatagramSender {
             connection: self.connection.clone(),
+            sends: self.state.datagram_sends.clone(),
             enabled: self.datagram_send_enabled.clone(),
             max_size: self.max_datagram_size.clone(),
         }
@@ -1197,6 +1305,7 @@ mod tests {
             datagram_tx,
             closed: Arc::new(RwLock::new(None)),
             datagram_cancel: CancellationToken::new(),
+            datagram_sends: Arc::default(),
             connected: AtomicBool::new(false),
             connected_notify: Notify::new(),
             runtime: tokio::runtime::Handle::current(),
