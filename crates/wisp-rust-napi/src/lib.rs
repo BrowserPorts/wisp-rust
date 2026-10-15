@@ -3,18 +3,20 @@ use std::path::Path;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::{Function, Promise};
-use napi::threadsafe_function::ThreadsafeFunction;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
 use wisp_config::{
-    build_wisp_wt_options, parse_toml, WispAuthResolveFuture, WispAuthResolver,
-    WispAuthTokenPolicy, WispServerOptions, WispWtConfigToml, WispWtServerOptions,
-    WISP_BASE_LIMIT_PROFILE,
+    build_wisp_wt_options, minus_one_to_unlimited, parse_toml, unlimited_to_minus_one,
+    WispAuthResolveFuture, WispAuthResolver, WispAuthTokenPolicy, WispServerOptions,
+    WispWtConfigToml, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
 use wisp_core::{Runtime, RuntimeConfig, ServeHandle};
+use wisp_iphash::IpHashBans;
+use wisp_reports::{set_report_hook, Report};
 use wisp_wisp_server::{
     ProxyControlLimits, ProxyControlRequest, ProxyControllerTemplate, ProxyRouteConfig,
     ProxyRuntimePolicy,
@@ -38,7 +40,42 @@ struct WispRustState {
     configured_limit_profiles: HashMap<String, WispServerOptions>,
     pending_policy: ProxyRuntimePolicy,
     pending_blocked_ips: HashSet<String>,
+    /// Banned client IP hashes. Owned here, not by the runtime, so bans set
+    /// before `start()` apply from the first connection and survive a restart.
+    ip_bans: Arc<IpHashBans>,
 }
+
+/// One emitted report as the JS callback receives it. Absent values arrive as
+/// `null`, not `undefined`.
+#[napi(object, use_nullable = true)]
+pub struct WispReport {
+    /// Stable report code such as `WISP_IP_HASH_BANNED`.
+    pub code: String,
+    /// Snake_case name of the report type such as `ip_hash_banned`.
+    pub kind: String,
+    pub ip_hash: Option<String>,
+    /// Unix time in milliseconds.
+    pub at: i64,
+    /// `key=value` summary of whatever the report carries, or `null`.
+    pub detail: Option<String>,
+}
+
+impl From<&Report> for WispReport {
+    fn from(report: &Report) -> Self {
+        Self {
+            code: report.report_code.to_owned(),
+            kind: report.error_type.kind().to_owned(),
+            ip_hash: report.ip_hash.clone(),
+            at: report.occurred_at,
+            detail: report.detail(),
+        }
+    }
+}
+
+/// Weak, so a registered callback never keeps the process alive, and bounded,
+/// so a slow JS thread drops reports instead of growing a queue behind a flood.
+type ReportCallback =
+    Arc<ThreadsafeFunction<WispReport, (), WispReport, Status, false, true, 1024>>;
 
 type AuthHandler = Arc<ThreadsafeFunction<String, Promise<Value>, String, Status, false>>;
 
@@ -83,6 +120,7 @@ impl WispRustState {
             configured_limit_profiles: HashMap::new(),
             pending_policy: ProxyRuntimePolicy::default(),
             pending_blocked_ips: HashSet::new(),
+            ip_bans: Arc::new(IpHashBans::new()),
         }
     }
 }
@@ -136,7 +174,9 @@ impl WispRust {
             if guard.runtime.is_some() {
                 return Ok(status_value(&guard));
             }
-            let runtime = Runtime::start(guard.config.clone()).map_err(js_err)?;
+            let runtime = Runtime::start(guard.config.clone())
+                .map_err(js_err)?
+                .with_ip_bans(guard.ip_bans.clone());
             let template = runtime.proxy_template();
             apply_configured_auth(&runtime, &guard)?;
             if let Some(template) = template.as_ref() {
@@ -197,6 +237,50 @@ impl WispRust {
     #[napi]
     pub fn status(&self) -> Value {
         status_value(&self.state.lock())
+    }
+
+    // Replace the whole banned-IP-hash set. Applies to the next connection on
+    // every transport, before or after `start()`, with no restart.
+    #[napi(ts_return_type = "{ count: number }")]
+    pub fn set_banned_ip_hashes(&self, hashes: Vec<String>) -> Value {
+        let count = self.state.lock().ip_bans.replace(hashes);
+        json!({ "count": count })
+    }
+
+    #[napi]
+    pub fn banned_ip_hashes(&self) -> Vec<String> {
+        let mut hashes: Vec<String> = self
+            .state
+            .lock()
+            .ip_bans
+            .snapshot()
+            .iter()
+            .cloned()
+            .collect();
+        hashes.sort();
+        hashes
+    }
+
+    // Receive every emitted report. Replaces any earlier callback. Calls are
+    // queued without blocking the connection path and dropped if the queue
+    // is full. The hook is process-wide, like the report log target.
+    #[napi(ts_args_type = "callback: (report: WispReport) => void")]
+    pub fn on_report(&self, callback: Function<'_, WispReport, ()>) -> Result<()> {
+        let sink: ReportCallback = Arc::new(
+            callback
+                .build_threadsafe_function::<WispReport>()
+                .weak::<true>()
+                .max_queue_size::<1024>()
+                .build()?,
+        );
+        // The hook owns the callback, so replacing the hook releases the old one.
+        set_report_hook(Some(Arc::new(move |report: &Report| {
+            sink.call(
+                WispReport::from(report),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        })));
+        Ok(())
     }
 
     #[napi]
@@ -400,7 +484,7 @@ impl WispRust {
 
     #[napi]
     pub fn get_limits(&self) -> Value {
-        json!(current_base_limits(&self.state.lock()))
+        limits_to_js(&current_base_limits(&self.state.lock()))
     }
 
     #[napi]
@@ -411,7 +495,7 @@ impl WispRust {
         if let Some(runtime) = guard.runtime.as_ref() {
             runtime.register_limit_profile(WISP_BASE_LIMIT_PROFILE.to_owned(), next.clone());
         }
-        Ok(json!(next))
+        Ok(limits_to_js(&next))
     }
 
     #[napi]
@@ -437,7 +521,7 @@ impl WispRust {
         }
         Ok(json!({
             "name": name,
-            "limits": next,
+            "limits": limits_to_js(&next),
         }))
     }
 
@@ -452,13 +536,13 @@ impl WispRust {
         if let Some(runtime) = guard.runtime.as_ref() {
             runtime
                 .limit_profile(&name)
-                .map(|limits| json!(limits))
+                .map(|limits| limits_to_js(&limits))
                 .unwrap_or(Value::Null)
         } else {
             guard
                 .configured_limit_profiles
                 .get(&name)
-                .map(|limits| json!(limits))
+                .map(limits_to_js)
                 .unwrap_or(Value::Null)
         }
     }
@@ -473,7 +557,7 @@ impl WispRust {
                 .map(|(name, limits)| {
                     json!({
                         "name": name,
-                        "limits": limits,
+                        "limits": limits_to_js(&limits),
                     })
                 })
                 .collect();
@@ -485,7 +569,7 @@ impl WispRust {
                 .map(|(name, limits)| {
                     json!({
                         "name": name,
-                        "limits": limits,
+                        "limits": limits_to_js(limits),
                     })
                 })
                 .collect();
@@ -686,7 +770,15 @@ fn set_config_base_limits(state: &mut WispRustState, options: WispServerOptions)
         .insert(WISP_BASE_LIMIT_PROFILE.to_owned(), options);
 }
 
-fn patch_wisp_options(base: &WispServerOptions, patch: Value) -> Result<WispServerOptions> {
+/// Serialize options for JS, reporting the no-cap sentinel as `-1`.
+fn limits_to_js(options: &WispServerOptions) -> Value {
+    let mut value = serde_json::to_value(options).unwrap_or(Value::Null);
+    unlimited_to_minus_one(&mut value);
+    value
+}
+
+fn patch_wisp_options(base: &WispServerOptions, mut patch: Value) -> Result<WispServerOptions> {
+    minus_one_to_unlimited(&mut patch);
     let mut merged = serde_json::to_value(base).map_err(js_err)?;
     merge_json(&mut merged, patch);
     let options: WispServerOptions = serde_json::from_value(merged).map_err(js_err)?;
@@ -730,6 +822,9 @@ fn status_value(state: &WispRustState) -> Value {
         "configuredAuthTokens": state.configured_auth_tokens.len(),
         "authHandlerConfigured": state.configured_auth_handler.is_some(),
         "configuredLimitProfiles": state.configured_limit_profiles.len(),
+        "connections": {
+            "active": state.runtime.as_ref().map(|r| r.active_connections()).unwrap_or(0),
+        },
         "boundUrls": bound_urls(&state.config),
     })
 }

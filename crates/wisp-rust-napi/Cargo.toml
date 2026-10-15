@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 wisp-config = { path = "../wisp-config" }
+wisp-iphash = { path = "../wisp-iphash" }
+wisp-reports = { path = "../wisp-reports" }
 wisp-core = { path = "../wisp-core", default-features = false, features = ["ws", "quic"] }
 wisp-wisp-server = { path = "../wisp-wisp-server" }
 

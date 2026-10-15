@@ -8,28 +8,47 @@ export declare class WispRust {
   start(): Promise<any>
   stop(): Promise<any>
   status(): any
-  boundUrls(): Array<string>
-  setRoute(route: any): Promise<any>
-  removeRoute(routeId: string): any
-  listRoutes(): any
-  rotateRoute(routeId: string): Promise<any | null>
-  locations(provider?: string | undefined | null): Promise<any>
-  refreshLocations(provider?: string | undefined | null): Promise<any>
-  providerStatus(): any
-  egressInventory(): any
-  blockEgressIp(ip: string): any
-  releaseEgressIp(ip: string): any
-  getPolicy(): any
-  setPolicy(policy: any): any
-  getLimits(): any
-  patchLimits(patch: any): any
-  setLimitProfile(name: string, limits: any): any
-  patchLimitProfile(name: string, patch: any): any
-  limitProfile(name: string): any
-  listLimitProfiles(): any
-  registerAuthToken(token: string, policy: any): any
-  revokeAuthToken(token: string): any
-  listAuthTokens(): any
-  setAuthTokenHandler(handler?: ((arg: string) => Promise<any>) | undefined | null): any
-  authTokenPolicy(token: string): any
+setBannedIpHashes(hashes: Array<string>): { count: number }
+bannedIpHashes(): Array<string>
+onReport(callback: (report: WispReport) => void): void
+boundUrls(): Array<string>
+setRoute(route: any): Promise<any>
+removeRoute(routeId: string): any
+listRoutes(): any
+rotateRoute(routeId: string): Promise<any | null>
+locations(provider?: string | undefined | null): Promise<any>
+refreshLocations(provider?: string | undefined | null): Promise<any>
+providerStatus(): any
+egressInventory(): any
+blockEgressIp(ip: string): any
+releaseEgressIp(ip: string): any
+getPolicy(): any
+setPolicy(policy: any): any
+getLimits(): any
+patchLimits(patch: any): any
+setLimitProfile(name: string, limits: any): any
+patchLimitProfile(name: string, patch: any): any
+limitProfile(name: string): any
+listLimitProfiles(): any
+registerAuthToken(token: string, policy: any): any
+revokeAuthToken(token: string): any
+listAuthTokens(): any
+setAuthTokenHandler(handler?: ((arg: string) => Promise<any>) | undefined | null): any
+authTokenPolicy(token: string): any
+}
+
+/**
+ * One emitted report as the JS callback receives it. Absent values arrive as
+ * `null`, not `undefined`.
+ */
+export interface WispReport {
+  /** Stable report code such as `WISP_IP_HASH_BANNED`. */
+  code: string
+  /** Snake_case name of the report type such as `ip_hash_banned`. */
+  kind: string
+  ipHash: string | null
+  /** Unix time in milliseconds. */
+  at: number
+  /** `key=value` summary of whatever the report carries, or `null`. */
+  detail: string | null
 }
