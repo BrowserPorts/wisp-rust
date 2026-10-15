@@ -116,6 +116,8 @@ pub enum AdapterError {
     ConnectionShutdown,
     #[error("stream id lookup failed")]
     StreamIdUnavailable,
+    #[error("send_data called before the previous frame was accepted by poll_ready")]
+    NotReady,
 }
 
 #[derive(Clone)]
@@ -201,12 +203,12 @@ pub(crate) struct ConnectionState {
     datagram_cancel: CancellationToken,
     connected: AtomicBool,
     connected_notify: Notify,
-}
-
     /// Runtime that owns this connection's async side. msquic delivers events
     /// on its own worker threads, which have no Tokio context, so anything the
     /// callbacks need to spawn goes through this handle.
     runtime: tokio::runtime::Handle,
+}
+
 impl ConnectionState {
     fn close(&self, err: ConnectionErrorIncoming) {
         {
@@ -275,9 +277,9 @@ impl MsQuicConnection {
             datagram_cancel: CancellationToken::new(),
             connected: AtomicBool::new(false),
             connected_notify: Notify::new(),
+            runtime,
         });
         let connection = Arc::new(connection);
-            runtime,
         let cb_state = state.clone();
         let cb_conn = connection.clone();
         let cb_max = max_datagram_size.clone();
@@ -602,6 +604,10 @@ fn set_stream_priority(stream: &Stream, priority: u16) -> Result<(), AdapterErro
 
 pub struct MsQuicSendStream {
     send_tx: PollSender<SendItem>,
+    /// Frame accepted by `send_data` and not yet handed to the send worker.
+    /// h3 calls `send_data` first and drives it out with `poll_ready`, so the
+    /// frame waits here until the worker queue has room.
+    pending: Option<SendItem>,
     stream: Arc<Stream>,
     stream_id: StreamId,
     fin_sent: bool,
@@ -631,14 +637,44 @@ impl MsQuicRecvStream {
     }
 }
 
+impl MsQuicSendStream {
+    /// Move the frame buffered by `send_data` into the worker queue, waiting for
+    /// room. Ready once nothing is buffered, which keeps queue order intact for
+    /// whatever is sent next.
+    fn poll_flush_pending(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
+        if self.pending.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        match self.send_tx.poll_reserve(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(_)) => return Poll::Ready(Err(stream_unknown(AdapterError::Closed))),
+            Poll::Ready(Ok(())) => {}
+        }
+        let Some(item) = self.pending.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        Poll::Ready(
+            self.send_tx
+                .send_item(item)
+                .map_err(|_| stream_unknown(AdapterError::Closed)),
+        )
+    }
+}
+
 impl H3SendStream<Bytes> for MsQuicSendStream {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-        self.send_tx
-            .poll_reserve(cx)
-            .map_err(|_| stream_unknown(AdapterError::Closed))
+        self.poll_flush_pending(cx)
     }
 
     fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
+        if self.pending.is_some() {
+            // h3 must wait for `poll_ready` between frames; refusing here keeps
+            // a misuse from reordering or dropping data.
+            return Err(stream_unknown(AdapterError::NotReady));
+        }
         let mut wb = data.into();
         let mut acc = BytesMut::with_capacity(wb.remaining());
         while wb.has_remaining() {
@@ -650,16 +686,20 @@ impl H3SendStream<Bytes> for MsQuicSendStream {
         if acc.is_empty() {
             return Ok(());
         }
-        self.send_tx
-            .send_item(SendItem {
-                bytes: acc.freeze(),
-                fin: false,
-            })
-            .map_err(|_| StreamErrorIncoming::Unknown(Box::new(AdapterError::Closed)))
+        self.pending = Some(SendItem {
+            bytes: acc.freeze(),
+            fin: false,
+        });
+        Ok(())
     }
 
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         if !self.fin_sent {
+            match self.poll_flush_pending(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
             match self.send_tx.poll_reserve(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(_)) => {
@@ -687,6 +727,7 @@ impl H3SendStream<Bytes> for MsQuicSendStream {
     }
 
     fn reset(&mut self, reset_code: u64) {
+        self.pending = None;
         let _ = self
             .stream
             .shutdown(StreamShutdownFlags::ABORT_SEND, reset_code);
@@ -784,6 +825,11 @@ impl H3SendStreamUnframed<Bytes> for MsQuicSendStream {
         if !buf.has_remaining() {
             return Poll::Ready(Ok(0));
         }
+        match self.poll_flush_pending(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
         match self.send_tx.poll_reserve(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(_)) => return Poll::Ready(Err(stream_unknown(AdapterError::Closed))),
@@ -863,6 +909,7 @@ fn evt_to_send_stream(evt: NewStreamEvent) -> Result<MsQuicSendStream, AdapterEr
         StreamId::try_from(evt.stream_id).map_err(|_| AdapterError::StreamIdUnavailable)?;
     Ok(MsQuicSendStream {
         send_tx: PollSender::new(evt.send_tx),
+        pending: None,
         stream: evt.stream,
         stream_id,
         fin_sent: false,
@@ -885,6 +932,7 @@ fn evt_to_bidi(evt: NewStreamEvent) -> Result<MsQuicBidiStream, AdapterError> {
         StreamId::try_from(evt.stream_id).map_err(|_| AdapterError::StreamIdUnavailable)?;
     let send = MsQuicSendStream {
         send_tx: PollSender::new(evt.send_tx),
+        pending: None,
         stream: evt.stream.clone(),
         stream_id,
         fin_sent: false,
@@ -1071,7 +1119,7 @@ impl SendDatagram<Bytes> for MsQuicDatagramSender {
             AdapterError::ConnectionShutdown => SendDatagramErrorIncoming::ConnectionError(
                 ConnectionErrorIncoming::ApplicationClose { error_code: 0 },
             ),
-            AdapterError::Closed | AdapterError::StreamIdUnavailable => {
+            AdapterError::Closed | AdapterError::StreamIdUnavailable | AdapterError::NotReady => {
                 SendDatagramErrorIncoming::NotAvailable
             }
             AdapterError::MsQuic(s) => SendDatagramErrorIncoming::ConnectionError(
@@ -1151,6 +1199,7 @@ mod tests {
             datagram_cancel: CancellationToken::new(),
             connected: AtomicBool::new(false),
             connected_notify: Notify::new(),
+            runtime: tokio::runtime::Handle::current(),
         })
     }
 
@@ -1199,7 +1248,6 @@ mod tests {
         let (_tx, rx) = mpsc::channel(1);
         let closed = Arc::new(RwLock::new(Some(
             ConnectionErrorIncoming::ApplicationClose { error_code: 77 },
-            runtime: tokio::runtime::Handle::current(),
         )));
         let cancel = CancellationToken::new();
         let mut receiver = MsQuicDatagramReceiver {
