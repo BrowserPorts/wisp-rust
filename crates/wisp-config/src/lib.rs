@@ -1876,6 +1876,62 @@ pub fn validate_wisp_version_with_proxy_control(
     Ok(())
 }
 
+/// The option fields typed [`Limit`] in the TOML, by their JSON (camelCase)
+/// names. [`WispServerOptions`] stores them as `u64` with `u64::MAX` meaning no
+/// cap, which a JSON caller cannot send exactly (JS reads it back as a BigInt),
+/// so JSON callers spell it `-1`, as TOML does. Other fields keep their own
+/// meaning: `streamLimitPerHost` is an `i64` where `-1` is a real value, and
+/// `maxConnections` uses `0` for unlimited.
+pub const LIMIT_OPTION_FIELDS: &[&str] = &[
+    "maxDnsResolutionsPerIpPerMinute",
+    "maxDnsResolutionsPerMinute",
+    "maxUniqueHostnamesPerIpPerMinute",
+    "maxConnectionStartsPerIpPerMinute",
+    "maxConnectionStartsPerMinute",
+    "maxTcpStreamOpensPerConnectionPerMinute",
+    "maxTcpStreamOpensPerIpPerMinute",
+    "maxTcpBytesPerConnectionPerSecond",
+    "maxTcpBytesPerIpPerSecond",
+    "maxDatagramsPerConnectionPerSecond",
+    "maxDatagramBytesPerConnectionPerSecond",
+    "maxDatagramsPerIpPerSecond",
+    "maxDatagramBytesPerIpPerSecond",
+    "maxControlMessagesPerConnectionPerMinute",
+    "maxControlMessagesPerIpPerMinute",
+    "maxBinaryPacketsPerConnectionPerMinute",
+];
+
+/// In serialized [`WispServerOptions`], report the no-cap sentinel of each
+/// [`LIMIT_OPTION_FIELDS`] entry as `-1`.
+pub fn unlimited_to_minus_one(options: &mut serde_json::Value) {
+    let Some(fields) = options.as_object_mut() else {
+        return;
+    };
+    for name in LIMIT_OPTION_FIELDS {
+        if let Some(field) = fields.get_mut(*name) {
+            if field.as_u64() == Some(u64::MAX) {
+                *field = serde_json::Value::from(-1);
+            }
+        }
+    }
+}
+
+/// In a JSON patch of [`WispServerOptions`], turn `-1` into the no-cap
+/// sentinel for each [`LIMIT_OPTION_FIELDS`] entry and leave every other field
+/// alone.
+pub fn minus_one_to_unlimited(patch: &mut serde_json::Value) {
+    let Some(fields) = patch.as_object_mut() else {
+        return;
+    };
+    for name in LIMIT_OPTION_FIELDS {
+        if let Some(field) = fields.get_mut(*name) {
+            if field.as_i64() == Some(-1) || field.as_f64() == Some(-1.0) {
+                *field = serde_json::Value::from(u64::MAX);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2301,5 +2357,94 @@ mod tests {
         assert!(!reg.register_profile("a/b".to_owned(), WispServerOptions::default()));
         assert!(reg.register_profile("good".to_owned(), WispServerOptions::default()));
         assert!(reg.profile("good").is_some());
+    }
+
+    #[test]
+    fn limit_option_fields_are_all_options_and_match_the_toml_limits() {
+        let serialized = serde_json::to_value(WispServerOptions::default()).unwrap();
+        for name in LIMIT_OPTION_FIELDS {
+            assert!(serialized.get(*name).is_some(), "{name} is not an option");
+        }
+        // Every `Limit` in the TOML sections must be listed, so a new one
+        // cannot silently miss the -1 mapping.
+        let toml_limits = [
+            "max_dns_resolutions_per_ip_per_minute",
+            "max_dns_resolutions_per_minute",
+            "max_unique_hostnames_per_ip_per_minute",
+            "max_connection_starts_per_ip_per_minute",
+            "max_connection_starts_per_minute",
+            "max_tcp_stream_opens_per_connection_per_minute",
+            "max_tcp_stream_opens_per_ip_per_minute",
+            "max_tcp_bytes_per_connection_per_second",
+            "max_tcp_bytes_per_ip_per_second",
+            "max_datagrams_per_connection_per_second",
+            "max_datagram_bytes_per_connection_per_second",
+            "max_datagrams_per_ip_per_second",
+            "max_datagram_bytes_per_ip_per_second",
+            "max_control_messages_per_connection_per_minute",
+            "max_control_messages_per_ip_per_minute",
+            "max_binary_packets_per_connection_per_minute",
+        ];
+        assert_eq!(toml_limits.len(), LIMIT_OPTION_FIELDS.len());
+        let source = include_str!("lib.rs");
+        for snake in toml_limits {
+            assert!(
+                source.contains(&format!("pub {snake}: Option<Limit>,")),
+                "{snake} is not a Limit in the TOML"
+            );
+            let camel: String = snake
+                .split('_')
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == 0 {
+                        part.to_owned()
+                    } else {
+                        part[..1].to_uppercase() + &part[1..]
+                    }
+                })
+                .collect();
+            assert!(LIMIT_OPTION_FIELDS.contains(&camel.as_str()), "{camel}");
+        }
+    }
+
+    #[test]
+    fn patch_minus_one_means_unlimited_for_limit_fields_only() {
+        let mut patch = serde_json::json!({
+            "maxTcpBytesPerIpPerSecond": -1,
+            "maxConnectionStartsPerMinute": -1.0,
+            "maxDnsResolutionsPerMinute": -1,
+            "streamLimitPerHost": -1,
+            "maxDatagramsPerIpPerSecond": 7,
+            "maxConnections": -1,
+        });
+        minus_one_to_unlimited(&mut patch);
+        assert_eq!(patch["maxTcpBytesPerIpPerSecond"], u64::MAX);
+        assert_eq!(patch["maxConnectionStartsPerMinute"], u64::MAX);
+        assert_eq!(patch["maxDnsResolutionsPerMinute"], u64::MAX);
+        assert_eq!(patch["streamLimitPerHost"], -1);
+        assert_eq!(patch["maxDatagramsPerIpPerSecond"], 7);
+        assert_eq!(
+            patch["maxConnections"], -1,
+            "plain counters keep their value"
+        );
+    }
+
+    #[test]
+    fn reported_sentinel_is_minus_one_and_round_trips() {
+        let options = WispServerOptions {
+            max_tcp_bytes_per_ip_per_second: u64::MAX,
+            max_connection_starts_per_minute: 30,
+            stream_limit_per_host: -1,
+            ..WispServerOptions::default()
+        };
+        let mut reported = serde_json::to_value(&options).unwrap();
+        unlimited_to_minus_one(&mut reported);
+        assert_eq!(reported["maxTcpBytesPerIpPerSecond"], -1);
+        assert_eq!(reported["maxConnectionStartsPerMinute"], 30);
+        assert_eq!(reported["streamLimitPerHost"], -1);
+
+        minus_one_to_unlimited(&mut reported);
+        let back: WispServerOptions = serde_json::from_value(reported).unwrap();
+        assert_eq!(back, options);
     }
 }
