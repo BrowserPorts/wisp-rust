@@ -3,7 +3,7 @@
 //! Transport tuning lives here:
 //! - BBR (CongestionControlAlgorithm = 1).
 //! - RFC 9221 datagrams enabled.
-//! - 64 MiB connection flow-control window, 6 MiB per-stream recv window.
+//! - 64 MiB connection flow-control window, 8 MiB per-stream recv window.
 //! - Pacing + send buffering on.
 //! - MTU discovery 1248..1500.
 //! - LowLatency execution profile.
@@ -42,7 +42,8 @@ pub struct EngineConfig {
     pub peer_bidi_stream_count: u16,
     /// Peer-initiated uni streams allowed per connection.
     pub peer_unidi_stream_count: u16,
-    /// Per-stream recv window (bytes).
+    /// Per-stream recv window (bytes). msquic rejects any value that is not a
+    /// power of two, which fails `Configuration::open` outright.
     pub stream_recv_window_default: u32,
     /// Per-connection flow-control window (bytes).
     pub conn_flow_control_window: u32,
@@ -65,7 +66,14 @@ impl Default for EngineConfig {
             key_path: String::new(),
             peer_bidi_stream_count: 4096,
             peer_unidi_stream_count: 1024,
-            stream_recv_window_default: 6 * 1024 * 1024,
+            // The tuning target was 6 MiB, but msquic only accepts powers of two
+            // here (settings.c, "Must be power of 2"). Round up to 8 MiB rather
+            // than down to 4 MiB: the window is only a flow-control ceiling, the
+            // receive buffer grows with what actually arrives, and the 64 MiB
+            // connection window still bounds the total in flight. Rounding down
+            // would cap a single stream below the intended bandwidth-delay
+            // product on long paths.
+            stream_recv_window_default: 8 * 1024 * 1024,
             conn_flow_control_window: 64 * 1024 * 1024,
             idle_timeout_ms: 60_000,
             keep_alive_interval_ms: 15_000,
@@ -166,7 +174,7 @@ mod tests {
         let raw = s.as_ffi_ref();
         assert_eq!(raw.PeerBidiStreamCount, 4096);
         assert_eq!(raw.PeerUnidiStreamCount, 1024);
-        assert_eq!(raw.StreamRecvWindowDefault, 6 * 1024 * 1024);
+        assert_eq!(raw.StreamRecvWindowDefault, 8 * 1024 * 1024);
         assert_eq!(raw.ConnFlowControlWindow, 64 * 1024 * 1024);
         assert_eq!(raw.IdleTimeoutMs, 60_000);
         assert_eq!(raw.KeepAliveIntervalMs, 15_000);
@@ -176,5 +184,20 @@ mod tests {
         assert_eq!(raw.MaximumMtu, 1500);
         assert_eq!(raw.CongestionControlAlgorithm, BBR_ALGO);
         assert_eq!(raw.ServerResumptionLevel(), 1);
+    }
+
+    #[test]
+    fn default_settings_are_accepted_by_msquic() {
+        // msquic validates settings when the configuration opens, so this fails
+        // with QUIC_STATUS_INVALID_PARAMETER if a window is not a power of two.
+        let cfg = EngineConfig::default();
+        assert!(cfg.stream_recv_window_default.is_power_of_two());
+        let registration =
+            Registration::new(&RegistrationConfig::new().set_app_name("wisp-test".to_owned()))
+                .expect("registration opens");
+        let settings = transport_settings(&cfg);
+        let alpn = [BufferRef::from(ALPN_H3)];
+        Configuration::open(&registration, &alpn, Some(&settings))
+            .expect("msquic accepts the default transport settings");
     }
 }
