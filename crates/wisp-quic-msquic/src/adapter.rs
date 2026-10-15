@@ -50,7 +50,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
 };
@@ -511,7 +511,11 @@ fn on_connection_event(
                 tracing::warn!("dropping peer stream with unresolvable id");
                 return;
             };
-            let evt = install_stream(state.clone(), owned, kind, stream_id);
+            let parts = new_stream_parts();
+            // A peer stream has no handler yet, so installing the real one here
+            // cannot race a callback that is already running.
+            owned.set_callback_handler(stream_callback(state.clone(), parts.binding.clone()));
+            let evt = start_stream(state, owned, parts, stream_id);
             let tx = match kind {
                 NewStreamKind::Bidi => &state.new_bidi_tx,
                 NewStreamKind::Uni => &state.new_uni_tx,
@@ -577,42 +581,88 @@ fn on_connection_event(
     }
 }
 
-fn install_stream(
-    state: Arc<ConnectionState>,
-    stream: Arc<Stream>,
-    _kind: NewStreamKind,
-    stream_id: u64,
-) -> NewStreamEvent {
-    let (recv_tx, recv_rx) = mpsc::channel(STREAM_RECEIVE_QUEUE_CAPACITY);
-    let (send_tx, mut send_rx) = mpsc::channel::<SendItem>(STREAM_SEND_QUEUE_CAPACITY);
-    let fin_state = Arc::new(FinState::new());
-    let send_complete = Arc::new(Notify::new());
-    let chans = StreamChans {
-        recv_tx,
-        fin_state: fin_state.clone(),
-        send_complete: send_complete.clone(),
-    };
-    state.streams.insert(stream_id, chans);
+/// Per-stream callback state. Built before the stream exists so a locally
+/// opened stream receives its real handler from `StreamOpen`: replacing the
+/// handler afterwards would free the old callback context while an msquic
+/// worker thread may still be running it.
+///
+/// It deliberately holds no `recv_tx`. The callback context lives until the
+/// stream handle is closed, and a sender kept there would keep the receiving
+/// half from ever seeing the channel close once the stream has shut down.
+struct StreamBinding {
+    /// QUIC stream id, known only once a local stream has started.
+    id: OnceLock<u64>,
+    sends: Arc<InFlightSends>,
+}
 
-    let cb_state = state.clone();
-    let sends = Arc::new(InFlightSends::default());
-    let cb_sends = sends.clone();
-    let release_sends = ReleaseInFlight(sends.clone());
-    stream.set_callback_handler(move |_, ev| {
-        // Lives and dies with the stream's callback context.
+struct StreamParts {
+    binding: Arc<StreamBinding>,
+    chans: StreamChans,
+    recv_rx: mpsc::Receiver<RecvItem>,
+    send_tx: mpsc::Sender<SendItem>,
+    send_rx: mpsc::Receiver<SendItem>,
+}
+
+fn new_stream_parts() -> StreamParts {
+    let (recv_tx, recv_rx) = mpsc::channel(STREAM_RECEIVE_QUEUE_CAPACITY);
+    let (send_tx, send_rx) = mpsc::channel::<SendItem>(STREAM_SEND_QUEUE_CAPACITY);
+    StreamParts {
+        binding: Arc::new(StreamBinding {
+            id: OnceLock::new(),
+            sends: Arc::new(InFlightSends::default()),
+        }),
+        chans: StreamChans {
+            recv_tx,
+            fin_state: Arc::new(FinState::new()),
+            send_complete: Arc::new(Notify::new()),
+        },
+        recv_rx,
+        send_tx,
+        send_rx,
+    }
+}
+
+/// The msquic callback for one stream.
+fn stream_callback(
+    state: Arc<ConnectionState>,
+    binding: Arc<StreamBinding>,
+) -> impl for<'a> FnMut(msquic::StreamRef, StreamEvent<'a>) -> Result<(), Status> + 'static {
+    // Lives and dies with the stream's callback context.
+    let release_sends = ReleaseInFlight(binding.sends.clone());
+    move |_, ev| {
         let _ = &release_sends;
-        let hook =
-            std::panic::AssertUnwindSafe(|| on_stream_event(&cb_state, &cb_sends, stream_id, ev));
+        let hook = std::panic::AssertUnwindSafe(|| on_stream_event(&state, &binding, ev));
         match std::panic::catch_unwind(hook) {
             Ok(result) => result,
             Err(_) => {
-                tracing::error!(stream_id, "panic in msquic stream callback");
+                tracing::error!(stream_id = ?binding.id.get(), "panic in msquic stream callback");
                 Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR))
             }
         }
-    });
+    }
+}
+
+/// Register a started stream under its id and spawn its send worker.
+fn start_stream(
+    state: &Arc<ConnectionState>,
+    stream: Arc<Stream>,
+    parts: StreamParts,
+    stream_id: u64,
+) -> NewStreamEvent {
+    let StreamParts {
+        binding,
+        chans,
+        recv_rx,
+        send_tx,
+        mut send_rx,
+    } = parts;
+    let fin_state = chans.fin_state.clone();
+    let send_complete = chans.send_complete.clone();
+    let _ = binding.id.set(stream_id);
+    state.streams.insert(stream_id, chans);
 
     let send_stream = stream.clone();
+    let sends = binding.sends.clone();
     // Reached from msquic's worker thread for peer streams, so spawn through
     // the connection's runtime handle instead of the ambient context.
     state.runtime.spawn(async move {
@@ -636,20 +686,21 @@ fn install_stream(
 
 fn on_stream_event(
     state: &ConnectionState,
-    sends: &InFlightSends,
-    key: u64,
+    binding: &StreamBinding,
     event: StreamEvent<'_>,
 ) -> Result<(), Status> {
+    // Events before a local stream is bound to its id carry nothing to route.
+    let key = binding.id.get().copied();
     if let StreamEvent::SendComplete { client_context, .. } = event {
         if !client_context.is_null() {
-            sends.complete(client_context);
+            binding.sends.complete(client_context);
         }
-        if let Some(chans) = state.streams.get(&key) {
+        if let Some(chans) = key.and_then(|key| state.streams.get(&key)) {
             chans.send_complete.notify_one();
         }
         return Ok(());
     }
-    let entry = state.streams.get(&key).map(|e| e.value().clone());
+    let entry = key.and_then(|key| state.streams.get(&key).map(|e| e.value().clone()));
     let Some(chans) = entry else { return Ok(()) };
     match event {
         StreamEvent::Receive {
@@ -686,7 +737,9 @@ fn on_stream_event(
             chans.fin_state.mark_complete();
         }
         StreamEvent::ShutdownComplete { .. } => {
-            state.streams.remove(&key);
+            if let Some(key) = key {
+                state.streams.remove(&key);
+            }
         }
         _ => {}
     }
@@ -988,8 +1041,13 @@ impl MsQuicOpener {
         } else {
             StreamOpenFlags::NONE
         };
-        let stream = Stream::open(&self.connection, flags, |_, _| Ok(()))
-            .map_err(|e| stream_unknown(AdapterError::MsQuic(e)))?;
+        let parts = new_stream_parts();
+        let stream = Stream::open(
+            &self.connection,
+            flags,
+            stream_callback(self.state.clone(), parts.binding.clone()),
+        )
+        .map_err(|e| stream_unknown(AdapterError::MsQuic(e)))?;
         stream
             .start(msquic::StreamStartFlags::IMMEDIATE)
             .map_err(|e| stream_unknown(AdapterError::MsQuic(e)))?;
@@ -997,12 +1055,7 @@ impl MsQuicOpener {
         let Ok(stream_id) = stream.get_stream_id() else {
             return Err(stream_unknown(AdapterError::StreamIdUnavailable));
         };
-        let kind = if uni {
-            NewStreamKind::Uni
-        } else {
-            NewStreamKind::Bidi
-        };
-        Ok(install_stream(self.state.clone(), stream, kind, stream_id))
+        Ok(start_stream(&self.state, stream, parts, stream_id))
     }
 }
 
