@@ -12,6 +12,7 @@ wisp-ws-h2 = { path = "../wisp-ws-h2" }
 wisp-iphash = { path = "../wisp-iphash" }
 wisp-origin = { path = "../wisp-origin" }
 wisp-dos = { path = "../wisp-dos" }
+wisp-reports = { path = "../wisp-reports" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

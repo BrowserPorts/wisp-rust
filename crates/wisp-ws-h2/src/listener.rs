@@ -15,6 +15,7 @@ use wisp_config::{
     WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
 use wisp_dos::{ConnectionLimiter, DosGuard};
+use wisp_iphash::IpHashBans;
 use wisp_wisp_server::{ProxyControllerTemplate, ServerOptions};
 
 use crate::service::handle_request;
@@ -44,6 +45,10 @@ pub struct H2ServeContext {
     pub proxy_template: Option<Arc<ProxyControllerTemplate>>,
     pub dos: Arc<DosGuard>,
     pub connection_limiter: Arc<ConnectionLimiter>,
+    /// Banned client IP hashes, checked before any Wisp traffic is served.
+    /// Replaced wholesale at runtime; share one set across listeners with
+    /// [`H2ServeContext::with_ip_bans`].
+    pub ip_bans: Arc<IpHashBans>,
     pub shutdown: CancellationToken,
 }
 
@@ -65,8 +70,14 @@ impl H2ServeContext {
             proxy_template,
             dos,
             connection_limiter,
+            ip_bans: Arc::new(IpHashBans::new()),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    pub fn with_ip_bans(mut self, ip_bans: Arc<IpHashBans>) -> Self {
+        self.ip_bans = ip_bans;
+        self
     }
 
     pub fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {

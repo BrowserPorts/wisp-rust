@@ -35,7 +35,9 @@ use wisp_config::{
     WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
 use wisp_dos::{ConnectionLimiter, DosGuard};
+use wisp_iphash::IpHashBans;
 use wisp_quic_msquic::adapter::MsQuicConnection;
+use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
 use wisp_wisp_server::{
     serve_connection, ProxyControllerTemplate, ServerContext, ServerError, ServerOptions,
     WispMessage,
@@ -63,6 +65,9 @@ pub struct H3WsContext {
     pub proxy_template: Option<Arc<ProxyControllerTemplate>>,
     pub dos: Arc<DosGuard>,
     pub connection_limiter: Arc<ConnectionLimiter>,
+    /// Banned client IP hashes, checked before any Wisp traffic is served.
+    /// Share one set across listeners with [`H3WsContext::with_ip_bans`].
+    pub ip_bans: Arc<IpHashBans>,
     pub shutdown: CancellationToken,
 }
 
@@ -84,8 +89,14 @@ impl H3WsContext {
             proxy_template,
             dos,
             connection_limiter,
+            ip_bans: Arc::new(IpHashBans::new()),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    pub fn with_ip_bans(mut self, ip_bans: Arc<IpHashBans>) -> Self {
+        self.ip_bans = ip_bans;
+        self
     }
 
     pub fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
@@ -196,6 +207,34 @@ pub async fn serve_h3_websocket(
     view: H3WsConnectionView,
     client_advertises_v2: bool,
 ) -> Result<(), H3WsError> {
+    let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
+    if ctx.ip_bans.is_banned(client_hash.as_deref()) {
+        debug!(client_ip = %client_ip, "h3 ws: rejecting: banned IP hash");
+        emit_report(
+            ReportErrorType::IpHashBanned,
+            ReportInput {
+                context: Some(ConnectionContext {
+                    client_ip: Some(client_ip),
+                    client_ip_hash: client_hash,
+                    transport: Some(Transport::Ws),
+                    origin: None,
+                }),
+                transport_close_code: Some(403),
+                ..Default::default()
+            },
+        );
+        let forbidden = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(())
+            .expect("static 403 response");
+        request_stream
+            .send_response(forbidden)
+            .await
+            .map_err(H3WsError::SendResponse)?;
+        let _ = request_stream.finish().await;
+        return Ok(());
+    }
+
     let mut response = Response::builder().status(StatusCode::OK);
     if client_advertises_v2
         && !matches!(
@@ -232,7 +271,7 @@ pub async fn serve_h3_websocket(
         run_writer(send_half, wisp_rx, ctrl_rx).await;
     });
 
-    let server_ctx = build_server_ctx(client_ip, &ctx, &view, client_advertises_v2);
+    let server_ctx = build_server_ctx(client_ip, client_hash, &ctx, &view, client_advertises_v2);
     let sink = PollSender::new(wisp_tx);
     let stream = WispMessageStream { rx: incoming_rx };
 
@@ -253,11 +292,11 @@ pub async fn serve_h3_websocket(
 
 fn build_server_ctx(
     client_ip: String,
+    client_hash: Option<String>,
     ctx: &H3WsContext,
     view: &H3WsConnectionView,
     client_advertises_v2: bool,
 ) -> ServerContext {
-    let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
     let proxy_controller = ctx.proxy_template.as_ref().map(|t| {
         t.spawn(
             view.server_options.proxy_control_limits(),

@@ -41,6 +41,7 @@ use wisp_dos::{
     TcpByteLimiter,
 };
 use wisp_inspect::{inspect, InspectionDecision};
+use wisp_iphash::IpHashBans;
 use wisp_proxy::{HostPolicy, TcpConnector};
 use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_quic_msquic::engine::{EngineConfig, EngineError, MsQuicEngine};
@@ -122,6 +123,9 @@ impl ServeHandle {
 #[derive(Clone, Default)]
 pub struct ServeExtras {
     pub proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    /// Banned client IP hashes applied to WebTransport sessions. WS-over-H3
+    /// uses the set on its [`H3WsContext`].
+    pub ip_bans: Arc<IpHashBans>,
 }
 
 /// Bind the msquic listener and start dispatching sessions.
@@ -232,6 +236,7 @@ pub async fn serve(
         connection_limiter,
         auth_registry,
         extras.proxy_template,
+        extras.ip_bans,
     ));
 
     Ok(ServeHandle {
@@ -250,6 +255,7 @@ async fn connection_acceptor(
     connection_limiter: Arc<ConnectionLimiter>,
     auth_registry: WispAuthRegistry,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    ip_bans: Arc<IpHashBans>,
 ) {
     loop {
         tokio::select! {
@@ -268,6 +274,7 @@ async fn connection_acceptor(
                 let connection_limiter = connection_limiter.clone();
                 let auth_registry = auth_registry.clone();
                 let proxy_template = proxy_template.clone();
+                let ip_bans = ip_bans.clone();
                 let connection_cancel = cancel.child_token();
                 tokio::spawn(async move {
                     let result = tokio::select! {
@@ -282,6 +289,7 @@ async fn connection_acceptor(
                             connection_limiter,
                             auth_registry,
                             proxy_template,
+                            ip_bans,
                         ) => result,
                     };
                     if let Err(e) = result {
@@ -303,6 +311,7 @@ async fn handle_connection(
     connection_limiter: Arc<ConnectionLimiter>,
     auth_registry: WispAuthRegistry,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    ip_bans: Arc<IpHashBans>,
 ) -> Result<(), HandlerError> {
     let endpoint = normalize_endpoint(&options.base.endpoint);
     let handshake_timeout =
@@ -360,7 +369,8 @@ async fn handle_connection(
             debug!(expected, "wisp: WS endpoint or authentication rejected");
             return Ok(());
         };
-        let policy = PreUpgradePolicy::new(view.options.clone(), dos.clone());
+        let policy = PreUpgradePolicy::new(view.options.clone(), dos.clone())
+            .with_ip_bans(ctx.ip_bans.clone());
         if let Err(rej) = policy.check(request.headers(), &client_ip) {
             warn!(reason = rej.reason, "wisp: WS pre-upgrade rejected");
             return Ok(());
@@ -438,7 +448,8 @@ async fn handle_connection(
             .unwrap_or_else(|| Arc::new(options.base.clone()))
     };
 
-    let policy = PreUpgradePolicy::new(effective_options.clone(), dos.clone());
+    let policy =
+        PreUpgradePolicy::new(effective_options.clone(), dos.clone()).with_ip_bans(ip_bans);
     let client_hash = match policy.check(request.headers(), &client_ip) {
         Ok(h) => h,
         Err(rej) => {

@@ -6,7 +6,7 @@
 //! - [`RuntimeConfig`] — fully-validated runtime config derived from the
 //!   parsed TOML (`wisp_config::WispWtServerOptions`).
 //! - [`Runtime`] — owns the cancellation token and the per-process shared
-//!   state (DoS guard, advanced-extension flags). `Runtime::start` is the
+//!   state (DoS guard, banned IP hashes, advanced-extension flags). `Runtime::start` is the
 //!   one-stop launch point.
 //! - [`shutdown`] helpers that close the cancellation token and wait for
 //!   sessions to drain up to `idle_timeout_ms`.
@@ -29,6 +29,7 @@ use wisp_config::{
     WispAuthResolver, WispServerOptions, WispWtServerOptions,
 };
 use wisp_dos::{ConnectionLimiter, DosGuard};
+use wisp_iphash::IpHashBans;
 
 #[cfg(feature = "ws")]
 use tokio::task::JoinHandle;
@@ -109,6 +110,7 @@ pub struct Runtime {
     cancel: CancellationToken,
     dos: Arc<DosGuard>,
     connection_limiter: Arc<ConnectionLimiter>,
+    ip_bans: Arc<IpHashBans>,
     auth: WispAuthRegistry,
     file_auth: Option<Arc<ReloadingTokenResolver>>,
     #[cfg(feature = "ws")]
@@ -143,6 +145,7 @@ impl Runtime {
             cancel: CancellationToken::new(),
             dos,
             connection_limiter: Arc::new(ConnectionLimiter::new()),
+            ip_bans: Arc::new(IpHashBans::new()),
             auth,
             file_auth,
             #[cfg(feature = "ws")]
@@ -156,6 +159,25 @@ impl Runtime {
 
     pub fn dos(&self) -> Arc<DosGuard> {
         self.dos.clone()
+    }
+
+    /// Number of client connections currently open across every transport.
+    pub fn active_connections(&self) -> u64 {
+        self.connection_limiter.active()
+    }
+
+    /// Use a ban set the caller already owns, so bans accepted before the
+    /// runtime exists carry over. Call before binding any listener; listeners
+    /// bound earlier keep the set they were given.
+    pub fn with_ip_bans(mut self, ip_bans: Arc<IpHashBans>) -> Self {
+        self.ip_bans = ip_bans;
+        self
+    }
+
+    /// The live banned-IP-hash set. Replacing its contents takes effect for
+    /// the next connection on every listener, with no restart.
+    pub fn ip_bans(&self) -> Arc<IpHashBans> {
+        self.ip_bans.clone()
     }
 
     pub fn auth_registry(&self) -> WispAuthRegistry {
@@ -235,6 +257,7 @@ impl Runtime {
                     self.dos.clone(),
                     self.connection_limiter.clone(),
                 )
+                .with_ip_bans(self.ip_bans.clone())
                 .with_shutdown_token(self.cancel.clone()),
             ))
         } else {
@@ -246,9 +269,13 @@ impl Runtime {
         #[cfg(feature = "ws")]
         let extras = ServeExtras {
             proxy_template: self.proxy_template.clone(),
+            ip_bans: self.ip_bans.clone(),
         };
         #[cfg(not(feature = "ws"))]
-        let extras = ServeExtras::default();
+        let extras = ServeExtras {
+            ip_bans: self.ip_bans.clone(),
+            ..ServeExtras::default()
+        };
         let handle = serve_listener(
             self.cfg.options.clone(),
             self.dos.clone(),
@@ -283,6 +310,7 @@ impl Runtime {
                 self.dos.clone(),
                 self.connection_limiter.clone(),
             )
+            .with_ip_bans(self.ip_bans.clone())
             .with_shutdown_token(self.cancel.clone()),
         );
         let cancel = self.cancel.clone();
@@ -415,6 +443,32 @@ mod tests {
         assert!(!tok.is_cancelled());
         rt.shutdown().await;
         assert!(tok.is_cancelled());
+    }
+
+    #[test]
+    fn bans_are_shared_and_live() {
+        let rt =
+            Runtime::start(RuntimeConfig::from_options(WispWtServerOptions::default()).unwrap())
+                .unwrap();
+        let bans = rt.ip_bans();
+        assert!(!bans.is_banned(Some("abc")));
+        rt.ip_bans().replace(["abc"]);
+        assert!(bans.is_banned(Some("abc")), "every handle sees the swap");
+        assert_eq!(rt.active_connections(), 0);
+    }
+
+    #[test]
+    fn with_ip_bans_adopts_an_existing_set() {
+        let owned = Arc::new(IpHashBans::new());
+        owned.replace(["abc"]);
+        let rt =
+            Runtime::start(RuntimeConfig::from_options(WispWtServerOptions::default()).unwrap())
+                .unwrap()
+                .with_ip_bans(owned.clone());
+        assert!(rt.ip_bans().is_banned(Some("abc")));
+        owned.replace(["def"]);
+        assert!(rt.ip_bans().is_banned(Some("def")));
+        assert!(!rt.ip_bans().is_banned(Some("abc")));
     }
 
     #[test]

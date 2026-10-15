@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 wisp-config = { path = "../wisp-config" }
 wisp-dos = { path = "../wisp-dos" }
+wisp-iphash = { path = "../wisp-iphash" }
 wisp-server = { path = "../wisp-server", optional = true }
 wisp-proxy = { path = "../wisp-proxy", optional = true }
 wisp-router = { path = "../wisp-router", optional = true }

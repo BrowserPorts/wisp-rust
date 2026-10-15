@@ -99,6 +99,24 @@ pub(crate) async fn handle_request(
         );
         return Ok(status(StatusCode::FORBIDDEN));
     }
+    let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
+    if ctx.ip_bans.is_banned(client_hash.as_deref()) {
+        debug!(client_ip = %client_ip, "ws-h2: rejecting: banned IP hash");
+        emit_report(
+            ReportErrorType::IpHashBanned,
+            ReportInput {
+                context: Some(ConnectionContext {
+                    client_ip: Some(client_ip.clone()),
+                    client_ip_hash: client_hash,
+                    transport: Some(Transport::Ws),
+                    origin: origin.clone(),
+                }),
+                transport_close_code: Some(403),
+                ..Default::default()
+            },
+        );
+        return Ok(status(StatusCode::FORBIDDEN));
+    }
     let store = ctx.dos.clone();
     if !is_connection_start_allowed(&client_ip, &view.options, &store) {
         debug!(client_ip = %client_ip, "ws-h2: rejecting: connection-start rate");
@@ -158,7 +176,7 @@ pub(crate) async fn handle_request(
         });
 
     let on_upgrade = hyper::upgrade::on(req);
-    let server_ctx = build_server_ctx(client_ip, &ctx, &view, client_advertises_v2);
+    let server_ctx = build_server_ctx(client_ip, client_hash, &ctx, &view, client_advertises_v2);
     let ws_max_payload = (view.server_options.max_binary_frame_bytes as usize)
         .max(view.server_options.max_text_frame_bytes as usize)
         .saturating_add(1024);
@@ -198,11 +216,11 @@ pub(crate) async fn handle_request(
 
 fn build_server_ctx(
     client_ip: String,
+    client_hash: Option<String>,
     ctx: &H2ServeContext,
     view: &ConnectionView,
     client_advertises_v2: bool,
 ) -> ServerContext {
-    let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
     let proxy_controller = ctx.proxy_template.as_ref().map(|t| {
         t.spawn(
             view.server_options.proxy_control_limits(),

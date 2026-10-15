@@ -17,6 +17,7 @@ use wisp_config::{
 use wisp_dos::is_connection_start_allowed;
 use wisp_iphash::hash_client_ip;
 use wisp_origin::{is_origin_allowed, origin_from_headers, origin_headers_valid};
+use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
 use wisp_wisp_server::ServerContext;
 use wisp_ws_h2::{listener::ConnectionView, websocket::serve_websocket, H2ServeContext};
 
@@ -218,6 +219,25 @@ async fn handle_connection(
         reject_upgrade(pending, "403 Forbidden").await?;
         return Ok(());
     }
+    let client_hash = hash_client_ip(Some(&client_ip), None);
+    if ctx.ip_bans.is_banned(client_hash.as_deref()) {
+        debug!(client_ip = %client_ip, "ws-plain: rejecting: banned IP hash");
+        emit_report(
+            ReportErrorType::IpHashBanned,
+            ReportInput {
+                context: Some(ConnectionContext {
+                    client_ip: Some(client_ip.clone()),
+                    client_ip_hash: client_hash,
+                    transport: Some(Transport::Ws),
+                    origin: origin.clone(),
+                }),
+                transport_close_code: Some(403),
+                ..Default::default()
+            },
+        );
+        reject_upgrade(pending, "403 Forbidden").await?;
+        return Ok(());
+    }
     let store = ctx.dos.clone();
     if !is_connection_start_allowed(&client_ip, &view.options, &store) {
         debug!(client_ip = %client_ip, "ws-plain: rejecting: connection-start rate");
@@ -246,7 +266,7 @@ async fn handle_connection(
         .config(Config::default().flush_threshold(WS_FLUSH_THRESHOLD))
         .limits(Limits::default().max_payload_len(Some(ws_max_payload)))
         .serve(io);
-    let server_ctx = build_server_ctx(client_ip, &ctx, &view, client_advertises_v2);
+    let server_ctx = build_server_ctx(client_ip, client_hash, &ctx, &view, client_advertises_v2);
     if let Err(error) = serve_websocket(ws, server_ctx).await {
         debug!(%error, "wisp-ws-plain connection ended with error");
     }
@@ -255,11 +275,11 @@ async fn handle_connection(
 
 fn build_server_ctx(
     client_ip: String,
+    client_hash: Option<String>,
     ctx: &H2ServeContext,
     view: &ConnectionView,
     client_advertises_v2: bool,
 ) -> ServerContext {
-    let client_hash = hash_client_ip(Some(&client_ip), None);
     let proxy_controller = ctx.proxy_template.as_ref().map(|t| {
         t.spawn(
             view.server_options.proxy_control_limits(),
@@ -276,4 +296,90 @@ fn build_server_ctx(
         ctx.dos.clone(),
     )
     .with_cancel(ctx.shutdown.child_token())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wisp_config::{WispAuthRegistry, WispServerOptions};
+    use wisp_dos::{ConnectionLimiter, DosGuard};
+    use wisp_iphash::IpHashBans;
+    use wisp_reports::{set_report_hook, Report, ReportErrorType};
+
+    const UPGRADE: &[u8] = b"GET /wisp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    /// Start a plain listener on a free loopback port and return its address.
+    async fn spawn_listener(ip_bans: Arc<IpHashBans>) -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let bind_addr = probe.local_addr().expect("read reserved address");
+        drop(probe);
+        let mut options = WispServerOptions {
+            block_blank_origins: false,
+            ..WispServerOptions::default()
+        };
+        options.auth.required = false;
+        let ctx = Arc::new(
+            H2ServeContext::with_template_and_auth(
+                Arc::new(options),
+                false,
+                None,
+                WispAuthRegistry::default(),
+                Arc::new(DosGuard::new()),
+                Arc::new(ConnectionLimiter::new()),
+            )
+            .with_ip_bans(ip_bans),
+        );
+        let cfg = WsPlainListenerConfig {
+            bind_addr,
+            trust_forwarded_headers: false,
+        };
+        tokio::spawn(serve_ws_plain_listener(cfg, ctx));
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(bind_addr).await.is_ok() {
+                return bind_addr;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("ws-plain listener did not come up");
+    }
+
+    async fn status_line(addr: SocketAddr) -> String {
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect test client");
+        client.write_all(UPGRADE).await.expect("write upgrade");
+        let mut head = vec![0u8; 64];
+        let read = client.read(&mut head).await.expect("read status line");
+        String::from_utf8_lossy(&head[..read])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn refuses_banned_client_with_403_and_reports_it() {
+        let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+        set_report_hook(Some(Arc::new(move |report: &Report| {
+            if report.error_type == ReportErrorType::IpHashBanned {
+                let _ = report_tx.send(report.ip_hash.clone());
+            }
+        })));
+
+        let bans = Arc::new(IpHashBans::new());
+        let addr = spawn_listener(bans.clone()).await;
+
+        let first = status_line(addr).await;
+        assert!(first.contains("101"), "unbanned client got {first:?}");
+
+        let banned = hash_client_ip(Some("127.0.0.1"), None).unwrap();
+        bans.replace([banned.clone()]);
+        assert!(status_line(addr).await.contains("403"));
+        assert_eq!(report_rx.recv().await, Some(Some(banned)));
+
+        bans.replace(Vec::<String>::new());
+        assert!(status_line(addr).await.contains("101"));
+        set_report_hook(None);
+    }
 }

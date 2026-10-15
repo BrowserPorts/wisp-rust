@@ -2936,6 +2936,7 @@ dependencies = [
  "tracing",
  "wisp-config",
  "wisp-dos",
+ "wisp-iphash",
  "wisp-proxy",
  "wisp-proxy-base",
  "wisp-proxy-mullvad",
@@ -3101,6 +3102,7 @@ dependencies = [
  "wisp-dos",
  "wisp-iphash",
  "wisp-origin",
+ "wisp-reports",
  "wisp-wisp-server",
  "wisp-ws-h2",
 ]
@@ -3252,6 +3254,7 @@ dependencies = [
  "wisp-dos",
  "wisp-iphash",
  "wisp-quic-msquic",
+ "wisp-reports",
  "wisp-wisp",
  "wisp-wisp-server",
 ]
