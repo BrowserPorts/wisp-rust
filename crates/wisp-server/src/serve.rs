@@ -183,6 +183,9 @@ pub async fn serve(
     let (conn_tx, conn_rx) =
         mpsc::channel::<(MsQuicConnection, Option<SocketAddr>, ConnectionGuard)>(channel_capacity);
 
+    // The listener callback runs on an msquic worker thread with no Tokio
+    // context, so hand it the runtime that `serve` was called on.
+    let runtime = tokio::runtime::Handle::current();
     let listener = engine.open_listener(move |_, ev| {
         if let ListenerEvent::NewConnection { info, connection } = ev {
             let peer = info.remote_address.as_socket();
@@ -204,7 +207,7 @@ pub async fn serve(
                 drop(owned);
                 return Ok(());
             }
-            let ms_conn = MsQuicConnection::install(owned);
+            let ms_conn = MsQuicConnection::install(owned, runtime.clone());
             if conn_tx.try_send((ms_conn, peer, raw_guard)).is_err() {
                 debug!("raw QUIC admission queue full; dropping new connection");
             }

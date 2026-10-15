@@ -203,6 +203,10 @@ pub(crate) struct ConnectionState {
     connected_notify: Notify,
 }
 
+    /// Runtime that owns this connection's async side. msquic delivers events
+    /// on its own worker threads, which have no Tokio context, so anything the
+    /// callbacks need to spawn goes through this handle.
+    runtime: tokio::runtime::Handle,
 impl ConnectionState {
     fn close(&self, err: ConnectionErrorIncoming) {
         {
@@ -252,7 +256,11 @@ pub struct MsQuicConnection {
 impl MsQuicConnection {
     /// Wrap a freshly-accepted msquic connection. Installs the dispatcher
     /// callback that fans events into the per-stream registry.
-    pub fn install(connection: Connection) -> Self {
+    ///
+    /// `runtime` is the Tokio runtime the connection's tasks run on. Callers in
+    /// an msquic callback have no ambient runtime, so it is passed in rather
+    /// than looked up.
+    pub fn install(connection: Connection, runtime: tokio::runtime::Handle) -> Self {
         let (new_bidi_tx, new_bidi_rx) = mpsc::channel(NEW_STREAM_QUEUE_CAPACITY);
         let (new_uni_tx, new_uni_rx) = mpsc::channel(NEW_STREAM_QUEUE_CAPACITY);
         let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_RECEIVE_QUEUE_CAPACITY);
@@ -269,6 +277,7 @@ impl MsQuicConnection {
             connected_notify: Notify::new(),
         });
         let connection = Arc::new(connection);
+            runtime,
         let cb_state = state.clone();
         let cb_conn = connection.clone();
         let cb_max = max_datagram_size.clone();
@@ -315,7 +324,7 @@ impl MsQuicConnection {
         }
         .map_err(AdapterError::MsQuic)?;
 
-        let connected = Self::install(connection);
+        let connected = Self::install(connection, tokio::runtime::Handle::current());
         connected
             .connection
             .start(configuration, server_name, remote_addr.port())
@@ -496,7 +505,9 @@ fn install_stream(
     });
 
     let send_stream = stream.clone();
-    tokio::spawn(async move {
+    // Reached from msquic's worker thread for peer streams, so spawn through
+    // the connection's runtime handle instead of the ambient context.
+    state.runtime.spawn(async move {
         while let Some(item) = send_rx.recv().await {
             let completed = send_complete.notified();
             if submit_stream_send(&send_stream, &item).is_err() {
@@ -1188,6 +1199,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel(1);
         let closed = Arc::new(RwLock::new(Some(
             ConnectionErrorIncoming::ApplicationClose { error_code: 77 },
+            runtime: tokio::runtime::Handle::current(),
         )));
         let cancel = CancellationToken::new();
         let mut receiver = MsQuicDatagramReceiver {
