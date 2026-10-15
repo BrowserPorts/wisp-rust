@@ -371,8 +371,10 @@ impl MsQuicConnection {
             runtime,
         });
         let connection = Arc::new(connection);
+        // The closure becomes the connection's callback context, which is only
+        // freed by closing the handle. It must not capture an `Arc` of the
+        // connection itself: that would keep the handle open forever.
         let cb_state = state.clone();
-        let cb_conn = connection.clone();
         let cb_max = max_datagram_size.clone();
         let cb_enabled = datagram_send_enabled.clone();
         let release_datagrams = ReleaseInFlight(state.datagram_sends.clone());
@@ -380,7 +382,7 @@ impl MsQuicConnection {
             // Lives and dies with the connection's callback context.
             let _ = &release_datagrams;
             let hook = std::panic::AssertUnwindSafe(|| {
-                on_connection_event(&cb_state, &cb_conn, &cb_max, &cb_enabled, event);
+                on_connection_event(&cb_state, &cb_max, &cb_enabled, event);
             });
             if std::panic::catch_unwind(hook).is_err() {
                 tracing::error!("panic in msquic connection callback (swallowed)");
@@ -486,7 +488,6 @@ fn send_datagram_inner(
 
 fn on_connection_event(
     state: &Arc<ConnectionState>,
-    _connection: &Arc<Connection>,
     max_size: &RwLock<u16>,
     enabled: &RwLock<bool>,
     event: ConnectionEvent<'_>,
