@@ -2972,6 +2972,7 @@ name = "wisp-iphash"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "parking_lot",
  "sha2",
 ]
 

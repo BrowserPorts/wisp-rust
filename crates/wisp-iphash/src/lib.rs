@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod bans;
+
+pub use bans::IpHashBans;
+
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
