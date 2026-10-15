@@ -530,6 +530,26 @@ impl WispRust {
         self.set_limit_profile(name, patch)
     }
 
+    // Forget a named limit profile, in the stored config and in the running
+    // runtime. True when a profile was removed. The base profile holds the
+    // limits every unnamed connection uses, so it cannot be removed.
+    #[napi]
+    pub fn remove_limit_profile(&self, name: String) -> Result<bool> {
+        if name == WISP_BASE_LIMIT_PROFILE {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "the base limit profile cannot be removed",
+            ));
+        }
+        let mut guard = self.state.lock();
+        let configured = guard.configured_limit_profiles.remove(&name).is_some();
+        let running = guard
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.remove_limit_profile(&name).is_some());
+        Ok(configured || running)
+    }
+
     #[napi]
     pub fn limit_profile(&self, name: String) -> Value {
         let guard = self.state.lock();

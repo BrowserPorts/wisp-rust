@@ -28,6 +28,7 @@ getLimits(): any
 patchLimits(patch: any): any
 setLimitProfile(name: string, limits: any): any
 patchLimitProfile(name: string, patch: any): any
+removeLimitProfile(name: string): boolean
 limitProfile(name: string): any
 listLimitProfiles(): any
 registerAuthToken(token: string, policy: any): any
