@@ -1076,7 +1076,15 @@ impl ConnectionLimiter {
         max_per_ip: u64,
     ) -> Option<ConnectionGuard> {
         if max_total == 0 && max_per_ip == 0 {
-            return Some(ConnectionGuard { held: None });
+            // Nothing to enforce, so skip the per-IP map, but still count the
+            // connection so `active` reports every open connection.
+            self.global.fetch_add(1, Ordering::AcqRel);
+            return Some(ConnectionGuard {
+                held: Some(HeldConnection {
+                    limiter: self.clone(),
+                    ip: None,
+                }),
+            });
         }
         let ip = dos_ip_key(client_ip);
         let mut entry = self.per_ip.entry(ip.clone()).or_insert(0);
@@ -1105,18 +1113,20 @@ impl ConnectionLimiter {
         Some(ConnectionGuard {
             held: Some(HeldConnection {
                 limiter: self.clone(),
-                ip,
+                ip: Some(ip),
             }),
         })
     }
 
-    fn release(&self, ip: &str) {
-        if let Some(mut e) = self.per_ip.get_mut(ip) {
-            *e = e.saturating_sub(1);
-            let empty = *e == 0;
-            drop(e);
-            if empty {
-                self.per_ip.remove_if(ip, |_, v| *v == 0);
+    fn release(&self, ip: Option<&str>) {
+        if let Some(ip) = ip {
+            if let Some(mut e) = self.per_ip.get_mut(ip) {
+                *e = e.saturating_sub(1);
+                let empty = *e == 0;
+                drop(e);
+                if empty {
+                    self.per_ip.remove_if(ip, |_, v| *v == 0);
+                }
             }
         }
         self.global.fetch_sub(1, Ordering::AcqRel);
@@ -1131,13 +1141,15 @@ pub struct ConnectionGuard {
 
 struct HeldConnection {
     limiter: Arc<ConnectionLimiter>,
-    ip: String,
+    /// The per-IP key this connection was counted under, or `None` when it was
+    /// admitted with no caps and only the global count was touched.
+    ip: Option<String>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         if let Some(held) = self.held.as_ref() {
-            held.limiter.release(&held.ip);
+            held.limiter.release(held.ip.as_deref());
         }
     }
 }
@@ -1664,15 +1676,34 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_connection_caps_do_not_touch_counters() {
+    fn unlimited_connection_caps_skip_the_per_ip_map() {
         let limiter = Arc::new(ConnectionLimiter::new());
         for _ in 0..100_000 {
             let guard = limiter
                 .try_acquire("not-an-ip", 0, 0)
                 .expect("uncapped connection admitted");
+            assert_eq!(limiter.active(), 1);
             drop(guard);
         }
-        assert_eq!(limiter.global.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.active(), 0);
+        assert!(limiter.per_ip.is_empty());
+    }
+
+    #[test]
+    fn uncapped_connections_are_counted_while_open() {
+        let limiter = Arc::new(ConnectionLimiter::new());
+        let first = limiter.try_acquire("203.0.113.5", 0, 0).unwrap();
+        let second = limiter.try_acquire("203.0.113.6", 0, 0).unwrap();
+        assert_eq!(limiter.active(), 2);
+        // A capped acquire for the same IP must not see the uncapped ones in
+        // its per-IP tally, and releasing them must not underflow it.
+        let capped = limiter.try_acquire("203.0.113.5", 0, 1).unwrap();
+        assert!(limiter.try_acquire("203.0.113.5", 0, 1).is_none());
+        drop(first);
+        drop(second);
+        assert_eq!(limiter.active(), 1);
+        drop(capped);
+        assert_eq!(limiter.active(), 0);
         assert!(limiter.per_ip.is_empty());
     }
 
