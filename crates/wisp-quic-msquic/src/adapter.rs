@@ -797,6 +797,17 @@ impl MsQuicRecvStream {
 }
 
 impl MsQuicSendStream {
+    /// Hold one frame until `poll_ready` can queue it.
+    fn buffer_frame(&mut self, bytes: Bytes) -> Result<(), StreamErrorIncoming> {
+        if self.pending.is_some() {
+            // h3 must wait for `poll_ready` between frames; refusing here keeps
+            // a misuse from reordering or dropping data.
+            return Err(stream_unknown(AdapterError::NotReady));
+        }
+        self.pending = Some(SendItem { bytes, fin: false });
+        Ok(())
+    }
+
     /// Move the frame buffered by `send_data` into the worker queue, waiting for
     /// room. Ready once nothing is buffered, which keeps queue order intact for
     /// whatever is sent next.
@@ -829,11 +840,6 @@ impl H3SendStream<Bytes> for MsQuicSendStream {
     }
 
     fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-        if self.pending.is_some() {
-            // h3 must wait for `poll_ready` between frames; refusing here keeps
-            // a misuse from reordering or dropping data.
-            return Err(stream_unknown(AdapterError::NotReady));
-        }
         let mut wb = data.into();
         let mut acc = BytesMut::with_capacity(wb.remaining());
         while wb.has_remaining() {
@@ -845,11 +851,7 @@ impl H3SendStream<Bytes> for MsQuicSendStream {
         if acc.is_empty() {
             return Ok(());
         }
-        self.pending = Some(SendItem {
-            bytes: acc.freeze(),
-            fin: false,
-        });
-        Ok(())
+        self.buffer_frame(acc.freeze())
     }
 
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
@@ -1450,6 +1452,144 @@ mod tests {
         state.close(ConnectionErrorIncoming::ApplicationClose { error_code: 9 });
         let err = waiter.await.unwrap().unwrap_err();
         assert!(matches!(err, AdapterError::ConnectionShutdown));
+    }
+
+    fn send_stream(capacity: usize) -> (MsQuicSendStream, mpsc::Receiver<SendItem>) {
+        let (send_tx, send_rx) = mpsc::channel(capacity);
+        // A null handle is never passed to msquic here and closing it is a no-op.
+        // SAFETY: `Stream::from_raw` only wraps the pointer.
+        let stream = unsafe { Stream::from_raw(std::ptr::null_mut()) };
+        let send = MsQuicSendStream {
+            send_tx: PollSender::new(send_tx),
+            pending: None,
+            stream: Arc::new(stream),
+            stream_id: StreamId::try_from(0).unwrap(),
+            fin_sent: false,
+            fin_state: Arc::new(FinState::new()),
+        };
+        (send, send_rx)
+    }
+
+    fn poll<T>(poll: impl FnOnce(&mut Context<'_>) -> Poll<T>) -> Poll<T> {
+        poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+    }
+
+    #[test]
+    fn send_data_then_poll_ready_queues_the_frame() {
+        // The order h3 uses: write the frame, then wait for it to be accepted.
+        let (mut send, mut worker) = send_stream(2);
+        send.buffer_frame(Bytes::from_static(b"one")).unwrap();
+        assert!(
+            worker.try_recv().is_err(),
+            "nothing is queued before poll_ready"
+        );
+        assert!(matches!(
+            poll(|cx| send.poll_ready(cx)),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(worker.try_recv().unwrap().bytes.as_ref(), b"one");
+        // Ready again with nothing buffered.
+        assert!(matches!(
+            poll(|cx| send.poll_ready(cx)),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn poll_ready_applies_backpressure_when_the_worker_queue_is_full() {
+        let (mut send, mut worker) = send_stream(1);
+        send.buffer_frame(Bytes::from_static(b"one")).unwrap();
+        assert!(matches!(
+            poll(|cx| send.poll_ready(cx)),
+            Poll::Ready(Ok(()))
+        ));
+
+        send.buffer_frame(Bytes::from_static(b"two")).unwrap();
+        assert!(poll(|cx| send.poll_ready(cx)).is_pending(), "queue is full");
+        // The second frame is still held, so a third write is refused.
+        assert!(send.buffer_frame(Bytes::from_static(b"three")).is_err());
+
+        assert_eq!(worker.try_recv().unwrap().bytes.as_ref(), b"one");
+        assert!(matches!(
+            poll(|cx| send.poll_ready(cx)),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(worker.try_recv().unwrap().bytes.as_ref(), b"two");
+    }
+
+    #[test]
+    fn finish_flushes_the_buffered_frame_before_the_fin() {
+        let (mut send, mut worker) = send_stream(4);
+        send.buffer_frame(Bytes::from_static(b"last")).unwrap();
+        // The FIN cannot complete here (no msquic), but it must queue after the frame.
+        assert!(poll(|cx| send.poll_finish(cx)).is_pending());
+        let frame = worker.try_recv().unwrap();
+        assert_eq!((frame.bytes.as_ref(), frame.fin), (&b"last"[..], false));
+        let fin = worker.try_recv().unwrap();
+        assert_eq!((fin.bytes.len(), fin.fin), (0, true));
+    }
+
+    /// Payload that counts how many times it has been freed.
+    struct Counted(&'static [u8], Arc<std::sync::atomic::AtomicUsize>);
+
+    impl AsRef<[u8]> for Counted {
+        fn as_ref(&self) -> &[u8] {
+            self.0
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn pinned_send_describes_its_own_payload() {
+        let pinned = PinnedSend::pin(Bytes::from_static(b"payload"));
+        // SAFETY: just pinned, released below.
+        let buffers = unsafe { PinnedSend::buffers(pinned) };
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].as_bytes(), b"payload");
+        // The descriptor array lives inside the allocation msquic is given, not
+        // in the caller's frame, so it outlives the call that submits it.
+        let array = buffers.as_ptr() as usize;
+        assert!(
+            array >= pinned as usize && array < pinned as usize + std::mem::size_of::<PinnedSend>()
+        );
+        // SAFETY: matches `pin`.
+        unsafe { drop(Box::from_raw(pinned)) };
+    }
+
+    #[test]
+    fn pinned_send_without_payload_passes_no_buffers() {
+        let pinned = PinnedSend::pin(Bytes::new());
+        // SAFETY: just pinned, released below.
+        assert!(unsafe { PinnedSend::buffers(pinned) }.is_empty());
+        // SAFETY: matches `pin`.
+        unsafe { drop(Box::from_raw(pinned)) };
+    }
+
+    #[test]
+    fn in_flight_sends_release_each_send_exactly_once() {
+        let freed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pin = |data| PinnedSend::pin(Bytes::from_owner(Counted(data, freed.clone())));
+        let sends = InFlightSends::default();
+        let (a, b, c) = (pin(b"a"), pin(b"b"), pin(b"c"));
+        for pinned in [a, b, c] {
+            sends.track(pinned);
+        }
+
+        sends.complete(a.cast());
+        assert_eq!(freed.load(Ordering::SeqCst), 1);
+        // A repeat completion, or an address that was never tracked, frees nothing.
+        sends.complete(a.cast());
+        sends.complete(std::ptr::NonNull::<u8>::dangling().as_ptr().cast());
+        assert_eq!(freed.load(Ordering::SeqCst), 1);
+
+        // What msquic never completed is freed when the handle's context drops.
+        drop(ReleaseInFlight(Arc::new(sends)));
+        assert_eq!(freed.load(Ordering::SeqCst), 3);
     }
 
     #[test]
