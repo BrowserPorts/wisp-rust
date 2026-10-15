@@ -3075,6 +3075,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "wisp-iphash",
 ]
 
 [[package]]

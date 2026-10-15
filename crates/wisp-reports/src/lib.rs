@@ -2,12 +2,17 @@
 //!
 //! The string report codes are stable wire identifiers so existing log
 //! aggregators continue to work. Call [`emit_report`] from admit/reject/close
-//! paths; it serializes a [`Report`] onto the `wisp_reports` tracing target.
+//! paths; it serializes a [`Report`] onto the `wisp_reports` tracing target
+//! and hands the same report to the process-wide hook set with
+//! [`set_report_hook`], so an embedder sees every report without a second
+//! emission path.
 
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use wisp_iphash::hash_client_ip;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +60,38 @@ pub struct ReportDefinition {
 }
 
 impl ReportErrorType {
+    /// The snake_case name this type serializes to, for callers that want the
+    /// kind without going through JSON.
+    pub fn kind(&self) -> &'static str {
+        use ReportErrorType::*;
+        match self {
+            IpHashBanned => "ip_hash_banned",
+            SecurityRateLimited => "security_rate_limited",
+            OriginBlocked => "origin_blocked",
+            ClientBlocked => "client_blocked",
+            ConnectionRateLimited => "connection_rate_limited",
+            ConnectionLimit => "connection_limit",
+            TcpStreamOpenRateLimited => "tcp_stream_open_rate_limited",
+            TcpByteRateLimited => "tcp_byte_rate_limited",
+            DatagramDropped => "datagram_dropped",
+            DatagramRateLimited => "datagram_rate_limited",
+            ControlRateLimited => "control_rate_limited",
+            DnsRateLimited => "dns_rate_limited",
+            StreamThrottled => "stream_throttled",
+            StreamPolicyBlocked => "stream_policy_blocked",
+            LocalhostBlocked => "localhost_blocked",
+            SecurityBlocked => "security_blocked",
+            ProtocolInspectionBlocked => "protocol_inspection_blocked",
+            HostPolicyBlocked => "host_policy_blocked",
+            InvalidPacket => "invalid_packet",
+            InvalidInfo => "invalid_info",
+            FrameTooLarge => "frame_too_large",
+            HandshakeTimeout => "handshake_timeout",
+            ProxyHopLimitExceeded => "proxy_hop_limit_exceeded",
+            ProxyControlSwitch => "proxy_control_switch",
+        }
+    }
+
     pub fn definition(&self) -> ReportDefinition {
         use ReportCategory::*;
         use ReportErrorType::*;
@@ -210,12 +247,31 @@ pub enum Transport {
     Wt,
 }
 
+impl Transport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Transport::Ws => "ws",
+            Transport::Wt => "wt",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamType {
     Tcp,
     Udp,
     Webtransport,
+}
+
+impl StreamType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StreamType::Tcp => "tcp",
+            StreamType::Udp => "udp",
+            StreamType::Webtransport => "webtransport",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -280,9 +336,16 @@ pub struct Report {
 pub fn create_report(error_type: ReportErrorType, input: ReportInput) -> Report {
     let def = error_type.definition();
     let ctx = input.context;
+    // Most call sites know the client IP but not its hash; derive it so every
+    // report can be matched against the ban list. The transports hash without
+    // a secret, so this agrees with the hash they check bans against.
     let ip_hash = input
         .ip_hash
-        .or_else(|| ctx.as_ref().and_then(|c| c.client_ip_hash.clone()));
+        .or_else(|| ctx.as_ref().and_then(|c| c.client_ip_hash.clone()))
+        .or_else(|| {
+            ctx.as_ref()
+                .and_then(|c| hash_client_ip(c.client_ip.as_deref(), None))
+        });
     let transport = input
         .transport
         .or_else(|| ctx.as_ref().and_then(|c| c.transport));
@@ -315,7 +378,68 @@ pub fn create_report(error_type: ReportErrorType, input: ReportInput) -> Report 
     }
 }
 
-/// Build a report and emit it on the `wisp_reports` tracing target as JSON.
+impl Report {
+    /// One-line `key=value` summary of the optional fields this report
+    /// carries, or `None` when it carries none. The order is fixed so the
+    /// output is stable for display and for tests.
+    pub fn detail(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(transport) = self.transport {
+            parts.push(format!("transport={}", transport.as_str()));
+        }
+        if let Some(origin) = &self.origin {
+            parts.push(format!("origin={origin}"));
+        }
+        if let Some(hostname) = &self.hostname {
+            parts.push(format!("hostname={hostname}"));
+        }
+        if let Some(port) = self.port {
+            parts.push(format!("port={port}"));
+        }
+        if let Some(stream_type) = self.stream_type {
+            parts.push(format!("stream_type={}", stream_type.as_str()));
+        }
+        if let Some(provider) = &self.provider {
+            parts.push(format!("provider={provider}"));
+        }
+        if let Some(request) = &self.proxy_request_type {
+            parts.push(format!("proxy_request_type={request}"));
+        }
+        if let Some(limit_type) = &self.limit_type {
+            parts.push(format!("limit_type={limit_type}"));
+        }
+        if let Some(amount) = self.amount {
+            parts.push(format!("amount={amount}"));
+        }
+        if let Some(code) = self.protocol_code.transport_close_code {
+            parts.push(format!("transport_close_code={code}"));
+        }
+        if let Some(code) = self.protocol_code.wisp_close_code {
+            parts.push(format!("wisp_close_code={code}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    }
+}
+
+/// Receives every report [`emit_report`] produces. Runs inline on the
+/// connection path, so it must return quickly and never block.
+pub type ReportHook = dyn Fn(&Report) + Send + Sync;
+
+/// One hook per process, matching the process-wide tracing target reports
+/// already go to.
+static REPORT_HOOK: RwLock<Option<Arc<ReportHook>>> = RwLock::new(None);
+
+/// Install the report hook, replacing any earlier one; `None` removes it.
+pub fn set_report_hook(hook: Option<Arc<ReportHook>>) {
+    *REPORT_HOOK.write().unwrap_or_else(PoisonError::into_inner) = hook;
+}
+
+/// Build a report and emit it on the `wisp_reports` tracing target as JSON,
+/// then pass it to the hook from [`set_report_hook`].
 /// Call this from admit/reject/close paths so aggregators can scrape stable
 /// `report_code` values without parsing free-form log lines.
 pub fn emit_report(error_type: ReportErrorType, input: ReportInput) {
@@ -338,6 +462,15 @@ pub fn emit_report(error_type: ReportErrorType, input: ReportInput) {
                 "failed to serialize wisp report"
             );
         }
+    }
+    // Clone the Arc out so the hook runs without the lock held; a hook that
+    // calls set_report_hook cannot deadlock against itself.
+    let hook = REPORT_HOOK
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(&report);
     }
 }
 
@@ -409,6 +542,127 @@ mod tests {
                 transport: Some(Transport::Ws),
                 ..Default::default()
             },
+        );
+    }
+
+    #[test]
+    fn kind_matches_the_serialized_name() {
+        use ReportErrorType::*;
+        for error_type in [
+            IpHashBanned,
+            SecurityRateLimited,
+            OriginBlocked,
+            ClientBlocked,
+            ConnectionRateLimited,
+            ConnectionLimit,
+            TcpStreamOpenRateLimited,
+            TcpByteRateLimited,
+            DatagramDropped,
+            DatagramRateLimited,
+            ControlRateLimited,
+            DnsRateLimited,
+            StreamThrottled,
+            StreamPolicyBlocked,
+            LocalhostBlocked,
+            SecurityBlocked,
+            ProtocolInspectionBlocked,
+            HostPolicyBlocked,
+            InvalidPacket,
+            InvalidInfo,
+            FrameTooLarge,
+            HandshakeTimeout,
+            ProxyHopLimitExceeded,
+            ProxyControlSwitch,
+        ] {
+            let serialized = serde_json::to_value(error_type).unwrap();
+            assert_eq!(serialized.as_str(), Some(error_type.kind()));
+        }
+    }
+
+    #[test]
+    fn create_report_hashes_a_bare_client_ip() {
+        let r = create_report(
+            ReportErrorType::ClientBlocked,
+            ReportInput {
+                context: Some(ConnectionContext {
+                    client_ip: Some("203.0.113.5".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            r.ip_hash,
+            hash_client_ip(Some("203.0.113.5"), None),
+            "derived hash must match the one the transports ban on"
+        );
+    }
+
+    #[test]
+    fn detail_lists_present_fields_in_order() {
+        let r = create_report(
+            ReportErrorType::ConnectionRateLimited,
+            ReportInput {
+                transport: Some(Transport::Ws),
+                origin: Some("https://example.test".to_owned()),
+                transport_close_code: Some(429),
+                limit_type: Some("connection_start".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            r.detail().as_deref(),
+            Some(
+                "transport=ws origin=https://example.test limit_type=connection_start \
+                 transport_close_code=429"
+            )
+        );
+        let bare = create_report(ReportErrorType::InvalidPacket, ReportInput::default());
+        assert_eq!(bare.detail(), None);
+    }
+
+    #[test]
+    fn hook_receives_emitted_reports() {
+        use std::sync::mpsc;
+        // The hook is process-wide and other tests emit concurrently, so the
+        // receiver keeps only the report carrying this test's origin.
+        let marker = "https://hook-test.example";
+        let (tx, rx) = mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        set_report_hook(Some(Arc::new(move |report: &Report| {
+            if report.origin.as_deref() == Some(marker) {
+                let _ = tx.lock().unwrap().send((
+                    report.report_code,
+                    report.error_type.kind(),
+                    report.ip_hash.clone(),
+                ));
+            }
+        })));
+        emit_report(
+            ReportErrorType::IpHashBanned,
+            ReportInput {
+                origin: Some(marker.to_owned()),
+                ip_hash: Some("hashy".to_owned()),
+                ..Default::default()
+            },
+        );
+        let (code, kind, ip_hash) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(code, "WISP_IP_HASH_BANNED");
+        assert_eq!(kind, "ip_hash_banned");
+        assert_eq!(ip_hash.as_deref(), Some("hashy"));
+
+        set_report_hook(None);
+        emit_report(
+            ReportErrorType::IpHashBanned,
+            ReportInput {
+                origin: Some(marker.to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a removed hook must not be called"
         );
     }
 }
