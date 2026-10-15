@@ -64,6 +64,7 @@ msquic = "=2.5.1-beta"
 h3 = "0.0.8"
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
+h3-quinn = "0.0.10"
 web-transport-quinn = { version = "0.11.12", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8"
 
@@ -82,12 +83,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # and Protocol::CONNECT_UDP. Master adds Protocol::WEBSOCKET (and CONNECT_IP)
 # which we need for the Wisp v2 WS-over-H3 dispatcher. Pinned to a specific
 # revision so reproducible builds aren't at the mercy of upstream master.
-# All three (h3, h3-webtransport, h3-datagram) come from the same monorepo
-# commit so internal path-deps stay consistent.
+# All of them (h3, h3-webtransport, h3-datagram, and h3-quinn for the
+# end-to-end tests) come from the same monorepo commit so internal path-deps
+# stay consistent.
 [patch.crates-io]
 h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
 h3-webtransport = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
 h3-datagram = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
 
 [patch."ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git"]
 wisp-proxy-base = { path = "../wisp-rust-proxy-providers/crates/wisp-proxy-base" }

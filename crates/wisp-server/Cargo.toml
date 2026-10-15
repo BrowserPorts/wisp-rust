@@ -36,3 +36,11 @@ wisp-proxy = { path = "../wisp-proxy" }
 wisp-quic-msquic = { path = "../wisp-quic-msquic" }
 wisp-ws-h3 = { path = "../wisp-ws-h3" }
 wisp-wisp-server = { path = "../wisp-wisp-server" }
+
+[dev-dependencies]
+h3-quinn = { workspace = true }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.13"
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+wisp-wisp = { path = "../wisp-wisp" }
