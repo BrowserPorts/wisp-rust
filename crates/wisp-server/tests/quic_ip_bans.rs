@@ -5,7 +5,9 @@
 //! certificate and connect with quinn, an independent QUIC stack: h3 drives
 //! WS-over-H3, and `web-transport-quinn`, the client the proxy itself uses for
 //! upstream sessions, drives WebTransport. The msquic listener, the h3 server
-//! and both session paths therefore run for real. Each test checks that an
+//! and both session paths therefore run for real. WS-over-H3 also runs from an
+//! msquic client built on [`MsQuicConnection::connect`], so the adapter's
+//! outbound path carries a real h3 session too. Each test checks that an
 //! unbanned client is served end to end (Wisp data through to a local TCP echo
 //! server), that a banned client is refused with a `WISP_IP_HASH_BANNED`
 //! report, and that clearing the ban admits the next session again.
@@ -25,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use wisp_config::{WispAuthRegistry, WispWtServerOptions};
 use wisp_dos::{ConnectionLimiter, DosGuard};
 use wisp_iphash::{hash_client_ip, IpHashBans};
+use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_reports::{set_report_hook, Report, ReportErrorType};
 use wisp_server::{serve, H3WsContext, ServeExtras, ServeHandle};
 use wisp_wire::{
@@ -311,8 +314,8 @@ impl ServerFrames {
 }
 
 /// Read server frames until a Wisp binary packet arrives.
-async fn next_wisp_packet(
-    stream: &mut h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+async fn next_wisp_packet<S: h3::quic::BidiStream<Bytes>>(
+    stream: &mut h3::client::RequestStream<S, Bytes>,
     frames: &mut ServerFrames,
 ) -> WispPacket {
     loop {
@@ -347,19 +350,28 @@ async fn ws_session(harness: &Harness) -> Outcome {
     .await
     .expect("request goes out")
     .expect("request stream opens");
+    let outcome = ws_exchange(harness, &mut stream).await;
+    finish_h3(endpoint, connection, driver, outcome)
+}
 
+/// Read the WS CONNECT response and, when it is admitted, run the Wisp echo
+/// over the request stream. Shared by the quinn and msquic clients.
+async fn ws_exchange<S: h3::quic::BidiStream<Bytes>>(
+    harness: &Harness,
+    stream: &mut h3::client::RequestStream<S, Bytes>,
+) -> Outcome {
     let response = match timeout(STEP, stream.recv_response()).await {
         Ok(Ok(response)) => response,
         // Closing the stream or the connection without a response is a refusal.
-        Ok(Err(_)) => return finish_h3(endpoint, connection, driver, Outcome::Refused),
+        Ok(Err(_)) => return Outcome::Refused,
         Err(_) => panic!("neither a response nor a close arrived for the WS CONNECT"),
     };
     if response.status() != StatusCode::OK {
-        return finish_h3(endpoint, connection, driver, Outcome::Refused);
+        return Outcome::Refused;
     }
 
     let mut frames = ServerFrames::default();
-    match next_wisp_packet(&mut stream, &mut frames).await {
+    match next_wisp_packet(stream, &mut frames).await {
         WispPacket::Continue(packet) => assert_eq!(packet.stream_id, 0),
         other => panic!("expected the initial CONTINUE, got {other:?}"),
     }
@@ -379,7 +391,7 @@ async fn ws_session(harness: &Harness) -> Outcome {
         .expect("send DATA");
     let mut echoed = Vec::new();
     while echoed.len() < b"hello over ws".len() {
-        match next_wisp_packet(&mut stream, &mut frames).await {
+        match next_wisp_packet(stream, &mut frames).await {
             WispPacket::Data(data) if data.stream_id == 1 => {
                 echoed.extend_from_slice(&data.payload)
             }
@@ -392,7 +404,7 @@ async fn ws_session(harness: &Harness) -> Outcome {
         .send_data(ws_client_frame(0x8, &1000u16.to_be_bytes()))
         .await;
     let _ = stream.finish().await;
-    finish_h3(endpoint, connection, driver, Outcome::Served)
+    Outcome::Served
 }
 
 fn finish_h3(
@@ -408,6 +420,100 @@ fn finish_h3(
 fn finish(endpoint: quinn::Endpoint, connection: quinn::Connection, outcome: Outcome) -> Outcome {
     connection.close(0u32.into(), b"done");
     drop(endpoint);
+    outcome
+}
+
+// msquic WS-over-H3 client --------------------------------------------------
+
+/// Client-side msquic handles. Field order is load-bearing, as in
+/// `MsQuicEngine`: the configuration closes before the registration.
+struct MsQuicClient {
+    configuration: msquic::Configuration,
+    registration: msquic::Registration,
+}
+
+impl MsQuicClient {
+    fn new() -> Self {
+        let registration = msquic::Registration::new(
+            &msquic::RegistrationConfig::new().set_app_name("wisp-test-client".to_owned()),
+        )
+        .expect("client registration opens");
+        // h3 needs room for the server's control and QPACK uni streams, and
+        // h3-datagram expects datagrams to be negotiated.
+        let settings = msquic::Settings::new()
+            .set_PeerBidiStreamCount(16)
+            .set_PeerUnidiStreamCount(16)
+            .set_DatagramReceiveEnabled()
+            .set_IdleTimeoutMs(STEP.as_millis() as u64);
+        let alpn = [msquic::BufferRef::from("h3")];
+        let configuration = msquic::Configuration::open(&registration, &alpn, Some(&settings))
+            .expect("client configuration opens");
+        configuration
+            .load_credential(
+                &msquic::CredentialConfig::new_client().set_credential_flags(
+                    msquic::CredentialFlags::CLIENT
+                        | msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION,
+                ),
+            )
+            .expect("client credentials load");
+        Self {
+            configuration,
+            registration,
+        }
+    }
+
+    /// Close the handles off the runtime. `RegistrationClose` blocks until every
+    /// connection opened under it is closed, so a connection the adapter leaks
+    /// shows up here as a hang.
+    async fn close(self) {
+        timeout(STEP, tokio::task::spawn_blocking(move || drop(self)))
+            .await
+            .expect("every client connection closes, letting the registration close")
+            .expect("close task");
+    }
+}
+
+/// Open a WS-over-H3 session from an msquic client through
+/// [`MsQuicConnection::connect`], the adapter's outbound path.
+async fn msquic_ws_session(harness: &Harness, client: &MsQuicClient) -> Outcome {
+    let connection = timeout(
+        STEP,
+        MsQuicConnection::connect(
+            &client.registration,
+            &client.configuration,
+            "localhost",
+            harness.addr,
+        ),
+    )
+    .await
+    .expect("msquic handshake finishes")
+    .expect("msquic handshake succeeds");
+    let (mut driver, mut send_request) = h3::client::builder()
+        .enable_extended_connect(true)
+        .build::<_, _, Bytes>(connection)
+        .await
+        .expect("h3 client builds over msquic");
+    let driver = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let mut stream = timeout(
+        STEP,
+        send_request.send_request(extended_connect(WS_PATH, Protocol::WEBSOCKET)),
+    )
+    .await
+    .expect("request goes out")
+    .expect("request stream opens");
+    let outcome = ws_exchange(harness, &mut stream).await;
+
+    // Dropping the last request sender closes the connection with
+    // H3_NO_ERROR, which in turn lets the driver finish.
+    drop(stream);
+    drop(send_request);
+    timeout(STEP, driver)
+        .await
+        .expect("the h3 driver finishes once the connection closes")
+        .expect("driver task");
     outcome
 }
 
@@ -526,4 +632,33 @@ async fn webtransport_serves_refuses_banned_client_and_serves_again_after_cleari
     harness.unban();
     assert!(matches!(wt_session(&harness).await, Outcome::Served));
     harness.assert_no_ban_report();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_over_h3_from_msquic_serves_refuses_banned_client_and_serves_again_after_clearing() {
+    let _turn = SERIAL.lock().await;
+    let mut harness = Harness::start().await;
+    let client = MsQuicClient::new();
+
+    assert!(matches!(
+        msquic_ws_session(&harness, &client).await,
+        Outcome::Served
+    ));
+    harness.assert_no_ban_report();
+
+    harness.ban();
+    assert!(matches!(
+        msquic_ws_session(&harness, &client).await,
+        Outcome::Refused
+    ));
+    harness.expect_ban_report().await;
+
+    harness.unban();
+    assert!(matches!(
+        msquic_ws_session(&harness, &client).await,
+        Outcome::Served
+    ));
+    harness.assert_no_ban_report();
+
+    client.close().await;
 }
