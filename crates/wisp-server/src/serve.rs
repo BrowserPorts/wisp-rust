@@ -310,6 +310,36 @@ async fn connection_acceptor(
     }
 }
 
+/// Wait until the peer's SETTINGS frame has been read.
+///
+/// h3 hands out a request as soon as its stream opens, and the peer's control
+/// stream is a separate stream that can arrive later. `WebTransportSession::accept`
+/// checks the peer's settings, and before they arrive it sees h3's defaults,
+/// which do not enable WebTransport, so it refuses a client that does support
+/// it. SETTINGS must be the first frame on the control stream (RFC 9114
+/// section 6.2.1), so this reads nothing past it.
+async fn await_peer_settings(
+    conn: &mut h3::server::Connection<MsQuicConnection, Bytes>,
+) -> Result<(), h3::error::ConnectionError> {
+    let shared = conn.inner.shared.clone();
+    std::future::poll_fn(|cx| loop {
+        // The shared settings are borrowed once the peer's have been stored
+        // and an owned default until then.
+        if matches!(
+            h3::ConnectionState::settings(&*shared),
+            std::borrow::Cow::Borrowed(_)
+        ) {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match conn.inner.poll_control(cx) {
+            std::task::Poll::Ready(Ok(_)) => {}
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
 async fn handle_connection(
     ms_conn: MsQuicConnection,
     peer: Option<SocketAddr>,
@@ -479,6 +509,10 @@ async fn handle_connection(
         }
     };
 
+    tokio::time::timeout(handshake_timeout, await_peer_settings(&mut h3_conn))
+        .await
+        .map_err(|_| HandlerError::WtAccept("peer SETTINGS timed out".to_owned()))?
+        .map_err(|e| HandlerError::WtAccept(format!("{e:?}")))?;
     let session = WebTransportSession::accept(request, stream, h3_conn)
         .await
         .map_err(|e| HandlerError::WtAccept(format!("{e:?}")))?;
