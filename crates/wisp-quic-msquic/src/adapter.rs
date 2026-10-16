@@ -293,6 +293,12 @@ pub(crate) struct ConnectionState {
     datagram_sends: Arc<InFlightSends>,
     connected: AtomicBool,
     connected_notify: Notify,
+    /// Cancelled once msquic reports SHUTDOWN_COMPLETE. Only then may the handle
+    /// be closed without cutting off a CONNECTION_CLOSE still queued to send.
+    shutdown_complete: CancellationToken,
+    /// False for an outbound connection whose start failed. msquic never
+    /// reports SHUTDOWN_COMPLETE for it, so its handle closes straight away.
+    started: AtomicBool,
     /// Runtime that owns this connection's async side. msquic delivers events
     /// on its own worker threads, which have no Tokio context, so anything the
     /// callbacks need to spawn goes through this handle.
@@ -368,6 +374,8 @@ impl MsQuicConnection {
             datagram_sends: Arc::default(),
             connected: AtomicBool::new(false),
             connected_notify: Notify::new(),
+            shutdown_complete: CancellationToken::new(),
+            started: AtomicBool::new(true),
             runtime,
         });
         let connection = Arc::new(connection);
@@ -423,10 +431,14 @@ impl MsQuicConnection {
         .map_err(AdapterError::MsQuic)?;
 
         let connected = Self::install(connection, tokio::runtime::Handle::current());
-        connected
-            .connection
-            .start(configuration, server_name, remote_addr.port())
-            .map_err(AdapterError::MsQuic)?;
+        if let Err(status) =
+            connected
+                .connection
+                .start(configuration, server_name, remote_addr.port())
+        {
+            connected.state.started.store(false, Ordering::Release);
+            return Err(AdapterError::MsQuic(status));
+        }
         wait_for_connected(&connected.state).await?;
         Ok(connected)
     }
@@ -435,6 +447,30 @@ impl MsQuicConnection {
     pub fn close_with_code(&self, error_code: u64) {
         self.connection
             .shutdown(ConnectionShutdownFlags::NONE, error_code);
+    }
+}
+
+impl Drop for MsQuicConnection {
+    /// Dropping the owning handle ends the session, and the peer has to hear
+    /// about it. Closing an msquic handle shuts the connection down silently,
+    /// and closing it right after `ConnectionShutdown` forces that silent path
+    /// before the queued CONNECTION_CLOSE is sent. Either way the peer only
+    /// finds out at its idle timeout. So shut down gracefully (a no-op if the
+    /// connection is already shutting down) and keep the handle open on the
+    /// runtime until msquic reports SHUTDOWN_COMPLETE.
+    fn drop(&mut self) {
+        self.connection
+            .shutdown(ConnectionShutdownFlags::NONE, Code::H3_NO_ERROR.value());
+        if !self.state.started.load(Ordering::Acquire) {
+            return;
+        }
+        let connection = self.connection.clone();
+        let shutdown_complete = self.state.shutdown_complete.clone();
+        // If the runtime is gone the task is dropped and the handle closes now.
+        self.state.runtime.spawn(async move {
+            shutdown_complete.cancelled().await;
+            drop(connection);
+        });
     }
 }
 
@@ -570,12 +606,12 @@ fn on_connection_event(
             };
             state.close(err);
         }
-        ConnectionEvent::ShutdownComplete { .. } if state.closed.read().is_none() => {
-            state.close(ConnectionErrorIncoming::ApplicationClose { error_code: 0 });
-            state.streams.clear();
-        }
         ConnectionEvent::ShutdownComplete { .. } => {
+            if state.closed.read().is_none() {
+                state.close(ConnectionErrorIncoming::ApplicationClose { error_code: 0 });
+            }
             state.streams.clear();
+            state.shutdown_complete.cancel();
         }
         _ => {}
     }
@@ -1375,6 +1411,8 @@ mod tests {
             datagram_sends: Arc::default(),
             connected: AtomicBool::new(false),
             connected_notify: Notify::new(),
+            shutdown_complete: CancellationToken::new(),
+            started: AtomicBool::new(true),
             runtime: tokio::runtime::Handle::current(),
         })
     }
