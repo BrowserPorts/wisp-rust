@@ -712,14 +712,25 @@ fn on_stream_event(
             for b in buffers {
                 buf.extend_from_slice(b.as_bytes());
             }
-            chans
-                .recv_tx
-                .try_send(RecvItem {
-                    result: Ok(buf.freeze()),
-                    complete_len: Some(*total_buffer_length),
-                })
-                .map_err(|_| Status::new(StatusCode::QUIC_STATUS_OUT_OF_MEMORY))?;
-            return Err(Status::new(StatusCode::QUIC_STATUS_PENDING));
+            let item = RecvItem {
+                result: Ok(buf.freeze()),
+                complete_len: Some(*total_buffer_length),
+            };
+            // msquic forbids failing a receive (a debug build aborts the
+            // process on it), so every path either queues or consumes.
+            return match chans.recv_tx.try_send(item) {
+                // The reader completes the receive once it takes the bytes.
+                Ok(()) => Err(Status::new(StatusCode::QUIC_STATUS_PENDING)),
+                // The reader is gone, so nothing will read these bytes. The
+                // peer may still have data in flight, which QUIC allows.
+                Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+                // msquic indicates no further receive while one is pending, so
+                // the queue only ever holds one data item and cannot fill.
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::error!(stream_id = ?key, "msquic receive queue full, dropping bytes");
+                    Ok(())
+                }
+            };
         }
         StreamEvent::PeerSendShutdown => {
             let _ = chans.recv_tx.try_send(RecvItem {
