@@ -6,7 +6,8 @@
 //!
 //! 1. [`engine`] — synchronous bootstrap of the msquic registration,
 //!    configuration, and listener with the transport settings (BBR,
-//!    RFC 9221 datagrams, 64 MiB connection flow-control window).
+//!    RFC 9221 datagrams, msquic's default flow-control windows, Retry for
+//!    every new address, no resumption).
 //!
 //! 2. [`adapter`] — the `h3::quic::Connection<Bytes>` impl plus stream
 //!    pumps that turn the msquic callback model into async streams.
@@ -19,6 +20,8 @@
 //! on the include path. Set `SDKROOT=$(xcrun --sdk macosx --show-sdk-path)`
 //! before `cargo build` and the build succeeds. Linux and Docker (the
 //! deployment platform) need no env changes.
+
+#![deny(unsafe_code)]
 
 pub mod adapter;
 pub mod engine;

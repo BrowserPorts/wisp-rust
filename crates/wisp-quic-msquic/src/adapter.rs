@@ -47,6 +47,7 @@ use std::{
     ffi::c_void,
     future::Future,
     net::SocketAddr,
+    ops::Deref,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -56,10 +57,17 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, Notify};
-use tokio_util::sync::{CancellationToken, PollSender};
+use tokio_util::sync::{CancellationToken, PollSender, WaitForCancellationFutureOwned};
 
 const DATAGRAM_RECEIVE_QUEUE_CAPACITY: usize = 256;
-const NEW_STREAM_QUEUE_CAPACITY: usize = 256;
+/// Peer streams waiting for h3 to accept them. msquic's stream count limits
+/// already bound how many a peer can open; this keeps the backlog an unpolled
+/// connection can build small, and a stream that does not fit is refused.
+const NEW_STREAM_QUEUE_CAPACITY: usize = 32;
+/// Datagrams handed to msquic and not yet acknowledged, lost or cancelled.
+/// Past this, new datagrams are refused: a peer that stops acknowledging must
+/// not make the server hold an unbounded queue of payloads for it.
+const DATAGRAM_IN_FLIGHT_CAPACITY: usize = 1024;
 const STREAM_RECEIVE_QUEUE_CAPACITY: usize = 4;
 const STREAM_SEND_QUEUE_CAPACITY: usize = 8;
 
@@ -135,7 +143,7 @@ pub(crate) enum NewStreamKind {
 }
 
 pub(crate) struct NewStreamEvent {
-    pub stream: Arc<Stream>,
+    pub stream: Arc<StreamHandle>,
     pub stream_id: u64,
     pub recv_rx: mpsc::Receiver<RecvItem>,
     pub send_tx: mpsc::Sender<SendItem>,
@@ -201,13 +209,10 @@ impl PinnedSend {
     }
 
     /// The buffers to pass to msquic: none for an empty payload, which is how a
-    /// FIN-only send is expressed.
-    ///
-    /// # Safety
-    /// `pinned` must come from [`PinnedSend::pin`] and not have been released.
-    unsafe fn buffers<'a>(pinned: *const Self) -> &'a [msquic::BufferRef] {
-        let this = unsafe { &*pinned };
-        &this.descriptor[..usize::from(!this.payload.is_empty())]
+    /// FIN-only send is expressed. Borrowed from `self`, so the slice cannot
+    /// outlive the reference the caller made from the pinned pointer.
+    fn buffers(&self) -> &[msquic::BufferRef] {
+        &self.descriptor[..usize::from(!self.payload.is_empty())]
     }
 }
 
@@ -224,8 +229,25 @@ impl InFlightSends {
         self.0.lock().insert(pinned as usize);
     }
 
+    /// Track `pinned` unless `cap` sends are already in flight. Refused sends
+    /// are not tracked, so the caller still owns the box.
+    fn try_track(&self, pinned: *mut PinnedSend, cap: usize) -> bool {
+        let mut sends = self.0.lock();
+        if sends.len() >= cap {
+            return false;
+        }
+        sends.insert(pinned as usize);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+
     /// Release a send msquic completed. Does nothing for an address that is
     /// not tracked, so the box can never be freed twice.
+    #[allow(unsafe_code)]
     fn complete(&self, client_context: *const c_void) {
         if self.0.lock().remove(&(client_context as usize)) {
             // SAFETY: the address came from `PinnedSend::pin` and was still
@@ -234,6 +256,7 @@ impl InFlightSends {
         }
     }
 
+    #[allow(unsafe_code)]
     fn release_all(&self) {
         for address in self.0.lock().drain() {
             // SAFETY: as in `complete`; draining removes the only record.
@@ -252,6 +275,7 @@ impl Drop for ReleaseInFlight {
     }
 }
 
+#[allow(unsafe_code)]
 fn submit_stream_send(
     stream: &Stream,
     sends: &InFlightSends,
@@ -266,8 +290,11 @@ fn submit_stream_send(
     // before `send` returns.
     sends.track(pinned);
     // SAFETY: `pinned` stays allocated until `complete` or `release_all`, which
-    // only run after msquic reports the send finished or the handle is closed.
-    let result = unsafe { stream.send(PinnedSend::buffers(pinned), flags, pinned.cast()) };
+    // only run after msquic reports the send finished or the handle is closed,
+    // and nothing else touches it until then.
+    let pinned_ref = unsafe { &*pinned };
+    // SAFETY: the buffers live in that same allocation, see above.
+    let result = unsafe { stream.send(pinned_ref.buffers(), flags, pinned.cast()) };
     if result.is_err() {
         // msquic does not report completion for a send it refused.
         sends.complete(pinned.cast());
@@ -288,6 +315,9 @@ pub(crate) struct ConnectionState {
     /// event. Used to short-circuit further sends and emit
     /// `ConnectionErrorIncoming` to h3.
     closed: Arc<RwLock<Option<ConnectionErrorIncoming>>>,
+    /// Cancelled by [`ConnectionState::close`]. Wakes the datagram receiver and
+    /// the stream accept calls, which would otherwise wait forever on queues
+    /// whose senders live as long as this state.
     datagram_cancel: CancellationToken,
     /// Datagrams handed to msquic and not yet in a final state.
     datagram_sends: Arc<InFlightSends>,
@@ -344,6 +374,10 @@ pub struct MsQuicConnection {
     state: Arc<ConnectionState>,
     new_bidi_rx: mpsc::Receiver<NewStreamEvent>,
     new_uni_rx: mpsc::Receiver<NewStreamEvent>,
+    /// Ready once the connection has closed; one per accept call, since each
+    /// keeps its own waker.
+    bidi_closed: Pin<Box<WaitForCancellationFutureOwned>>,
+    uni_closed: Pin<Box<WaitForCancellationFutureOwned>>,
     datagram_rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
     /// Last advertised max datagram length from msquic.
     pub max_datagram_size: Arc<RwLock<u16>>,
@@ -399,6 +433,8 @@ impl MsQuicConnection {
         });
         Self {
             connection,
+            bidi_closed: Box::pin(state.datagram_cancel.clone().cancelled_owned()),
+            uni_closed: Box::pin(state.datagram_cancel.clone().cancelled_owned()),
             state,
             new_bidi_rx,
             new_uni_rx,
@@ -410,6 +446,7 @@ impl MsQuicConnection {
 
     /// Open an outbound connection to an already policy-checked address while
     /// retaining `server_name` for TLS SNI and certificate validation.
+    #[allow(unsafe_code)]
     pub async fn connect(
         registration: &Registration,
         configuration: &Configuration,
@@ -448,6 +485,13 @@ impl MsQuicConnection {
         self.connection
             .shutdown(ConnectionShutdownFlags::NONE, error_code);
     }
+
+    /// Wait for the handshake to finish. A server connection is handed over
+    /// from the listener before its handshake completes, and only a connected
+    /// peer has proven its address and finished TLS.
+    pub async fn connected(&self) -> Result<(), AdapterError> {
+        wait_for_connected(&self.state).await
+    }
 }
 
 impl Drop for MsQuicConnection {
@@ -469,7 +513,9 @@ impl Drop for MsQuicConnection {
         // If the runtime is gone the task is dropped and the handle closes now.
         self.state.runtime.spawn(async move {
             shutdown_complete.cancelled().await;
-            drop(connection);
+            // ConnectionClose waits for msquic's worker, so keep it off the
+            // async workers.
+            close_off_runtime(connection);
         });
     }
 }
@@ -486,6 +532,7 @@ async fn wait_for_connected(state: &ConnectionState) -> Result<(), AdapterError>
     }
 }
 
+#[allow(unsafe_code)]
 fn send_datagram_inner(
     connection: &Arc<Connection>,
     sends: &InFlightSends,
@@ -501,19 +548,27 @@ fn send_datagram_inner(
     if max != 0 && payload.len() > max as usize {
         return Err(AdapterError::DatagramRejected);
     }
-    let mut flags = SendFlags::NONE;
+    // A datagram msquic cannot send right away (congestion or pacing) is
+    // cancelled instead of queued: late datagrams are worthless, and a peer
+    // that withholds acknowledgements must not grow the send queue.
+    let mut flags = SendFlags::CANCEL_ON_BLOCKED;
     if matches!(class, DatagramClass::Interactive) {
         flags |= SendFlags::DGRAM_PRIORITY;
     }
     let pinned = PinnedSend::pin(payload);
     // Tracked before the call, as for streams: the final state change can
     // arrive on a worker thread before `datagram_send` returns.
-    sends.track(pinned);
+    if !sends.try_track(pinned, DATAGRAM_IN_FLIGHT_CAPACITY) {
+        // SAFETY: never tracked or handed to msquic, so this is the only owner.
+        unsafe { drop(Box::from_raw(pinned)) };
+        return Err(AdapterError::DatagramRejected);
+    }
     // SAFETY: `pinned` stays allocated until the final state change or the
     // connection handle is closed; see `PinnedSend`.
-    let res = unsafe {
-        connection.datagram_send(PinnedSend::buffers(pinned), flags, pinned as *const c_void)
-    };
+    let pinned_ref = unsafe { &*pinned };
+    // SAFETY: the buffers live in that same allocation, see above.
+    let res =
+        unsafe { connection.datagram_send(pinned_ref.buffers(), flags, pinned as *const c_void) };
     if let Err(e) = res {
         // msquic reports nothing for a datagram it refused.
         sends.complete(pinned as *const c_void);
@@ -522,6 +577,7 @@ fn send_datagram_inner(
     Ok(())
 }
 
+#[allow(unsafe_code)]
 fn on_connection_event(
     state: &Arc<ConnectionState>,
     max_size: &RwLock<u16>,
@@ -537,7 +593,7 @@ fn on_connection_event(
             // SAFETY: msquic transferred ownership in the callback per the
             // PEER_STREAM_STARTED contract; from_raw matches the doc.
             let owned = unsafe { Stream::from_raw(stream.as_raw()) };
-            let owned = Arc::new(owned);
+            let owned = Arc::new(StreamHandle::new(owned));
             let kind = if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
                 NewStreamKind::Uni
             } else {
@@ -558,7 +614,10 @@ fn on_connection_event(
             };
             if let Err(error) = tx.try_send(evt) {
                 let rejected = error.into_inner();
-                let _ = rejected.stream.shutdown(StreamShutdownFlags::ABORT, 0);
+                let _ = rejected.stream.shutdown(
+                    StreamShutdownFlags::ABORT,
+                    Code::H3_REQUEST_REJECTED.value(),
+                );
                 state.streams.remove(&stream_id);
             }
         }
@@ -665,9 +724,9 @@ fn stream_callback(
 ) -> impl for<'a> FnMut(msquic::StreamRef, StreamEvent<'a>) -> Result<(), Status> + 'static {
     // Lives and dies with the stream's callback context.
     let release_sends = ReleaseInFlight(binding.sends.clone());
-    move |_, ev| {
+    move |stream, ev| {
         let _ = &release_sends;
-        let hook = std::panic::AssertUnwindSafe(|| on_stream_event(&state, &binding, ev));
+        let hook = std::panic::AssertUnwindSafe(|| on_stream_event(&state, &binding, &stream, ev));
         match std::panic::catch_unwind(hook) {
             Ok(result) => result,
             Err(_) => {
@@ -681,7 +740,7 @@ fn stream_callback(
 /// Register a started stream under its id and spawn its send worker.
 fn start_stream(
     state: &Arc<ConnectionState>,
-    stream: Arc<Stream>,
+    stream: Arc<StreamHandle>,
     parts: StreamParts,
     stream_id: u64,
 ) -> NewStreamEvent {
@@ -723,6 +782,7 @@ fn start_stream(
 fn on_stream_event(
     state: &ConnectionState,
     binding: &StreamBinding,
+    stream: &Stream,
     event: StreamEvent<'_>,
 ) -> Result<(), Status> {
     // Events before a local stream is bound to its id carry nothing to route.
@@ -744,6 +804,16 @@ fn on_stream_event(
             total_buffer_length,
             ..
         } => {
+            if chans.recv_tx.is_closed() {
+                // Nothing will read this stream again. Consume the bytes
+                // without copying them, and tell the peer to stop sending
+                // instead of granting it more credit to fill.
+                let _ = stream.shutdown(
+                    StreamShutdownFlags::ABORT_RECEIVE,
+                    Code::H3_NO_ERROR.value(),
+                );
+                return Ok(());
+            }
             let mut buf = BytesMut::with_capacity(*total_buffer_length as usize);
             for b in buffers {
                 buf.extend_from_slice(b.as_bytes());
@@ -757,9 +827,14 @@ fn on_stream_event(
             return match chans.recv_tx.try_send(item) {
                 // The reader completes the receive once it takes the bytes.
                 Ok(()) => Err(Status::new(StatusCode::QUIC_STATUS_PENDING)),
-                // The reader is gone, so nothing will read these bytes. The
-                // peer may still have data in flight, which QUIC allows.
-                Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+                // The reader went away during the copy; see above.
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    let _ = stream.shutdown(
+                        StreamShutdownFlags::ABORT_RECEIVE,
+                        Code::H3_NO_ERROR.value(),
+                    );
+                    Ok(())
+                }
                 // msquic indicates no further receive while one is pending, so
                 // the queue only ever holds one data item and cannot fill.
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -794,6 +869,7 @@ fn on_stream_event(
 }
 
 /// QUIC_PARAM_STREAM_PRIORITY — exposed as a safe wrapper over the unsafe FFI.
+#[allow(unsafe_code)]
 fn set_stream_priority(stream: &Stream, priority: u16) -> Result<(), AdapterError> {
     // SAFETY: handle is owned by the Arc<Stream> for the duration of this
     // call; pointer + length describe a local stack value with stable address.
@@ -808,13 +884,56 @@ fn set_stream_priority(stream: &Stream, priority: u16) -> Result<(), AdapterErro
     .map_err(AdapterError::MsQuic)
 }
 
+/// Owns an msquic stream handle. `StreamClose` waits for the connection's
+/// msquic worker, so the last owner to drop on a Tokio runtime hands the close
+/// to the blocking pool instead of stalling an async worker on it.
+pub(crate) struct StreamHandle(Option<Stream>);
+
+impl StreamHandle {
+    fn new(stream: Stream) -> Self {
+        Self(Some(stream))
+    }
+}
+
+impl Deref for StreamHandle {
+    type Target = Stream;
+
+    fn deref(&self) -> &Stream {
+        // Only `Drop` takes the stream out.
+        self.0
+            .as_ref()
+            .expect("stream handle is present until drop")
+    }
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        if let Some(stream) = self.0.take() {
+            close_off_runtime(stream);
+        }
+    }
+}
+
+/// Drop an msquic handle, whose close call blocks until msquic's worker has
+/// processed it, on the blocking pool when called from a Tokio runtime and in
+/// place otherwise (msquic's own threads, plain threads, a runtime that is
+/// shutting down).
+fn close_off_runtime<T: Send + 'static>(handle: T) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(move || drop(handle));
+        }
+        Err(_) => drop(handle),
+    }
+}
+
 pub struct MsQuicSendStream {
     send_tx: PollSender<SendItem>,
     /// Frame accepted by `send_data` and not yet handed to the send worker.
     /// h3 calls `send_data` first and drives it out with `poll_ready`, so the
     /// frame waits here until the worker queue has room.
     pending: Option<SendItem>,
-    stream: Arc<Stream>,
+    stream: Arc<StreamHandle>,
     stream_id: StreamId,
     fin_sent: bool,
     fin_state: Arc<FinState>,
@@ -822,8 +941,23 @@ pub struct MsQuicSendStream {
 
 pub struct MsQuicRecvStream {
     recv_rx: mpsc::Receiver<RecvItem>,
-    stream: Arc<Stream>,
+    stream: Arc<StreamHandle>,
     stream_id: StreamId,
+    /// Set once the peer's FIN or an error has been read. A receive half
+    /// dropped before that sends STOP_SENDING, so the peer stops spending
+    /// flow-control credit on bytes nobody will read.
+    finished: bool,
+}
+
+impl Drop for MsQuicRecvStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.stream.shutdown(
+                StreamShutdownFlags::ABORT_RECEIVE,
+                Code::H3_NO_ERROR.value(),
+            );
+        }
+    }
 }
 
 pub struct MsQuicBidiStream {
@@ -955,21 +1089,31 @@ impl H3RecvStream for MsQuicRecvStream {
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
         match self.recv_rx.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(Ok(None)),
+            Poll::Ready(None) => {
+                self.finished = true;
+                Poll::Ready(Ok(None))
+            }
             Poll::Ready(Some(item)) => {
                 if let Some(len) = item.complete_len {
                     self.stream.receive_complete(len);
                 }
                 match item.result {
-                    Ok(b) if b.is_empty() => Poll::Ready(Ok(None)),
+                    Ok(b) if b.is_empty() => {
+                        self.finished = true;
+                        Poll::Ready(Ok(None))
+                    }
                     Ok(b) => Poll::Ready(Ok(Some(b))),
-                    Err(error) => Poll::Ready(Err(error)),
+                    Err(error) => {
+                        self.finished = true;
+                        Poll::Ready(Err(error))
+                    }
                 }
             }
         }
     }
 
     fn stop_sending(&mut self, error_code: u64) {
+        self.finished = true;
         let _ = self
             .stream
             .shutdown(StreamShutdownFlags::ABORT_RECEIVE, error_code);
@@ -1100,7 +1244,7 @@ impl MsQuicOpener {
         stream
             .start(msquic::StreamStartFlags::IMMEDIATE)
             .map_err(|e| stream_unknown(AdapterError::MsQuic(e)))?;
-        let stream = Arc::new(stream);
+        let stream = Arc::new(StreamHandle::new(stream));
         let Ok(stream_id) = stream.get_stream_id() else {
             return Err(stream_unknown(AdapterError::StreamIdUnavailable));
         };
@@ -1132,6 +1276,7 @@ fn evt_to_recv_stream(evt: NewStreamEvent) -> Result<MsQuicRecvStream, AdapterEr
         recv_rx: evt.recv_rx,
         stream: evt.stream,
         stream_id,
+        finished: false,
     })
 }
 
@@ -1150,6 +1295,7 @@ fn evt_to_bidi(evt: NewStreamEvent) -> Result<MsQuicBidiStream, AdapterError> {
         recv_rx: evt.recv_rx,
         stream: evt.stream,
         stream_id,
+        finished: false,
     };
     Ok(MsQuicBidiStream { send, recv })
 }
@@ -1216,6 +1362,14 @@ impl H3OpenStreams<Bytes> for MsQuicConnection {
     }
 }
 
+impl MsQuicConnection {
+    fn closed_error(&self) -> ConnectionErrorIncoming {
+        self.state
+            .closed_err()
+            .unwrap_or(ConnectionErrorIncoming::ApplicationClose { error_code: 0 })
+    }
+}
+
 impl quic::Connection<Bytes> for MsQuicConnection {
     type RecvStream = MsQuicRecvStream;
     type OpenStreams = MsQuicOpener;
@@ -1225,18 +1379,15 @@ impl quic::Connection<Bytes> for MsQuicConnection {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
         match self.new_uni_rx.poll_recv(cx) {
+            Poll::Pending if self.uni_closed.as_mut().poll(cx).is_ready() => {
+                Poll::Ready(Err(self.closed_error()))
+            }
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(evt)) => Poll::Ready(
                 evt_to_recv_stream(evt)
                     .map_err(|error| ConnectionErrorIncoming::InternalError(error.to_string())),
             ),
-            Poll::Ready(None) => {
-                let err = self
-                    .state
-                    .closed_err()
-                    .unwrap_or_else(|| ConnectionErrorIncoming::ApplicationClose { error_code: 0 });
-                Poll::Ready(Err(err))
-            }
+            Poll::Ready(None) => Poll::Ready(Err(self.closed_error())),
         }
     }
 
@@ -1245,18 +1396,15 @@ impl quic::Connection<Bytes> for MsQuicConnection {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
         match self.new_bidi_rx.poll_recv(cx) {
+            Poll::Pending if self.bidi_closed.as_mut().poll(cx).is_ready() => {
+                Poll::Ready(Err(self.closed_error()))
+            }
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(evt)) => Poll::Ready(
                 evt_to_bidi(evt)
                     .map_err(|error| ConnectionErrorIncoming::InternalError(error.to_string())),
             ),
-            Poll::Ready(None) => {
-                let err = self
-                    .state
-                    .closed_err()
-                    .unwrap_or_else(|| ConnectionErrorIncoming::ApplicationClose { error_code: 0 });
-                Poll::Ready(Err(err))
-            }
+            Poll::Ready(None) => Poll::Ready(Err(self.closed_error())),
         }
     }
 
@@ -1503,6 +1651,7 @@ mod tests {
         assert!(matches!(err, AdapterError::ConnectionShutdown));
     }
 
+    #[allow(unsafe_code)]
     fn send_stream(capacity: usize) -> (MsQuicSendStream, mpsc::Receiver<SendItem>) {
         let (send_tx, send_rx) = mpsc::channel(capacity);
         // A null handle is never passed to msquic here and closing it is a no-op.
@@ -1511,7 +1660,7 @@ mod tests {
         let send = MsQuicSendStream {
             send_tx: PollSender::new(send_tx),
             pending: None,
-            stream: Arc::new(stream),
+            stream: Arc::new(StreamHandle::new(stream)),
             stream_id: StreamId::try_from(0).unwrap(),
             fin_sent: false,
             fin_state: Arc::new(FinState::new()),
@@ -1594,10 +1743,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn pinned_send_describes_its_own_payload() {
         let pinned = PinnedSend::pin(Bytes::from_static(b"payload"));
         // SAFETY: just pinned, released below.
-        let buffers = unsafe { PinnedSend::buffers(pinned) };
+        let buffers = unsafe { &*pinned }.buffers();
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0].as_bytes(), b"payload");
         // The descriptor array lives inside the allocation msquic is given, not
@@ -1611,10 +1761,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn pinned_send_without_payload_passes_no_buffers() {
         let pinned = PinnedSend::pin(Bytes::new());
         // SAFETY: just pinned, released below.
-        assert!(unsafe { PinnedSend::buffers(pinned) }.is_empty());
+        assert!(unsafe { &*pinned }.buffers().is_empty());
         // SAFETY: matches `pin`.
         unsafe { drop(Box::from_raw(pinned)) };
     }
@@ -1639,6 +1790,38 @@ mod tests {
         // What msquic never completed is freed when the handle's context drops.
         drop(ReleaseInFlight(Arc::new(sends)));
         assert_eq!(freed.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn datagram_in_flight_sends_are_capped() {
+        let sends = InFlightSends::default();
+        let pinned: Vec<_> = (0..3)
+            .map(|_| PinnedSend::pin(Bytes::from_static(b"d")))
+            .collect();
+        assert!(sends.try_track(pinned[0], 2));
+        assert!(sends.try_track(pinned[1], 2));
+        assert!(
+            !sends.try_track(pinned[2], 2),
+            "the cap refuses a third send"
+        );
+        assert_eq!(sends.len(), 2);
+        // A completion frees room again.
+        sends.complete(pinned[0].cast());
+        assert!(sends.try_track(pinned[2], 2));
+        sends.release_all();
+        assert_eq!(sends.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn accept_calls_end_once_the_connection_closes() {
+        // The accept queues' senders live in the shared state for as long as
+        // the connection does, so only the close signal can end a pending
+        // accept.
+        let state = connection_state();
+        let mut bidi_closed = Box::pin(state.datagram_cancel.clone().cancelled_owned());
+        assert!(poll(|cx| bidi_closed.as_mut().poll(cx)).is_pending());
+        state.close(ConnectionErrorIncoming::ApplicationClose { error_code: 3 });
+        assert!(poll(|cx| bidi_closed.as_mut().poll(cx)).is_ready());
     }
 
     #[test]
