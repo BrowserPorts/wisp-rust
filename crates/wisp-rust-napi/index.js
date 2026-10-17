@@ -701,3 +701,4 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.WispRust = nativeBinding.WispRust
+module.exports.hashClientIp = nativeBinding.hashClientIp

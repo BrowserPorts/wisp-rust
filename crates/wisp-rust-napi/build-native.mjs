@@ -17,6 +17,11 @@
  * process's own node binary, and cargo is whatever `CARGO` names, the way cargo's own tools resolve
  * it.
  *
+ * `--release` selects the workspace's `release-napi` profile rather than `release`: the addon runs
+ * inside the Bun front, and `release` aborts the whole process on any panic, where `release-napi`
+ * unwinds. Every cargo call runs with `--locked`, so the build uses exactly the reviewed Cargo.lock
+ * and fails instead of resolving anything new.
+ *
  * Usage: node build-native.mjs [--release | --profile <name>] [--target <triple>]
  *                             [--target-dir <dir>] [--output-dir <dir>]
  *                             [--features <list>] [--no-default-features]
@@ -50,6 +55,8 @@ const manifestPath = join(crateDir, "Cargo.toml");
 const localRequire = createRequire(import.meta.url);
 /** cargo exports CARGO for the tools it spawns and napi honors it, so every call here agrees. */
 const cargo = env("CARGO") || "cargo";
+/** The profile `--release` stands for; see the header. */
+const RELEASE_PROFILE = "release-napi";
 
 function fail(message) {
 	console.error(`[build-native] ${message}`);
@@ -267,16 +274,23 @@ function msquicPackage(metadata) {
 }
 
 const options = parseArgs(process.argv.slice(2));
-const metadata = JSON.parse(capture(cargo, ["metadata", "--format-version", "1", "--manifest-path", manifestPath]));
+const metadata = JSON.parse(
+	capture(cargo, ["metadata", "--locked", "--format-version", "1", "--manifest-path", manifestPath]),
+);
 const triple = resolveTriple(options);
 const targetDir = resolveTargetDir(options, metadata);
 const outputDir = options.outputDir ? resolve(crateDir, options.outputDir) : crateDir;
-const profileArgs = options.release ? ["--release"] : options.profile ? ["--profile", options.profile] : [];
+const profileArgs = options.release
+	? ["--profile", RELEASE_PROFILE]
+	: options.profile
+		? ["--profile", options.profile]
+		: [];
 const featureArgs = [
 	...(options.features ? ["--features", options.features] : []),
 	...(options.noDefaultFeatures ? ["--no-default-features"] : []),
 ];
 const cargoArgs = [
+	"--locked",
 	"--manifest-path",
 	manifestPath,
 	"--target",
@@ -310,6 +324,9 @@ try {
 		staging,
 		...profileArgs,
 		...featureArgs,
+		// Everything after `--` goes to cargo unchanged.
+		"--",
+		"--locked",
 	]);
 
 	const built = readdirSync(staging).filter((name) => name.endsWith(".node"));

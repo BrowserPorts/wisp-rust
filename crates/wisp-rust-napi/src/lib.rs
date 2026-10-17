@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -38,7 +40,9 @@ struct WispRustState {
     configured_auth_tokens: HashMap<String, WispAuthTokenPolicy>,
     configured_auth_handler: Option<AuthHandler>,
     configured_limit_profiles: HashMap<String, WispServerOptions>,
-    pending_policy: ProxyRuntimePolicy,
+    /// Policy set through `set_policy`. `None` until then, so starting the
+    /// runtime keeps the policy built from the config.
+    pending_policy: Option<ProxyRuntimePolicy>,
     pending_blocked_ips: HashSet<String>,
     /// Banned client IP hashes. Owned here, not by the runtime, so bans set
     /// before `start()` apply from the first connection and survive a restart.
@@ -56,8 +60,20 @@ pub struct WispReport {
     pub ip_hash: Option<String>,
     /// Unix time in milliseconds.
     pub at: i64,
-    /// `key=value` summary of whatever the report carries, or `null`.
+    /// `key=value` summary of whatever the report carries, or `null`. Kept for
+    /// compatibility; read the fields below instead of splitting it.
     pub detail: Option<String>,
+    pub transport: Option<String>,
+    pub origin: Option<String>,
+    pub hostname: Option<String>,
+    pub port: Option<u32>,
+    pub stream_type: Option<String>,
+    pub proxy_request_type: Option<String>,
+    pub provider: Option<String>,
+    pub limit_type: Option<String>,
+    pub amount: Option<i64>,
+    pub transport_close_code: Option<i32>,
+    pub wisp_close_code: Option<i32>,
 }
 
 impl From<&Report> for WispReport {
@@ -68,6 +84,17 @@ impl From<&Report> for WispReport {
             ip_hash: report.ip_hash.clone(),
             at: report.occurred_at,
             detail: report.detail(),
+            transport: report.transport.map(|value| value.as_str().to_owned()),
+            origin: report.origin.clone(),
+            hostname: report.hostname.clone(),
+            port: report.port.map(u32::from),
+            stream_type: report.stream_type.map(|value| value.as_str().to_owned()),
+            proxy_request_type: report.proxy_request_type.clone(),
+            provider: report.provider.clone(),
+            limit_type: report.limit_type.clone(),
+            amount: report.amount,
+            transport_close_code: report.protocol_code.transport_close_code,
+            wisp_close_code: report.protocol_code.wisp_close_code,
         }
     }
 }
@@ -79,29 +106,132 @@ type ReportCallback =
 
 type AuthHandler = Arc<ThreadsafeFunction<String, Promise<Value>, String, Status, false>>;
 
+/// A token the JS handler refused is remembered this long, so a client
+/// retrying a bad token does not reach the handler each time.
+const AUTH_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Refused tokens remembered at most; expired entries go first, then all.
+const AUTH_NEGATIVE_CACHE_MAX: usize = 4096;
+/// JS handler calls in flight at once. A token arriving while all are busy is
+/// refused at once instead of queueing behind them.
+const AUTH_HANDLER_MAX_IN_FLIGHT: usize = 64;
+/// A handler call that has not settled by then is abandoned and its slot
+/// freed, even if the listener stopped waiting for it earlier.
+const AUTH_HANDLER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct NapiAuthResolver {
     tokens: HashMap<String, WispAuthTokenPolicy>,
     handler: Option<AuthHandler>,
+    gate: Arc<AuthHandlerGate>,
+}
+
+/// Bounds the work unknown tokens can cause in the JS handler: a short-lived
+/// cache of refused tokens (keyed by a keyed hash, never the token) and a cap
+/// on calls in flight.
+struct AuthHandlerGate {
+    hasher: std::collections::hash_map::RandomState,
+    refused: Mutex<HashMap<u64, std::time::Instant>>,
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+impl AuthHandlerGate {
+    fn new() -> Self {
+        Self {
+            hasher: std::collections::hash_map::RandomState::new(),
+            refused: Mutex::new(HashMap::new()),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(AUTH_HANDLER_MAX_IN_FLIGHT)),
+        }
+    }
+
+    fn key(&self, token: &str) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(token)
+    }
+
+    fn recently_refused(&self, key: u64) -> bool {
+        let mut refused = self.refused.lock();
+        match refused.get(&key) {
+            Some(at) if at.elapsed() < AUTH_NEGATIVE_TTL => true,
+            Some(_) => {
+                refused.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn remember_refused(&self, key: u64) {
+        let mut refused = self.refused.lock();
+        if refused.len() >= AUTH_NEGATIVE_CACHE_MAX {
+            refused.retain(|_, at| at.elapsed() < AUTH_NEGATIVE_TTL);
+            if refused.len() >= AUTH_NEGATIVE_CACHE_MAX {
+                refused.clear();
+            }
+        }
+        refused.insert(key, std::time::Instant::now());
+    }
+}
+
+/// What the JS handler said about a token: a policy, a refusal, or nothing
+/// usable (the call failed or missed its deadline), which is not cached.
+enum HandlerAnswer {
+    Policy(Box<WispAuthTokenPolicy>),
+    Refused,
+    Unavailable,
+}
+
+fn handler_answer(val: Value) -> HandlerAnswer {
+    if val.is_null() || val == Value::Bool(false) {
+        return HandlerAnswer::Refused;
+    }
+    if val == Value::Bool(true) {
+        return HandlerAnswer::Policy(Box::default());
+    }
+    // A policy with unknown keys is refused rather than read as unrestricted.
+    match serde_json::from_value(val) {
+        Ok(policy) => HandlerAnswer::Policy(Box::new(policy)),
+        Err(_) => HandlerAnswer::Refused,
+    }
 }
 
 impl WispAuthResolver for NapiAuthResolver {
     fn resolve(&self, token: String) -> WispAuthResolveFuture {
         let static_policy = self.tokens.get(&token).cloned();
         let handler = self.handler.clone();
+        let gate = self.gate.clone();
         Box::pin(async move {
             if static_policy.is_some() {
                 return static_policy;
             }
             let handler = handler?;
-            let promise = handler.call_async_catch(token).await.ok()?;
-            let val = promise.await.ok()?;
-            if val.is_null() || val == Value::Bool(false) {
+            let key = gate.key(&token);
+            if gate.recently_refused(key) {
                 return None;
             }
-            if val == Value::Bool(true) {
-                return Some(WispAuthTokenPolicy::default());
+            let permit = gate.in_flight.clone().try_acquire_owned().ok()?;
+            // The call runs in its own task that holds the slot until the
+            // handler settles or the deadline passes, so a listener giving up
+            // after resolver_timeout_ms cannot free the slot while JS still
+            // works on the token.
+            let call = tokio::spawn(async move {
+                let _permit = permit;
+                let settled = tokio::time::timeout(AUTH_HANDLER_DEADLINE, async {
+                    let promise = handler.call_async_catch(token).await.ok()?;
+                    promise.await.ok()
+                })
+                .await;
+                match settled {
+                    Ok(Some(val)) => handler_answer(val),
+                    _ => HandlerAnswer::Unavailable,
+                }
+            });
+            match call.await.unwrap_or(HandlerAnswer::Unavailable) {
+                HandlerAnswer::Policy(policy) => Some(*policy),
+                HandlerAnswer::Refused => {
+                    gate.remember_refused(key);
+                    None
+                }
+                HandlerAnswer::Unavailable => None,
             }
-            serde_json::from_value(val).ok()
         })
     }
 }
@@ -118,7 +248,7 @@ impl WispRustState {
             configured_auth_tokens: HashMap::new(),
             configured_auth_handler: None,
             configured_limit_profiles: HashMap::new(),
-            pending_policy: ProxyRuntimePolicy::default(),
+            pending_policy: None,
             pending_blocked_ips: HashSet::new(),
             ip_bans: Arc::new(IpHashBans::new()),
         }
@@ -228,7 +358,11 @@ impl WispRust {
             handle.abort();
             let _ = handle.await;
         }
-        drop(wt_handle);
+        if let Some(handle) = wt_handle {
+            // Closing waits for msquic to release every connection, which needs
+            // the runtime's workers, so wait on a blocking thread instead.
+            let _ = tokio::task::spawn_blocking(move || handle.close_blocking()).await;
+        }
 
         let guard = self.state.lock();
         Ok(status_value(&guard))
@@ -420,7 +554,7 @@ impl WispRust {
             json!({
                 "routes": guard.pending_routes.values().collect::<Vec<_>>(),
                 "blockedEgressIps": blocked,
-                "policy": guard.pending_policy,
+                "policy": guard.pending_policy.clone().unwrap_or_default(),
             })
         }
     }
@@ -463,7 +597,7 @@ impl WispRust {
         if let Some(template) = guard.proxy_template.as_ref() {
             json!(template.policy())
         } else {
-            json!(guard.pending_policy)
+            json!(guard.pending_policy.clone().unwrap_or_default())
         }
     }
 
@@ -472,7 +606,7 @@ impl WispRust {
         let policy: ProxyRuntimePolicy = serde_json::from_value(policy).map_err(js_err)?;
         let template = {
             let mut guard = self.state.lock();
-            guard.pending_policy = policy.clone();
+            guard.pending_policy = Some(policy.clone());
             guard.proxy_template.clone()
         };
         if let Some(template) = template {
@@ -714,7 +848,7 @@ fn runtime_config_from_value(value: Value) -> Result<RuntimeConfig> {
 
     if let Some(path) = string_field(obj, "tomlPath") {
         let config = RuntimeConfig::from_toml(Path::new(&path)).map_err(js_err)?;
-        return Ok(apply_config_flags(config, obj));
+        return apply_config_flags(config, obj);
     }
 
     if let Some(raw) = string_field(obj, "toml") {
@@ -722,25 +856,37 @@ fn runtime_config_from_value(value: Value) -> Result<RuntimeConfig> {
         let parsed = parse_toml(&raw, &source).map_err(js_err)?;
         let options = build_wisp_wt_options(&parsed);
         let config = RuntimeConfig::from_options(options).map_err(js_err)?;
-        return Ok(apply_config_flags(config, obj));
+        return apply_config_flags(config, obj);
     }
 
     let config_value = obj.get("config").cloned().unwrap_or_else(|| value.clone());
     let parsed: WispWtConfigToml = serde_json::from_value(config_value).map_err(js_err)?;
     let options = build_wisp_wt_options(&parsed);
     let config = RuntimeConfig::from_options(options).map_err(js_err)?;
-    Ok(apply_config_flags(config, obj))
+    apply_config_flags(config, obj)
 }
 
-fn apply_config_flags(mut config: RuntimeConfig, obj: &Map<String, Value>) -> RuntimeConfig {
+/// `logLevel` installs the process-wide tracing subscriber with that filter
+/// (the addon installs none otherwise, so without it every log line is
+/// dropped). An invalid filter is an error, and a subscriber that already
+/// exists is left in charge.
+fn apply_config_flags(
+    mut config: RuntimeConfig,
+    obj: &Map<String, Value>,
+) -> Result<RuntimeConfig> {
     if let Some(log_level) = string_field(obj, "logLevel") {
         config = config.with_log_level(log_level);
+        config
+            .init_tracing()
+            .map_err(|message| Error::new(Status::InvalidArg, message))?;
     }
-    config
+    Ok(config)
 }
 
 fn apply_pending(template: &ProxyControllerTemplate, state: &WispRustState) -> Result<()> {
-    template.set_policy(state.pending_policy.clone());
+    if let Some(policy) = state.pending_policy.as_ref() {
+        template.set_policy(policy.clone());
+    }
     for route in state.pending_routes.values() {
         template.set_route(route.clone()).map_err(js_err)?;
     }
@@ -771,6 +917,7 @@ fn install_auth_resolver(runtime: &Runtime, state: &WispRustState) {
     runtime.set_auth_resolver(Arc::new(NapiAuthResolver {
         tokens: state.configured_auth_tokens.clone(),
         handler: state.configured_auth_handler.clone(),
+        gate: Arc::new(AuthHandlerGate::new()),
     }));
 }
 
@@ -797,9 +944,76 @@ fn limits_to_js(options: &WispServerOptions) -> Value {
     value
 }
 
+/// Options a limits patch cannot change on a running server: they are read
+/// once at startup (routing, the limiter backend, ingress trust, protocol
+/// version, authentication), so accepting a new value would report success
+/// and change nothing. Re-sending the current value is fine, because
+/// `getLimits()` output is routinely fed back into `setLimitProfile`.
+const STARTUP_ONLY_FIELDS: &[&str] = &[
+    "endpoint",
+    "rateLimitBackend",
+    "redisRateLimitUrl",
+    "redisRateLimitKeyPrefix",
+    "redisRateLimitHashTag",
+    "rateLimitIpv6Prefix",
+    "parseRealIp",
+    "parseRealIpFrom",
+    "wispVersion",
+    "auth",
+];
+
+fn same_json(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        _ => left == right,
+    }
+}
+
+/// Fail a patch that names a field `WispServerOptions` does not have, or a
+/// startup-only field with a different value.
+fn check_patch_keys(current: &Value, patch: &Value) -> Result<()> {
+    let Some(fields) = patch.as_object() else {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "limits patch must be an object",
+        ));
+    };
+    let mut unknown = Vec::new();
+    let mut unsupported = Vec::new();
+    for (key, value) in fields {
+        match current.get(key) {
+            None => unknown.push(key.as_str()),
+            Some(existing)
+                if STARTUP_ONLY_FIELDS.contains(&key.as_str()) && !same_json(existing, value) =>
+            {
+                unsupported.push(key.as_str());
+            }
+            Some(_) => {}
+        }
+    }
+    if unknown.is_empty() && unsupported.is_empty() {
+        return Ok(());
+    }
+    let mut message = String::new();
+    if !unknown.is_empty() {
+        message.push_str(&format!("unknown limit option(s): {}", unknown.join(", ")));
+    }
+    if !unsupported.is_empty() {
+        if !message.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(&format!(
+            "option(s) fixed at startup and not patchable: {}",
+            unsupported.join(", ")
+        ));
+    }
+    Err(Error::new(Status::InvalidArg, message))
+}
+
 fn patch_wisp_options(base: &WispServerOptions, mut patch: Value) -> Result<WispServerOptions> {
     minus_one_to_unlimited(&mut patch);
     let mut merged = serde_json::to_value(base).map_err(js_err)?;
+    check_patch_keys(&merged, &patch)?;
     merge_json(&mut merged, patch);
     let options: WispServerOptions = serde_json::from_value(merged).map_err(js_err)?;
     options.validate().map_err(js_err)?;
@@ -923,6 +1137,133 @@ fn string_field(obj: &Map<String, Value>, key: &str) -> Option<String> {
         .map(|value| value.to_owned())
 }
 
+/// Hash a client IP exactly as the listeners do, with the process-wide key from
+/// `WISP_IP_HASH_KEY` when it is set. Returns `null` for text that is not an IP
+/// address. The link panel uses this so the ban hashes it writes match the
+/// hashes the listeners check.
+#[napi]
+pub fn hash_client_ip(ip: String) -> Result<Option<String>> {
+    wisp_iphash::init_process_key().map_err(js_err)?;
+    Ok(wisp_iphash::hash_client_ip_keyed(Some(&ip)))
+}
+
 fn js_err(error: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, error.to_string())
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn patch_applies_known_limits_and_minus_one() {
+        let base = WispServerOptions::default();
+        let next = patch_wisp_options(
+            &base,
+            json!({ "maxTcpBytesPerIpPerSecond": -1, "maxConnectionStartsPerMinute": 90000 }),
+        )
+        .expect("known limits patch");
+        assert_eq!(next.max_tcp_bytes_per_ip_per_second, u64::MAX);
+        assert_eq!(next.max_connection_starts_per_minute, 90_000);
+    }
+
+    #[test]
+    fn patch_rejects_unknown_keys() {
+        let base = WispServerOptions::default();
+        let error = patch_wisp_options(&base, json!({ "maxTcpBytesPerIpPerSeconds": 5 }))
+            .expect_err("typo must fail");
+        assert!(
+            error.reason.contains("maxTcpBytesPerIpPerSeconds"),
+            "{error}"
+        );
+        assert!(patch_wisp_options(&base, json!(7)).is_err());
+    }
+
+    #[test]
+    fn patch_rejects_changes_to_startup_only_keys_but_not_a_round_trip() {
+        let base = WispServerOptions::default();
+        let error = patch_wisp_options(&base, json!({ "endpoint": "/other" }))
+            .expect_err("endpoint is fixed at startup");
+        assert!(error.reason.contains("endpoint"), "{error}");
+        assert!(patch_wisp_options(&base, json!({ "rateLimitBackend": "redis" })).is_err());
+        assert!(patch_wisp_options(&base, json!({ "auth": { "required": false } })).is_err());
+
+        // What getLimits() reports can be sent straight back.
+        let reported = limits_to_js(&base);
+        let again = patch_wisp_options(&base, reported).expect("round trip");
+        assert_eq!(again, base);
+    }
+
+    #[test]
+    fn missing_toml_path_is_an_error() {
+        assert!(WispRust::from_toml_path("/nonexistent/wispd.toml".to_owned()).is_err());
+        let value = json!({ "tomlPath": "/nonexistent/wispd.toml" });
+        assert!(runtime_config_from_value(value).is_err());
+    }
+
+    #[test]
+    fn invalid_log_level_is_an_error() {
+        let config = RuntimeConfig::from_options(WispWtServerOptions::default()).unwrap();
+        let flags = json!({ "logLevel": "wisp_core=notalevel[" });
+        let error = apply_config_flags(config, flags.as_object().unwrap())
+            .expect_err("bad filter must not be ignored");
+        assert!(error.reason.contains("log level"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod auth_gate_tests {
+    use super::*;
+
+    #[test]
+    fn handler_answers_with_unknown_keys_are_refusals() {
+        assert!(matches!(
+            handler_answer(json!({ "portWhitlist": [443] })),
+            HandlerAnswer::Refused
+        ));
+        assert!(matches!(
+            handler_answer(Value::Null),
+            HandlerAnswer::Refused
+        ));
+        assert!(matches!(
+            handler_answer(Value::Bool(false)),
+            HandlerAnswer::Refused
+        ));
+        assert!(matches!(
+            handler_answer(Value::Bool(true)),
+            HandlerAnswer::Policy(_)
+        ));
+        match handler_answer(json!({ "hostnameBlacklist": ["bad.example"] })) {
+            HandlerAnswer::Policy(policy) => {
+                assert_eq!(
+                    policy.domain_blacklist,
+                    Some(vec!["bad.example".to_owned()])
+                )
+            }
+            _ => panic!("documented policy keys must parse"),
+        }
+    }
+
+    #[test]
+    fn refused_tokens_are_remembered_briefly_and_the_cache_is_bounded() {
+        let gate = AuthHandlerGate::new();
+        let key = gate.key("bad-token");
+        assert!(!gate.recently_refused(key));
+        gate.remember_refused(key);
+        assert!(gate.recently_refused(key));
+        assert!(!gate.recently_refused(gate.key("other-token")));
+        for n in 0..(AUTH_NEGATIVE_CACHE_MAX as u64 * 2) {
+            gate.remember_refused(n);
+        }
+        assert!(gate.refused.lock().len() <= AUTH_NEGATIVE_CACHE_MAX);
+    }
+
+    #[test]
+    fn empty_destination_whitelists_are_rejected_in_patches() {
+        let base = WispServerOptions::default();
+        assert!(patch_wisp_options(&base, json!({ "portWhitelist": [] })).is_err());
+        let next = patch_wisp_options(&base, json!({ "udpPortWhitelist": [443] }))
+            .expect("udp port list is patchable");
+        assert_eq!(next.udp_port_whitelist, Some(vec![443]));
+    }
 }

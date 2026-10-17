@@ -105,6 +105,14 @@ panic = "abort"
 strip = "symbols"
 debug = false
 
+# The napi addon runs inside the Bun front, so a panic under `panic = "abort"`
+# would take the whole site down. This profile unwinds instead, which lets the
+# msquic callbacks' `catch_unwind` and napi's own panic handling contain a
+# panic to the call that raised it. build-native.mjs builds with it.
+[profile.release-napi]
+inherits = "release"
+panic = "unwind"
+
 [profile.release-with-debug]
 inherits = "release"
 debug = true
