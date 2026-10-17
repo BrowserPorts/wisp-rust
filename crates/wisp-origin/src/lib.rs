@@ -7,7 +7,7 @@
 
 use http::HeaderMap;
 use url::Url;
-use wisp_config::WispServerOptions;
+use wisp_config::{parse_origin_pattern, serialize_origin, OriginPattern, WispServerOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedOrigin {
@@ -17,82 +17,15 @@ pub enum ParsedOrigin {
     Invalid(String),
 }
 
-#[derive(Debug, Clone)]
-enum Pattern {
-    Any,
-    Null,
-    Exact(String),
-    Wildcard {
-        scheme: String,
-        host_suffix: String,
-        port: Option<u16>,
-    },
-}
-
-fn serialize_origin(raw: &str) -> Option<String> {
-    let url = Url::parse(raw).ok()?;
-    let origin = url.origin();
-    if !origin.is_tuple() {
-        return None;
-    }
-    Some(origin.ascii_serialization())
-}
-
-fn normalize_configured_origin(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    serialize_origin(trimmed)
-}
-
-fn parse_pattern(entry: &str) -> Option<Pattern> {
-    let trimmed = entry.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed == "*" {
-        return Some(Pattern::Any);
-    }
-    if trimmed == "null" {
-        return Some(Pattern::Null);
-    }
-    if let Some((scheme, rest)) = trimmed.split_once("://") {
-        if let Some(after_star) = rest.strip_prefix("*.") {
-            let (host, port) = match after_star.rsplit_once(':') {
-                Some((h, p)) => (h, p.parse::<u16>().ok()),
-                None => (after_star, None),
-            };
-            if host.is_empty() {
-                return None;
-            }
-            let scheme_lc = scheme.to_ascii_lowercase();
-            let port = match (scheme_lc.as_str(), port) {
-                ("https", Some(443))
-                | ("http", Some(80))
-                | ("ws", Some(80))
-                | ("wss", Some(443)) => None,
-                _ => port,
-            };
-            return Some(Pattern::Wildcard {
-                scheme: scheme_lc,
-                host_suffix: host.to_ascii_lowercase(),
-                port,
-            });
-        }
-    }
-    normalize_configured_origin(trimmed).map(Pattern::Exact)
-}
-
-fn pattern_matches(p: &Pattern, origin: &ParsedOrigin) -> bool {
+fn pattern_matches(p: &OriginPattern, origin: &ParsedOrigin) -> bool {
     match (p, origin) {
-        (Pattern::Null, ParsedOrigin::Null) => true,
+        (OriginPattern::Null, ParsedOrigin::Null) => true,
         (_, ParsedOrigin::Null) => false,
         (_, ParsedOrigin::Missing | ParsedOrigin::Invalid(_)) => false,
-        (Pattern::Any, ParsedOrigin::Origin(_)) => true,
-        (Pattern::Exact(v), ParsedOrigin::Origin(o)) => v == o,
+        (OriginPattern::Any, ParsedOrigin::Origin(_)) => true,
+        (OriginPattern::Exact(v), ParsedOrigin::Origin(o)) => v == o,
         (
-            Pattern::Wildcard {
+            OriginPattern::Wildcard {
                 scheme,
                 host_suffix,
                 port,
@@ -111,18 +44,31 @@ fn pattern_matches(p: &Pattern, origin: &ParsedOrigin) -> bool {
             let Some(host) = url.host_str() else {
                 return false;
             };
-            host == host_suffix || host.ends_with(&format!(".{host_suffix}"))
+            // Subdomains only; the apex needs its own exact entry.
+            host.strip_suffix(host_suffix.as_str())
+                .is_some_and(|head| head.len() > 1 && head.ends_with('.'))
         }
-        (Pattern::Null, _) => false,
+        (OriginPattern::Null, _) => false,
     }
 }
 
+/// `true` when some entry matches. An entry that does not parse never matches,
+/// which is the safe side for a whitelist. Config validation rejects such
+/// entries at load, so this only covers options that skipped validation.
 fn list_matches(list: &Option<Vec<String>>, origin: &ParsedOrigin) -> bool {
     let Some(list) = list else {
         return false;
     };
     list.iter()
-        .any(|e| parse_pattern(e).is_some_and(|p| pattern_matches(&p, origin)))
+        .any(|e| parse_origin_pattern(e).is_ok_and(|p| pattern_matches(&p, origin)))
+}
+
+/// `true` when the blacklist holds an entry that does not parse. A blacklist
+/// that cannot be read cannot be trusted to exclude anything, so the caller
+/// denies every origin instead of failing open.
+fn list_is_malformed(list: &Option<Vec<String>>) -> bool {
+    list.as_ref()
+        .is_some_and(|list| list.iter().any(|e| parse_origin_pattern(e).is_err()))
 }
 
 const ORIGIN_START: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -171,10 +117,14 @@ pub fn is_origin_allowed(origin: Option<&str>, options: &WispServerOptions) -> b
     if matches!(parsed, ParsedOrigin::Invalid(_)) {
         return false;
     }
+    // A whitelist that is present admits only what it lists, so an empty one
+    // denies every origin. Leave it unset for no whitelist.
     if options.origin_whitelist.is_some() {
         return list_matches(&options.origin_whitelist, &parsed);
     }
-    if list_matches(&options.origin_blacklist, &parsed) {
+    if list_is_malformed(&options.origin_blacklist)
+        || list_matches(&options.origin_blacklist, &parsed)
+    {
         return false;
     }
     if matches!(parsed, ParsedOrigin::Missing | ParsedOrigin::Null) {
@@ -276,8 +226,43 @@ mod tests {
         let mut o = opts();
         o.origin_whitelist = Some(vec!["https://*.example.com".to_owned()]);
         assert!(is_origin_allowed(Some("https://api.example.com"), &o));
-        assert!(is_origin_allowed(Some("https://example.com"), &o));
+        assert!(is_origin_allowed(Some("https://a.b.example.com"), &o));
+        assert!(!is_origin_allowed(Some("https://example.com"), &o));
+        assert!(!is_origin_allowed(Some("https://evilexample.com"), &o));
         assert!(!is_origin_allowed(Some("https://example.org"), &o));
+        o.origin_whitelist = Some(vec![
+            "https://*.example.com".to_owned(),
+            "https://example.com".to_owned(),
+        ]);
+        assert!(is_origin_allowed(Some("https://example.com"), &o));
+    }
+
+    #[test]
+    fn unparseable_blacklist_entry_denies_instead_of_failing_open() {
+        let mut o = opts();
+        o.block_blank_origins = false;
+        o.origin_blacklist = Some(vec!["https://*.example.com:abc".to_owned()]);
+        assert!(!is_origin_allowed(Some("https://good.example"), &o));
+        assert!(!is_origin_allowed(None, &o));
+        assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn empty_whitelist_denies_every_origin() {
+        let mut o = opts();
+        o.block_blank_origins = false;
+        o.origin_whitelist = Some(vec![]);
+        assert!(!is_origin_allowed(Some("https://good.example"), &o));
+        assert!(!is_origin_allowed(None, &o));
+    }
+
+    #[test]
+    fn invalid_wildcard_port_does_not_widen_the_match() {
+        let mut o = opts();
+        o.origin_whitelist = Some(vec!["https://*.example.com:abc".to_owned()]);
+        assert!(!is_origin_allowed(Some("https://api.example.com"), &o));
+        assert!(!is_origin_allowed(Some("https://api.example.com:8443"), &o));
+        assert!(o.validate().is_err());
     }
 
     #[test]
