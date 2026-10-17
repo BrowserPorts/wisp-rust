@@ -15,7 +15,7 @@ use http::{header, Method, Request, StatusCode};
 use tokio::sync::{mpsc, Mutex};
 use wisp_config::{WispAuthRegistry, WispWtServerOptions};
 use wisp_dos::{ConnectionLimiter, DosGuard};
-use wisp_iphash::{hash_client_ip, IpHashBans};
+use wisp_iphash::{hash_client_ip_keyed, IpHashBans};
 use wisp_reports::{set_report_hook, Report, ReportErrorType};
 use wisp_server::{H3WsContext, PreUpgradePolicy, ServeExtras};
 
@@ -57,7 +57,7 @@ fn report_channel() -> mpsc::UnboundedReceiver<Option<String>> {
 }
 
 fn loopback_hash() -> String {
-    hash_client_ip(Some(CLIENT_IP), None).expect("loopback hashes")
+    hash_client_ip_keyed(Some(CLIENT_IP)).expect("loopback hashes")
 }
 
 #[tokio::test]

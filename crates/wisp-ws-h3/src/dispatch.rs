@@ -207,7 +207,7 @@ pub async fn serve_h3_websocket(
     view: H3WsConnectionView,
     client_advertises_v2: bool,
 ) -> Result<(), H3WsError> {
-    let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
+    let client_hash = wisp_iphash::hash_client_ip_keyed(Some(&client_ip));
     if ctx.ip_bans.is_banned(client_hash.as_deref()) {
         debug!(client_ip = %client_ip, "h3 ws: rejecting: banned IP hash");
         emit_report(

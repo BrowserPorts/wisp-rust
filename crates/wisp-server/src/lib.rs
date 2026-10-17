@@ -14,6 +14,8 @@
 //!   the H3 extended CONNECT, returning the 403 body + headers on reject.
 //! - [`SessionDispatch`] — frame-loop driver over the control stream.
 
+#![deny(unsafe_code)]
+
 pub mod control;
 pub mod handshake;
 pub mod policy;

@@ -133,7 +133,10 @@ impl PreUpgradePolicy {
                 reason: "client IP policy",
             });
         }
-        let client_hash = hash_client_ip(Some(client_ip), self.iphash_secret.as_deref());
+        let client_hash = hash_client_ip(
+            Some(client_ip),
+            self.iphash_secret.as_deref().or(wisp_iphash::process_key()),
+        );
         if self.ip_bans.is_banned(client_hash.as_deref()) {
             emit_report(
                 ReportErrorType::IpHashBanned,
@@ -232,7 +235,7 @@ mod tests {
             .with_ip_bans(bans.clone());
         assert!(p.check(&HeaderMap::new(), "1.2.3.4").is_ok());
 
-        bans.replace([hash_client_ip(Some("1.2.3.4"), None).unwrap()]);
+        bans.replace([wisp_iphash::hash_client_ip_keyed(Some("1.2.3.4")).unwrap()]);
         let rej = p.check(&HeaderMap::new(), "1.2.3.4").unwrap_err();
         assert_eq!(rej.status, StatusCode::FORBIDDEN);
         assert_eq!(rej.reason, "banned IP hash");

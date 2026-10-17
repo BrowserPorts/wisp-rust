@@ -72,18 +72,28 @@ impl<'a> SessionDispatch<'a> {
                 Err(ControlIoError::Closed) => return ControlOutcome::PeerEof,
                 Err(e) => return ControlOutcome::Error(e.to_string()),
             };
-            if !is_control_message_allowed(
-                &self.ctx.client_ip,
-                &self.ctx.conn_dos,
-                &self.ctx.options,
-                &self.ctx.dos,
-            ) {
-                return ControlOutcome::Error("control rate limit".to_owned());
-            }
             let parsed = match decode_frame_body(&frame) {
                 Ok(p) => p,
                 Err(e) => return ControlOutcome::Error(e.to_string()),
             };
+            // UDP_OPEN spends the stream-open budget in the sink and UDP_CLOSE
+            // only frees a flow, so neither counts against the control-message
+            // budget, whose overflow ends the whole session (and whose per-IP
+            // share is common to every client behind one address).
+            let udp_flow_frame = matches!(
+                parsed.frame_type,
+                frame_type::UDP_OPEN | frame_type::UDP_CLOSE
+            );
+            if !udp_flow_frame
+                && !is_control_message_allowed(
+                    &self.ctx.client_ip,
+                    &self.ctx.conn_dos,
+                    &self.ctx.options,
+                    &self.ctx.dos,
+                )
+            {
+                return ControlOutcome::Error("control rate limit".to_owned());
+            }
             match parsed.frame_type {
                 frame_type::CLOSE => {
                     let reason = parse_close_payload(&parsed.payload).unwrap_or(0);
@@ -225,6 +235,39 @@ mod tests {
         assert_eq!(rec.udp_opens[0].port, 53);
         assert_eq!(rec.udp_closes.len(), 1);
         assert_eq!(rec.udp_closes[0].flow_id, 7);
+    }
+
+    #[tokio::test]
+    async fn udp_flow_frames_do_not_spend_the_control_budget() {
+        let options = WispServerOptions {
+            max_control_messages_per_connection_per_minute: 2,
+            ..WispServerOptions::default()
+        };
+        let mut ctx = SessionContext::new(
+            "1.2.3.4".to_owned(),
+            Arc::new(options),
+            Arc::new(DosGuard::new()),
+        );
+        ctx.negotiated.insert(Udp::ID);
+        ctx.negotiated.insert(ProxyControl::ID);
+        let (tx, rx) = mpsc::unbounded_channel();
+        for flow in 0..50 {
+            tx.send(body(&encode_udp_open_frame("example.com", 53)))
+                .unwrap();
+            tx.send(body(&encode_udp_close_frame(flow, 0))).unwrap();
+        }
+        // The control budget still applies to everything else.
+        for _ in 0..3 {
+            tx.send(body(&encode_control_frame("ping"))).unwrap();
+        }
+        tx.send(body(&encode_close_frame(0x02))).unwrap();
+        let mut io = ChanIo { rx };
+        let mut rec = Recorder::default();
+        let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
+        assert_eq!(rec.udp_opens.len(), 50);
+        assert_eq!(rec.udp_closes.len(), 50);
+        assert_eq!(rec.controls.len(), 2);
+        assert!(matches!(outcome, ControlOutcome::Error(ref e) if e == "control rate limit"));
     }
 
     #[tokio::test]

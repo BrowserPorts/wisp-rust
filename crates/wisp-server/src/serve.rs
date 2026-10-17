@@ -1,10 +1,11 @@
 //! Listener bind + h3 server boot.
 //!
 //! Wires the [`MsQuicEngine`] listener to an h3 server per accepted QUIC
-//! connection. Each connection accepts exactly one WebTransport CONNECT to
-//! the configured wisp-wt endpoint, runs [`PreUpgradePolicy`], accepts the
+//! connection. Each connection accepts requests in a loop: WS-over-H3
+//! CONNECTs run side by side, and one WebTransport CONNECT to the configured
+//! wisp-wt endpoint runs [`PreUpgradePolicy`], accepts the
 //! [`WebTransportSession`], runs [`negotiate_handshake`] on the first bidi
-//! and then [`SessionDispatch`] on it.
+//! and then [`SessionDispatch`] on it. Refused requests get a status.
 //!
 //! The actual TCP/UDP bridging hot path is handled by tasks spawned per
 //! accepted bidi/uni/datagram from the WT session — see [`session_loop`].
@@ -13,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,15 +23,17 @@ use h3::ext::Protocol;
 use h3::quic::{
     BidiStream as H3BidiStream, RecvStream as _, SendStream as _, SendStreamUnframed as _,
 };
+use h3::server::RequestStream;
 use h3_webtransport::server::{AcceptedBi, WebTransportSession};
-use http::Method;
+use http::{HeaderMap, Method, StatusCode};
 use msquic::{Addr, BufferRef, Connection, Listener, ListenerEvent};
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use wisp_config::{
     endpoint_matches, endpoint_path_token, normalize_endpoint, WispAuthRegistry, WispServerOptions,
@@ -40,11 +44,12 @@ use wisp_dos::{
     ConnectionDosGuard, ConnectionGuard, ConnectionLimiter, DatagramDecision, DosGuard,
     TcpByteLimiter,
 };
-use wisp_inspect::{inspect, InspectionDecision};
+use wisp_inspect::{InspectionDecision, Inspector};
 use wisp_iphash::IpHashBans;
 use wisp_proxy::{HostPolicy, TcpConnector};
 use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_quic_msquic::engine::{EngineConfig, EngineError, MsQuicEngine};
+use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
 use wisp_wire::{
     datagram_class, datagram_kind, encode_control_frame, try_parse_bidi_stream_header,
     BidiStreamKind, Extension, ProxyControl, UdpClose, UdpOpenFrame, WebTransportProxy,
@@ -63,6 +68,12 @@ use crate::udp_flow::{UdpFlowHandle, UdpFlowRegistry};
 use crate::wt_proxy::{WtProxyError, WtProxyRegistry, WtProxySession};
 
 const ALPN_H3: &str = "h3";
+/// Largest HTTP/3 field section (request header block) the server decodes.
+/// h3 counts each field as its name and value plus 32 bytes (RFC 9114 section
+/// 4.2.2) and answers a larger block with 431 before building a header map,
+/// so a request cannot carry the tens of thousands of fields that make
+/// `http::HeaderMap` panic. A wisp CONNECT needs well under 1 KiB.
+const MAX_FIELD_SECTION_BYTES: u64 = 16 * 1024;
 /// Hard cap on a single wisp-wt control-bidi frame body. The 4-byte length
 /// prefix is attacker-controlled (up to ~4 GiB); without this bound a client
 /// could declare a huge frame and force `rx_buf` to grow unbounded (or drip
@@ -74,6 +85,22 @@ const DATAGRAM_EGRESS_QUEUE_CAPACITY: usize =
 const UDP_FLOW_QUEUE_CAPACITY: usize = 64;
 const RAW_CONNECTION_FALLBACK_CAP: u64 = 4096;
 const RAW_CONNECTION_PER_IP_FALLBACK_CAP: u64 = 256;
+/// How long a rejection response may take to go out before the stream is
+/// dropped instead.
+const REJECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a finished session waits for its stream, flow and proxy tasks to
+/// observe cancellation before it releases its connection slot anyway.
+const SESSION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Requests one connection may have refused before it is closed. Each refusal
+/// can cost a token lookup, so a client must not keep one connection open
+/// just to make them.
+const MAX_REFUSED_REQUESTS: u32 = 8;
+/// Wisp close reasons, also used as UDP_CLOSE reasons and stream reset codes.
+const CLOSE_NETWORK_ERROR: u8 = 0x03;
+const CLOSE_HOST_BLOCKED: u8 = 0x48;
+const CLOSE_THROTTLED: u8 = 0x49;
+
+type RequestBidi = <MsQuicConnection as h3::quic::OpenStreams<Bytes>>::BidiStream;
 
 struct DatagramEgress {
     queued_at: Instant,
@@ -100,17 +127,41 @@ pub enum ServeError {
 }
 
 /// Live serve state. Drop, or call [`ServeHandle::shutdown`], to stop the
-/// listener and let in-flight sessions finish.
+/// listener and end every session.
 ///
-/// Teardown blocks until msquic has closed every connection, so it needs other
-/// runtime threads to drop the cancelled sessions: call it from a multi-thread
-/// runtime or off the runtime.
+/// Teardown asks msquic to close every connection first, then waits until it
+/// has released them. Dropped on a multi-thread runtime it waits in
+/// `block_in_place`, so the runtime keeps running the tasks that release the
+/// connections; on a current-thread runtime the wait moves to its own thread.
+/// [`ServeHandle::close_blocking`] waits on the calling thread instead, for a
+/// caller already off the runtime.
 pub struct ServeHandle {
-    // The listener must close before the engine: the engine's registration
-    // waits for every listener and connection opened under it.
-    listener: Listener,
-    _engine: Arc<MsQuicEngine>,
+    teardown: Option<Teardown>,
     cancel: CancellationToken,
+}
+
+/// The msquic handles a [`ServeHandle`] owns, closed in field order: the
+/// listener before the engine, whose registration waits for every listener
+/// and connection opened under it.
+struct Teardown {
+    listener: Listener,
+    engine: Arc<MsQuicEngine>,
+}
+
+impl Teardown {
+    /// Ask msquic to shut down every connection under the registration. Does
+    /// not wait, and leaves nothing for the closes below to wait on but the
+    /// tasks that hold the connection handles.
+    fn begin(&self) {
+        self.engine.registration.shutdown();
+    }
+
+    /// Close the listener, then the engine. Blocks until msquic has released
+    /// every handle opened under the registration.
+    fn finish(self) {
+        drop(self.listener);
+        drop(self.engine);
+    }
 }
 
 impl ServeHandle {
@@ -120,7 +171,41 @@ impl ServeHandle {
 
     pub fn shutdown(self) {
         self.cancel.cancel();
-        self.listener.stop();
+        if let Some(teardown) = self.teardown.as_ref() {
+            teardown.listener.stop();
+        }
+    }
+
+    /// Stop everything and wait, on the calling thread, until msquic has
+    /// released every handle. Call it from a blocking thread such as
+    /// `spawn_blocking`, never from an async task.
+    pub fn close_blocking(mut self) {
+        self.cancel.cancel();
+        if let Some(teardown) = self.teardown.take() {
+            teardown.begin();
+            teardown.finish();
+        }
+    }
+}
+
+impl Drop for ServeHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let Some(teardown) = self.teardown.take() else {
+            return;
+        };
+        teardown.begin();
+        match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| teardown.finish());
+            }
+            // A current-thread runtime runs the tasks that release the
+            // connections on this very thread, so waiting here would hang.
+            Ok(_) => {
+                std::thread::spawn(move || teardown.finish());
+            }
+            Err(_) => teardown.finish(),
+        }
     }
 }
 
@@ -129,9 +214,72 @@ impl ServeHandle {
 #[derive(Clone, Default)]
 pub struct ServeExtras {
     pub proxy_template: Option<Arc<ProxyControllerTemplate>>,
-    /// Banned client IP hashes applied to WebTransport sessions. WS-over-H3
-    /// uses the set on its [`H3WsContext`].
+    /// Banned client IP hashes. Checked when a QUIC connection arrives, before
+    /// the handshake, so a banned address never gets a connection; the
+    /// WebTransport and WS-over-H3 policies check them again per session.
     pub ip_bans: Arc<IpHashBans>,
+}
+
+/// Raw QUIC connection caps. Handshakes in progress and established
+/// connections are counted apart: a slot under `established` is only taken
+/// once the peer has finished the handshake, so peers that start handshakes
+/// and never finish them cannot hold the slots real clients need.
+struct RawAdmission {
+    established: Arc<ConnectionLimiter>,
+    handshakes: Arc<ConnectionLimiter>,
+    total_cap: u64,
+    per_ip_cap: u64,
+}
+
+impl RawAdmission {
+    /// `true` when `client_ip` could take an established slot right now. Only
+    /// a pre-check: the slot itself is taken at Connected.
+    fn has_room(&self, client_ip: &str) -> bool {
+        self.established
+            .try_acquire(client_ip, self.total_cap, self.per_ip_cap)
+            .is_some()
+    }
+
+    fn start_handshake(&self, client_ip: &str) -> Option<ConnectionGuard> {
+        self.handshakes
+            .try_acquire(client_ip, self.total_cap, self.per_ip_cap)
+    }
+
+    fn establish(&self, client_ip: &str) -> Option<ConnectionGuard> {
+        self.established
+            .try_acquire(client_ip, self.total_cap, self.per_ip_cap)
+    }
+}
+
+fn client_ip_of(peer: Option<SocketAddr>) -> String {
+    peer.map(|address| address.ip().to_string())
+        .unwrap_or_else(|| "0.0.0.0".to_owned())
+}
+
+/// Ban check for a connection that has not started its handshake. Reports a
+/// hit the way the session policies do.
+fn refuse_banned(ip_bans: &IpHashBans, client_ip: &str) -> bool {
+    let client_hash = wisp_iphash::hash_client_ip_keyed(Some(client_ip));
+    if !ip_bans.is_banned(client_hash.as_deref()) {
+        return false;
+    }
+    emit_report(
+        ReportErrorType::IpHashBanned,
+        ReportInput {
+            context: Some(ConnectionContext {
+                client_ip: Some(client_ip.to_owned()),
+                client_ip_hash: client_hash,
+                transport: Some(Transport::Wt),
+                origin: None,
+            }),
+            ..Default::default()
+        },
+    );
+    true
+}
+
+fn connection_refused() -> msquic::Status {
+    msquic::Status::new(msquic::StatusCode::QUIC_STATUS_CONNECTION_REFUSED)
 }
 
 /// Bind the msquic listener and start dispatching sessions.
@@ -140,6 +288,7 @@ pub struct ServeExtras {
 /// listener: requests with `:method = CONNECT` and `:protocol = websocket`
 /// at the WS endpoint are dispatched to [`serve_h3_websocket`] instead of
 /// the WT path. `None` keeps the listener WT-only.
+#[allow(unsafe_code)]
 pub async fn serve(
     options: Arc<WispWtServerOptions>,
     dos: Arc<DosGuard>,
@@ -157,33 +306,39 @@ pub async fn serve(
         alpns: vec![ALPN_H3.to_owned()],
         cert_path,
         key_path,
+        // A session uses two bidi streams of its own (the CONNECT request and
+        // the wisp-wt control stream) on top of its data streams.
         peer_bidi_stream_count: if options.base.stream_limit_total == 0 {
             EngineConfig::default().peer_bidi_stream_count
         } else {
             options
                 .base
                 .stream_limit_total
-                .saturating_add(1)
+                .saturating_add(2)
                 .min(u64::from(u16::MAX)) as u16
         },
-        idle_timeout_ms: options.base.idle_timeout_ms.unwrap_or(60_000).max(1),
+        // 0 disables the idle timeout, which is msquic's meaning of 0 too.
+        idle_timeout_ms: options.base.idle_timeout_ms.unwrap_or(60_000),
         ..EngineConfig::default()
     };
     let engine = Arc::new(MsQuicEngine::new(&engine_cfg)?);
     let configuration = engine.configuration.clone();
 
-    let raw_total_cap = if options.base.max_connections == 0 {
-        RAW_CONNECTION_FALLBACK_CAP
-    } else {
-        options.base.max_connections
-    };
-    let raw_per_ip_cap = if options.base.max_connections_per_ip == 0 {
-        RAW_CONNECTION_PER_IP_FALLBACK_CAP
-    } else {
-        options.base.max_connections_per_ip
-    };
-    let raw_limiter = Arc::new(ConnectionLimiter::new());
-    let channel_capacity = usize::try_from(raw_total_cap)
+    let admission = Arc::new(RawAdmission {
+        established: Arc::new(ConnectionLimiter::new()),
+        handshakes: Arc::new(ConnectionLimiter::new()),
+        total_cap: if options.base.max_connections == 0 {
+            RAW_CONNECTION_FALLBACK_CAP
+        } else {
+            options.base.max_connections
+        },
+        per_ip_cap: if options.base.max_connections_per_ip == 0 {
+            RAW_CONNECTION_PER_IP_FALLBACK_CAP
+        } else {
+            options.base.max_connections_per_ip
+        },
+    });
+    let channel_capacity = usize::try_from(admission.total_cap)
         .unwrap_or(usize::MAX)
         .clamp(1, RAW_CONNECTION_FALLBACK_CAP as usize);
     let (conn_tx, conn_rx) =
@@ -192,29 +347,39 @@ pub async fn serve(
     // The listener callback runs on an msquic worker thread with no Tokio
     // context, so hand it the runtime that `serve` was called on.
     let runtime = tokio::runtime::Handle::current();
-    let listener = engine.open_listener(move |_, ev| {
+    let listener_admission = admission.clone();
+    let listener_bans = extras.ip_bans.clone();
+    let engine_listener = engine.open_listener(move |_, ev| {
         if let ListenerEvent::NewConnection { info, connection } = ev {
             let peer = info.remote_address.as_socket();
+            let client_ip = client_ip_of(peer);
+            // Refusing returns an error without taking the handle, so msquic
+            // closes the connection itself with CONNECTION_REFUSED. msquic
+            // only gets here for a validated address: Retry is on for every
+            // new address (see `EngineConfig::retry_memory_limit`).
+            if refuse_banned(&listener_bans, &client_ip) {
+                debug!(client_ip = %client_ip, "wisp: QUIC connection refused: banned IP hash");
+                return Err(connection_refused());
+            }
+            if !listener_admission.has_room(&client_ip) {
+                debug!(client_ip = %client_ip, "wisp: QUIC connection refused: connection cap");
+                return Err(connection_refused());
+            }
+            let Some(handshake) = listener_admission.start_handshake(&client_ip) else {
+                debug!(client_ip = %client_ip, "wisp: QUIC connection refused: handshake cap");
+                return Err(connection_refused());
+            };
             // SAFETY: msquic transferred ownership in the listener callback.
             // We own the handle from this point; MsQuicConnection holds it
             // inside an Arc<Connection> for the connection lifetime.
             let owned: Connection = unsafe { Connection::from_raw(connection.as_raw()) };
-            let client_ip = peer
-                .map(|address| address.ip().to_string())
-                .unwrap_or_else(|| "0.0.0.0".to_owned());
-            let Some(raw_guard) =
-                raw_limiter.try_acquire(&client_ip, raw_total_cap, raw_per_ip_cap)
-            else {
-                owned.shutdown(msquic::ConnectionShutdownFlags::SILENT, 0);
-                return Ok(());
-            };
             if let Err(status) = owned.set_configuration(&configuration) {
                 warn!(?status, "set_configuration failed; rejecting connection");
                 drop(owned);
                 return Ok(());
             }
             let ms_conn = MsQuicConnection::install(owned, runtime.clone());
-            if conn_tx.try_send((ms_conn, peer, raw_guard)).is_err() {
+            if conn_tx.try_send((ms_conn, peer, handshake)).is_err() {
                 debug!("raw QUIC admission queue full; dropping new connection");
             }
         }
@@ -229,15 +394,26 @@ pub async fn serve(
             ))
         })?;
     let alpn_refs = [BufferRef::from(ALPN_H3)];
-    listener
-        .start(&alpn_refs, Some(&Addr::from(local_addr)))
-        .map_err(ServeError::Start)?;
+    let handle = ServeHandle {
+        teardown: Some(Teardown {
+            listener: engine_listener,
+            engine,
+        }),
+        cancel: cancel.clone(),
+    };
+    if let Some(teardown) = handle.teardown.as_ref() {
+        teardown
+            .listener
+            .start(&alpn_refs, Some(&Addr::from(local_addr)))
+            .map_err(ServeError::Start)?;
+    }
 
     info!(addr = %local_addr, "wisp: listener bound");
 
     let acceptor_cancel = cancel.clone();
     tokio::spawn(connection_acceptor(
         conn_rx,
+        admission,
         options,
         dos,
         acceptor_cancel,
@@ -248,15 +424,12 @@ pub async fn serve(
         extras.ip_bans,
     ));
 
-    Ok(ServeHandle {
-        listener,
-        _engine: engine,
-        cancel,
-    })
+    Ok(handle)
 }
 
 async fn connection_acceptor(
     mut rx: mpsc::Receiver<(MsQuicConnection, Option<SocketAddr>, ConnectionGuard)>,
+    admission: Arc<RawAdmission>,
     options: Arc<WispWtServerOptions>,
     dos: Arc<DosGuard>,
     cancel: CancellationToken,
@@ -266,6 +439,8 @@ async fn connection_acceptor(
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
     ip_bans: Arc<IpHashBans>,
 ) {
+    let handshake_timeout =
+        Duration::from_millis(options.base.handshake_timeout_ms.unwrap_or(10_000).max(1));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -273,10 +448,11 @@ async fn connection_acceptor(
                 return;
             }
             maybe = rx.recv() => {
-                let Some((ms_conn, peer, raw_guard)) = maybe else {
+                let Some((ms_conn, peer, handshake)) = maybe else {
                     info!("wisp: connection channel closed");
                     return;
                 };
+                let admission = admission.clone();
                 let opts = options.clone();
                 let dos = dos.clone();
                 let ws_ctx = ws_ctx.clone();
@@ -288,18 +464,33 @@ async fn connection_acceptor(
                 tokio::spawn(async move {
                     let result = tokio::select! {
                         _ = connection_cancel.cancelled() => return,
-                        result = handle_connection(
-                            ms_conn,
-                            peer,
-                            raw_guard,
-                            opts,
-                            dos,
-                            ws_ctx,
-                            connection_limiter,
-                            auth_registry,
-                            proxy_template,
-                            ip_bans,
-                        ) => result,
+                        result = async {
+                            let client_ip = client_ip_of(peer);
+                            let Some(raw_guard) = admit_connected(
+                                &ms_conn,
+                                &client_ip,
+                                handshake,
+                                &admission,
+                                handshake_timeout,
+                            )
+                            .await
+                            else {
+                                return Ok(());
+                            };
+                            handle_connection(
+                                ms_conn,
+                                peer,
+                                raw_guard,
+                                opts,
+                                dos,
+                                ws_ctx,
+                                connection_limiter,
+                                auth_registry,
+                                proxy_template,
+                                ip_bans,
+                            )
+                            .await
+                        } => result,
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "wisp: connection handler ended");
@@ -308,6 +499,30 @@ async fn connection_acceptor(
             }
         }
     }
+}
+
+/// Wait for the handshake, then trade the handshake slot for an established
+/// one. `None` when the handshake failed or timed out, or when the caps filled
+/// up meanwhile; the connection is then closed.
+async fn admit_connected(
+    ms_conn: &MsQuicConnection,
+    client_ip: &str,
+    handshake: ConnectionGuard,
+    admission: &RawAdmission,
+    handshake_timeout: Duration,
+) -> Option<ConnectionGuard> {
+    let connected = tokio::time::timeout(handshake_timeout, ms_conn.connected()).await;
+    drop(handshake);
+    if !matches!(connected, Ok(Ok(()))) {
+        debug!(client_ip = %client_ip, "wisp: QUIC handshake did not complete");
+        return None;
+    }
+    let guard = admission.establish(client_ip);
+    if guard.is_none() {
+        debug!(client_ip = %client_ip, "wisp: QUIC connection closed: connection cap");
+        ms_conn.close_with_code(h3::error::Code::H3_EXCESSIVE_LOAD.value());
+    }
+    guard
 }
 
 /// Wait until the peer's SETTINGS frame has been read.
@@ -340,6 +555,38 @@ async fn await_peer_settings(
     .await
 }
 
+/// Answer a request the server will not serve with `status` and end the
+/// stream, so the client learns why instead of seeing a silent reset.
+async fn reject_request(
+    mut stream: RequestStream<RequestBidi, Bytes>,
+    status: StatusCode,
+    headers: HeaderMap,
+) {
+    let mut response = http::Response::new(());
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    let _ = tokio::time::timeout(REJECT_RESPONSE_TIMEOUT, async {
+        stream.send_response(response).await?;
+        stream.finish().await
+    })
+    .await;
+}
+
+/// A WebTransport CONNECT that passed every pre-upgrade check.
+struct AdmittedWt {
+    request: http::Request<()>,
+    stream: RequestStream<RequestBidi, Bytes>,
+    options: Arc<WispServerOptions>,
+    allowed_proxy_providers: Option<Vec<String>>,
+    client_hash: Option<String>,
+    conn_guard: ConnectionGuard,
+}
+
+/// Serves one QUIC connection. Requests are accepted in a loop: every
+/// WS-over-H3 CONNECT gets its own task and connection slot, and a
+/// WebTransport CONNECT takes over the connection (h3-webtransport supports
+/// one session per connection), after which further requests are refused
+/// with a status. The connection stays open until every session on it ends.
 async fn handle_connection(
     ms_conn: MsQuicConnection,
     peer: Option<SocketAddr>,
@@ -352,15 +599,12 @@ async fn handle_connection(
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
     ip_bans: Arc<IpHashBans>,
 ) -> Result<(), HandlerError> {
-    let endpoint = normalize_endpoint(&options.base.endpoint);
     let handshake_timeout =
         Duration::from_millis(options.base.handshake_timeout_ms.unwrap_or(10_000).max(1));
-    let ws_endpoint = ws_ctx
-        .as_ref()
-        .map(|ctx| normalize_endpoint(&ctx.options.endpoint));
     let mut h3_conn: h3::server::Connection<MsQuicConnection, Bytes> = tokio::time::timeout(
         handshake_timeout,
         h3::server::builder()
+            .max_field_section_size(MAX_FIELD_SECTION_BYTES)
             .enable_webtransport(true)
             .enable_extended_connect(true)
             .enable_datagram(true)
@@ -371,97 +615,218 @@ async fn handle_connection(
     .map_err(|_| HandlerError::H3Build("timed out".to_owned()))?
     .map_err(|e| HandlerError::H3Build(format!("{e:?}")))?;
 
-    let resolver = match tokio::time::timeout(handshake_timeout, h3_conn.accept())
-        .await
-        .map_err(|_| HandlerError::H3Accept("timed out".to_owned()))?
-        .map_err(|e| HandlerError::H3Accept(format!("{e:?}")))?
-    {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-
-    let (request, stream) = tokio::time::timeout(handshake_timeout, resolver.resolve_request())
-        .await
-        .map_err(|_| HandlerError::H3Resolve("timed out".to_owned()))?
-        .map_err(|e| HandlerError::H3Resolve(format!("{e:?}")))?;
-
-    let path = request.uri().path().to_owned();
-    let is_connect = request.method() == Method::CONNECT;
-    let protocol = request.extensions().get::<Protocol>();
-    let is_wt = protocol == Some(&Protocol::WEB_TRANSPORT);
-    let is_ws = protocol == Some(&Protocol::WEBSOCKET);
-
-    let client_ip = peer
-        .map(|sa| sa.ip().to_string())
-        .unwrap_or_else(|| "0.0.0.0".to_owned());
-
-    if is_connect && is_ws {
-        let Some(ctx) = ws_ctx.as_ref() else {
-            debug!(%path, "wisp: WS-over-H3 request but ws_ctx not configured");
-            return Ok(());
-        };
-        let Some(expected) = ws_endpoint.as_deref() else {
-            debug!(%path, "wisp: ws_endpoint not configured");
-            return Ok(());
-        };
-        let Some(view) = ctx.context_for_path(&path).await else {
-            debug!(expected, "wisp: WS endpoint or authentication rejected");
-            return Ok(());
-        };
-        let policy = PreUpgradePolicy::new(view.options.clone(), dos.clone())
-            .with_ip_bans(ctx.ip_bans.clone());
-        if let Err(rej) = policy.check(request.headers(), &client_ip) {
-            warn!(reason = rej.reason, "wisp: WS pre-upgrade rejected");
-            return Ok(());
+    let client_ip = client_ip_of(peer);
+    let mut ws_sessions: JoinSet<()> = JoinSet::new();
+    let mut refused = 0u32;
+    let admitted = loop {
+        if refused >= MAX_REFUSED_REQUESTS {
+            debug!(client_ip = %client_ip, "wisp: too many refused requests on one connection");
+            break None;
         }
-        let client_advertises_v2 = request
-            .headers()
-            .get_all("sec-websocket-protocol")
-            .iter()
-            .any(|v| {
-                v.to_str()
-                    .map(|s| {
-                        s.split(',')
-                            .any(|p| p.trim().eq_ignore_ascii_case("wisp-v2"))
-                    })
-                    .unwrap_or(false)
-            });
-        let _conn_guard = match ctx.connection_limiter.try_acquire(
-            &client_ip,
-            view.options.max_connections,
-            view.options.max_connections_per_ip,
-        ) {
-            Some(guard) => guard,
-            None => {
-                warn!(client_ip = %client_ip, "wisp: rejecting WS-over-H3 concurrency cap");
-                return Ok(());
+        // With no session running, a connection that sends no request is
+        // closed after the handshake timeout. While WS-over-H3 sessions run,
+        // the next request may come at any time.
+        let request_wait = if ws_sessions.is_empty() {
+            handshake_timeout
+        } else {
+            Duration::MAX
+        };
+        let accepted = tokio::select! {
+            Some(_) = ws_sessions.join_next(), if !ws_sessions.is_empty() => continue,
+            accepted = tokio::time::timeout(request_wait, h3_conn.accept()) => accepted,
+        };
+        let resolver = match accepted {
+            Ok(Ok(Some(resolver))) => resolver,
+            Ok(Ok(None)) => break None,
+            Ok(Err(e)) => {
+                debug!(error = ?e, "wisp: h3 accept ended");
+                break None;
+            }
+            Err(_) => {
+                debug!(client_ip = %client_ip, "wisp: no request before the handshake timeout");
+                break None;
             }
         };
-        info!(client_ip = %client_ip, "wisp: dispatching WS-over-H3");
-        let _h3_conn = h3_conn;
-        return serve_h3_websocket(
-            stream,
-            client_ip,
-            (**ctx).clone(),
-            view,
-            client_advertises_v2,
-        )
-        .await
-        .map_err(|e| HandlerError::WsH3(e.to_string()));
-    }
+        // A request stream that fails to resolve (431 for an oversized header
+        // block, malformed headers) costs only that stream.
+        let (request, stream) =
+            match tokio::time::timeout(handshake_timeout, resolver.resolve_request()).await {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(e)) => {
+                    debug!(error = ?e, "wisp: h3 request rejected");
+                    refused += 1;
+                    continue;
+                }
+                Err(_) => {
+                    debug!("wisp: h3 request headers timed out");
+                    refused += 1;
+                    continue;
+                }
+            };
 
-    if !is_connect
-        || !is_wt
-        || !(endpoint_matches(&path, &endpoint) || endpoint_path_token(&path, &endpoint).is_some())
-    {
-        debug!(method = %request.method(), %path, "rejecting non-wisp-wt request");
-        return Ok(());
-    }
+        let protocol = request.extensions().get::<Protocol>();
+        let is_connect = request.method() == Method::CONNECT;
+        if is_connect && protocol == Some(&Protocol::WEBSOCKET) {
+            match admit_ws(&request, &client_ip, ws_ctx.as_ref(), &dos).await {
+                Ok((ctx, view, conn_guard, client_advertises_v2)) => {
+                    debug!(client_ip = %client_ip, "wisp: dispatching WS-over-H3");
+                    let client_ip = client_ip.clone();
+                    ws_sessions.spawn(async move {
+                        let _conn_guard = conn_guard;
+                        if let Err(e) =
+                            serve_h3_websocket(stream, client_ip, ctx, view, client_advertises_v2)
+                                .await
+                        {
+                            debug!(error = %e, "wisp: WS-over-H3 session ended");
+                        }
+                    });
+                }
+                Err((status, headers)) => {
+                    refused += 1;
+                    reject_request(stream, status, headers).await;
+                }
+            }
+            continue;
+        }
+        if is_connect && protocol == Some(&Protocol::WEB_TRANSPORT) {
+            match admit_wt(
+                &request,
+                &client_ip,
+                &options,
+                &dos,
+                &connection_limiter,
+                &auth_registry,
+                &ip_bans,
+            )
+            .await
+            {
+                Ok(admission) => {
+                    break Some(AdmittedWt {
+                        request,
+                        stream,
+                        options: admission.0,
+                        allowed_proxy_providers: admission.1,
+                        client_hash: admission.2,
+                        conn_guard: admission.3,
+                    })
+                }
+                Err((status, headers)) => {
+                    refused += 1;
+                    reject_request(stream, status, headers).await;
+                }
+            }
+            continue;
+        }
+        refused += 1;
+        debug!(method = ?request.method(), path = ?request.uri().path(), "rejecting non-wisp request");
+        reject_request(stream, StatusCode::NOT_FOUND, HeaderMap::new()).await;
+    };
 
-    let effective_options = if let Some(token) = endpoint_path_token(&path, &endpoint) {
+    match admitted {
+        Some(admitted) => {
+            serve_webtransport(
+                h3_conn,
+                admitted,
+                client_ip,
+                &options,
+                dos,
+                proxy_template,
+                &mut ws_sessions,
+                handshake_timeout,
+            )
+            .await
+        }
+        None => {
+            // Keep the connection open for the WS sessions still running.
+            while ws_sessions.join_next().await.is_some() {}
+            drop(h3_conn);
+            Ok(())
+        }
+    }
+}
+
+type WsAdmission = (
+    H3WsContext,
+    wisp_ws_h3::dispatch::H3WsConnectionView,
+    ConnectionGuard,
+    bool,
+);
+
+/// Pre-upgrade checks for a WS-over-H3 CONNECT. `Err` carries the status and
+/// headers to answer with.
+async fn admit_ws(
+    request: &http::Request<()>,
+    client_ip: &str,
+    ws_ctx: Option<&Arc<H3WsContext>>,
+    dos: &Arc<DosGuard>,
+) -> Result<WsAdmission, (StatusCode, HeaderMap)> {
+    let path = request.uri().path();
+    let Some(ctx) = ws_ctx else {
+        debug!(path = ?path, "wisp: WS-over-H3 request but ws_ctx not configured");
+        return Err((StatusCode::NOT_FOUND, HeaderMap::new()));
+    };
+    let Some(view) = ctx.context_for_path(path).await else {
+        debug!(path = ?path, "wisp: WS endpoint or authentication rejected");
+        return Err((StatusCode::FORBIDDEN, HeaderMap::new()));
+    };
+    let policy =
+        PreUpgradePolicy::new(view.options.clone(), dos.clone()).with_ip_bans(ctx.ip_bans.clone());
+    if let Err(rej) = policy.check(request.headers(), client_ip) {
+        debug!(reason = rej.reason, "wisp: WS pre-upgrade rejected");
+        return Err((rej.status, rej.headers));
+    }
+    let client_advertises_v2 = request
+        .headers()
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .any(|v| {
+            v.to_str()
+                .map(|s| {
+                    s.split(',')
+                        .any(|p| p.trim().eq_ignore_ascii_case("wisp-v2"))
+                })
+                .unwrap_or(false)
+        });
+    let Some(conn_guard) = ctx.connection_limiter.try_acquire(
+        client_ip,
+        view.options.max_connections,
+        view.options.max_connections_per_ip,
+    ) else {
+        debug!(client_ip = %client_ip, "wisp: rejecting WS-over-H3 concurrency cap");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()));
+    };
+    Ok(((**ctx).clone(), view, conn_guard, client_advertises_v2))
+}
+
+type WtAdmission = (
+    Arc<WispServerOptions>,
+    Option<Vec<String>>,
+    Option<String>,
+    ConnectionGuard,
+);
+
+/// Pre-upgrade checks for a WebTransport CONNECT: endpoint, token, origin, IP
+/// and connection caps. `Err` carries the status and headers to answer with.
+async fn admit_wt(
+    request: &http::Request<()>,
+    client_ip: &str,
+    options: &WispWtServerOptions,
+    dos: &Arc<DosGuard>,
+    connection_limiter: &Arc<ConnectionLimiter>,
+    auth_registry: &WispAuthRegistry,
+    ip_bans: &Arc<IpHashBans>,
+) -> Result<WtAdmission, (StatusCode, HeaderMap)> {
+    let endpoint = normalize_endpoint(&options.base.endpoint);
+    let path = request.uri().path();
+    let token = endpoint_path_token(path, &endpoint);
+    if token.is_none() && !endpoint_matches(path, &endpoint) {
+        debug!(path = ?path, "rejecting WebTransport request outside the endpoint");
+        return Err((StatusCode::NOT_FOUND, HeaderMap::new()));
+    }
+    let (effective_options, allowed_proxy_providers) = if let Some(token) = token {
         if !options.base.auth.token_path {
-            warn!("wisp: token paths are disabled");
-            return Ok(());
+            debug!("wisp: token paths are disabled");
+            return Err((StatusCode::FORBIDDEN, HeaderMap::new()));
         }
         let timeout = Duration::from_millis(options.base.auth.resolver_timeout_ms);
         let resolved = tokio::time::timeout(
@@ -472,78 +837,130 @@ async fn handle_connection(
         .ok()
         .flatten();
         let Some(resolved) = resolved else {
-            warn!("wisp: WebTransport authentication rejected");
-            return Ok(());
+            debug!("wisp: WebTransport authentication rejected");
+            return Err((StatusCode::FORBIDDEN, HeaderMap::new()));
         };
-        Arc::new(resolved.options)
+        (
+            Arc::new(resolved.options),
+            resolved.policy.allowed_proxy_providers,
+        )
     } else {
         if options.base.auth.required {
-            warn!("wisp: WebTransport authentication required");
-            return Ok(());
+            debug!("wisp: WebTransport authentication required");
+            return Err((StatusCode::FORBIDDEN, HeaderMap::new()));
         }
-        auth_registry
+        let base = auth_registry
             .profile(WISP_BASE_LIMIT_PROFILE)
             .map(Arc::new)
-            .unwrap_or_else(|| Arc::new(options.base.clone()))
+            .unwrap_or_else(|| Arc::new(options.base.clone()));
+        (base, None)
     };
 
     let policy =
-        PreUpgradePolicy::new(effective_options.clone(), dos.clone()).with_ip_bans(ip_bans);
-    let client_hash = match policy.check(request.headers(), &client_ip) {
+        PreUpgradePolicy::new(effective_options.clone(), dos.clone()).with_ip_bans(ip_bans.clone());
+    let client_hash = match policy.check(request.headers(), client_ip) {
         Ok(h) => h,
         Err(rej) => {
-            warn!(reason = rej.reason, "wisp: pre-upgrade rejected");
-            return Ok(());
+            debug!(reason = rej.reason, "wisp: pre-upgrade rejected");
+            return Err((rej.status, rej.headers));
         }
     };
 
-    let _conn_guard = match connection_limiter.try_acquire(
-        &client_ip,
+    let Some(conn_guard) = connection_limiter.try_acquire(
+        client_ip,
         effective_options.max_connections,
         effective_options.max_connections_per_ip,
-    ) {
-        Some(g) => g,
-        None => {
-            warn!(client_ip = %client_ip, "wisp: rejecting: connection concurrency cap");
-            return Ok(());
-        }
+    ) else {
+        debug!(client_ip = %client_ip, "wisp: rejecting: connection concurrency cap");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()));
     };
+    Ok((
+        effective_options,
+        allowed_proxy_providers,
+        client_hash,
+        conn_guard,
+    ))
+}
 
+/// Accept the admitted WebTransport session and run it to the end, then wait
+/// for any WS-over-H3 sessions that were already running on the connection.
+async fn serve_webtransport(
+    mut h3_conn: h3::server::Connection<MsQuicConnection, Bytes>,
+    admitted: AdmittedWt,
+    client_ip: String,
+    options: &WispWtServerOptions,
+    dos: Arc<DosGuard>,
+    proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    ws_sessions: &mut JoinSet<()>,
+    handshake_timeout: Duration,
+) -> Result<(), HandlerError> {
+    let AdmittedWt {
+        request,
+        stream,
+        options: effective_options,
+        allowed_proxy_providers,
+        client_hash,
+        conn_guard: _conn_guard,
+    } = admitted;
     tokio::time::timeout(handshake_timeout, await_peer_settings(&mut h3_conn))
         .await
         .map_err(|_| HandlerError::WtAccept("peer SETTINGS timed out".to_owned()))?
         .map_err(|e| HandlerError::WtAccept(format!("{e:?}")))?;
-    let session = WebTransportSession::accept(request, stream, h3_conn)
-        .await
-        .map_err(|e| HandlerError::WtAccept(format!("{e:?}")))?;
-    info!(client_ip = %client_ip, "wisp: WebTransport session accepted");
+    let session = Arc::new(
+        WebTransportSession::accept(request, stream, h3_conn)
+            .await
+            .map_err(|e| HandlerError::WtAccept(format!("{e:?}")))?,
+    );
+    debug!(client_ip = %client_ip, "wisp: WebTransport session accepted");
 
     let mut ctx =
         SessionContext::new(client_ip, effective_options, dos).with_client_hash(client_hash);
 
-    session_loop(
-        session,
+    let result = session_loop(
+        session.clone(),
         &mut ctx,
-        options.webtransport_proxy_enabled,
-        options.max_proxy_sessions_per_connection,
-        options.max_proxy_substreams_per_session,
-        options.max_datagram_bytes,
-        options.proxy_control_enabled,
+        SessionSettings {
+            wt_proxy_enabled: options.webtransport_proxy_enabled,
+            max_proxy_sessions: options.max_proxy_sessions_per_connection,
+            max_proxy_substreams: options.max_proxy_substreams_per_session,
+            max_datagram_bytes: options.max_datagram_bytes,
+            proxy_control_enabled: options.proxy_control_enabled,
+            allowed_proxy_providers,
+        },
         proxy_template,
     )
-    .await
+    .await;
+    // The session owns the h3 connection, and dropping it closes the QUIC
+    // connection, so it stays alive while a WS-over-H3 session still runs.
+    while ws_sessions.join_next().await.is_some() {}
+    drop(session);
+    result
 }
 
-async fn session_loop(
-    session: WebTransportSession<MsQuicConnection, Bytes>,
-    ctx: &mut SessionContext,
+/// Per-session settings taken from `[wisp_wt]` and the token's policy.
+struct SessionSettings {
     wt_proxy_enabled: bool,
     max_proxy_sessions: u32,
     max_proxy_substreams: u32,
     max_datagram_bytes: u32,
     proxy_control_enabled: bool,
+    allowed_proxy_providers: Option<Vec<String>>,
+}
+
+async fn session_loop(
+    session: Arc<WebTransportSession<MsQuicConnection, Bytes>>,
+    ctx: &mut SessionContext,
+    settings: SessionSettings,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
 ) -> Result<(), HandlerError> {
+    let SessionSettings {
+        wt_proxy_enabled,
+        max_proxy_sessions,
+        max_proxy_substreams,
+        max_datagram_bytes,
+        proxy_control_enabled,
+        allowed_proxy_providers,
+    } = settings;
     let handshake_timeout =
         Duration::from_millis(ctx.options.handshake_timeout_ms.unwrap_or(10_000).max(1));
     let accepted = tokio::time::timeout(handshake_timeout, session.accept_bi())
@@ -552,10 +969,11 @@ async fn session_loop(
         .map_err(|e| HandlerError::ControlAccept(format!("{e:?}")))?;
     let bidi = match accepted {
         Some(AcceptedBi::BidiStream(_, bidi)) => bidi,
-        Some(AcceptedBi::Request(..)) => {
+        Some(AcceptedBi::Request(_, stream)) => {
+            reject_request(stream, StatusCode::BAD_REQUEST, HeaderMap::new()).await;
             return Err(HandlerError::ControlAccept(
                 "first bidi was an HTTP request, not a WT bidi stream".into(),
-            ))
+            ));
         }
         None => return Ok(()),
     };
@@ -572,7 +990,13 @@ async fn session_loop(
     let proxy_controller = if proxy_control_enabled {
         proxy_template.as_ref().map(|template| {
             let server_opts = ServerOptions::from_wisp(&ctx.options, true);
-            template.spawn(server_opts.proxy_control_limits(), None)
+            // The token's provider grants and the per-IP budgets apply here
+            // the same way they do on the WebSocket transports.
+            let controller =
+                template.spawn(server_opts.proxy_control_limits(), allowed_proxy_providers);
+            controller.bind_client(&ctx.client_ip, None);
+            controller.bind_ip_budget(ctx.client_ip.clone(), ctx.dos.clone());
+            controller
         })
     } else {
         None
@@ -593,15 +1017,24 @@ async fn session_loop(
         return Err(HandlerError::Handshake(e));
     }
 
-    info!(
+    debug!(
         negotiated = ?ctx.negotiated.iter().collect::<Vec<_>>(),
         "wisp: handshake complete"
     );
 
+    // Everything the session starts ends with it. `flow_shutdown` is
+    // cancelled when the session ends, and also when this future is dropped
+    // (the server shutting down), so no task keeps a stream, socket or
+    // upstream open after the session's connection slot is released.
+    let flow_shutdown = CancellationToken::new();
+    let _cancel_on_drop = flow_shutdown.clone().drop_guard();
+    let mut session_tasks: JoinSet<()> = JoinSet::new();
+    let tasks = TaskTracker::new();
+
     let (bidi, rx_buf) = control_io.into_inner();
     let (mut control_send, control_recv) = H3BidiStream::<Bytes>::split(bidi);
     let (control_writer_tx, mut control_writer_rx) = mpsc::channel::<Bytes>(64);
-    let writer_task = tokio::spawn(async move {
+    session_tasks.spawn(async move {
         while let Some(frame) = control_writer_rx.recv().await {
             let mut remaining = frame;
             while remaining.has_remaining() {
@@ -635,12 +1068,11 @@ async fn session_loop(
     );
 
     let udp_flows = Arc::new(UdpFlowRegistry::default());
-    let flow_shutdown = CancellationToken::new();
     let datagram_reader = session.datagram_reader();
     let mut datagram_sender = session.datagram_sender();
     let (datagram_tx, mut datagram_rx) =
         mpsc::channel::<DatagramEgress>(DATAGRAM_EGRESS_QUEUE_CAPACITY);
-    let datagram_writer_task = tokio::spawn(async move {
+    session_tasks.spawn(async move {
         while let Some(queued) = datagram_rx.recv().await {
             if queued.frame.len() > max_datagram_bytes as usize {
                 debug!(
@@ -665,7 +1097,6 @@ async fn session_loop(
         }
     });
 
-    let session = Arc::new(session);
     let wt_proxies = if ctx.has::<WebTransportProxy>() {
         Some(Arc::new(
             WtProxyRegistry::new(
@@ -679,40 +1110,29 @@ async fn session_loop(
     } else {
         None
     };
-    let accept_session = session.clone();
-    let accept_connector = tcp_connector.clone();
-    let accept_wt_proxies = wt_proxies.clone();
-    let accept_proxy = proxy_controller.clone();
-    let stream_logger = ctx.client_ip.clone();
     let session_limits = SessionLimits::from_ctx(ctx);
-    let accept_limits = session_limits.clone();
-    let accept_task = tokio::spawn(async move {
-        accept_streams_loop(
-            accept_session,
-            accept_connector,
-            accept_wt_proxies,
-            accept_proxy,
-            stream_logger,
-            accept_limits,
-        )
-        .await;
-    });
+    session_tasks.spawn(accept_streams_loop(
+        session.clone(),
+        tcp_connector.clone(),
+        wt_proxies.clone(),
+        proxy_controller.clone(),
+        ctx.client_ip.clone(),
+        session_limits.clone(),
+        tasks.clone(),
+        flow_shutdown.clone(),
+    ));
+    session_tasks.spawn(refuse_uni_streams(session.clone()));
 
-    let demux_flows = udp_flows.clone();
-    let demux_wt_proxies = wt_proxies.clone();
-    let demux_limits = session_limits.clone();
     let udp_negotiated = ctx.has::<wisp_wire::Udp>();
-    let demux_task = tokio::spawn(async move {
-        datagram_demux_loop(
-            datagram_reader,
-            demux_flows,
-            demux_wt_proxies,
-            demux_limits,
-            udp_negotiated,
-            max_datagram_bytes,
-        )
-        .await;
-    });
+    session_tasks.spawn(datagram_demux_loop(
+        datagram_reader,
+        udp_flows.clone(),
+        wt_proxies.clone(),
+        session_limits.clone(),
+        udp_negotiated,
+        max_datagram_bytes,
+        flow_shutdown.clone(),
+    ));
 
     let sink_options = ctx.options.clone();
     let udp_slots = (sink_options.stream_limit_total != 0).then(|| {
@@ -733,20 +1153,39 @@ async fn session_loop(
         proxy_controller: proxy_controller.clone(),
         proxy_control_negotiated: ctx.has::<ProxyControl>(),
         udp_slots,
+        udp_reply_tail: None,
+        tasks: tasks.clone(),
     };
 
     let dispatch = SessionDispatch::new(ctx);
-    let outcome = dispatch.run(&mut control_reader, &mut sink).await;
+    let outcome = tokio::select! {
+        outcome = dispatch.run(&mut control_reader, &mut sink) => outcome,
+        // The datagram path ends the session on abuse (see `datagram_demux_loop`).
+        _ = flow_shutdown.cancelled() => {
+            ControlOutcome::Error("session ended by the datagram path".to_owned())
+        }
+    };
 
     flow_shutdown.cancel();
     udp_flows.shutdown_all();
     if let Some(registry) = wt_proxies {
         registry.shutdown_all();
     }
-    accept_task.abort();
-    demux_task.abort();
-    datagram_writer_task.abort();
-    writer_task.abort();
+    drop(sink);
+    session_tasks.abort_all();
+    while session_tasks.join_next().await.is_some() {}
+    // Stream, flow and proxy tasks watch `flow_shutdown`; wait for them so the
+    // connection's slot is only released once nothing runs for it.
+    tasks.close();
+    if tokio::time::timeout(SESSION_TASK_DRAIN_TIMEOUT, tasks.wait())
+        .await
+        .is_err()
+    {
+        debug!(
+            remaining = tasks.len(),
+            "wisp: session tasks still running after the drain timeout"
+        );
+    }
 
     match outcome {
         ControlOutcome::PeerClose { reason } => {
@@ -758,13 +1197,32 @@ async fn session_loop(
     }
 }
 
+/// wisp-wt clients open no unidirectional streams of their own. Any that
+/// arrive are told to stop sending, so they hold no flow-control credit or
+/// buffered data for the rest of the session.
+async fn refuse_uni_streams(session: Arc<WebTransportSession<MsQuicConnection, Bytes>>) {
+    loop {
+        match session.accept_uni().await {
+            Ok(Some((_, mut stream))) => {
+                stream.stop_sending(h3::error::Code::H3_NO_ERROR.value());
+                debug!("wisp: client unidirectional WT stream refused");
+            }
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
 /// Per-session DoS accounting threaded into the stream/datagram pump tasks so
 /// the WT/QUIC path enforces the same per-IP / per-connection rate limits the
 /// WS path does. Cloneable (all fields are `Arc`/`String`).
 #[derive(Clone)]
 struct SessionLimits {
     client_ip: String,
+    client_hash: Option<String>,
     options: Arc<WispServerOptions>,
+    /// Destination policy, checked before any stream is bridged, exactly as
+    /// the WebSocket path checks it before dialing.
+    policy: Arc<HostPolicy>,
     dos: Arc<DosGuard>,
     conn_dos: Arc<ConnectionDosGuard>,
     tcp_bytes: Arc<TcpByteLimiter>,
@@ -844,12 +1302,40 @@ impl SessionLimits {
         ));
         Self {
             client_ip: ctx.client_ip.clone(),
+            client_hash: ctx.client_hash.clone(),
             options: ctx.options.clone(),
+            policy: Arc::new(HostPolicy::from_options(&ctx.options)),
             dos: ctx.dos.clone(),
             conn_dos: ctx.conn_dos.clone(),
             tcp_bytes,
             stream_caps: Arc::new(WtStreamCaps::new(&ctx.options)),
         }
+    }
+
+    /// Destination policy for a TCP stream, reported like the WebSocket path
+    /// reports a blocked host.
+    fn tcp_destination_allowed(&self, hostname: &str, port: u16) -> bool {
+        let Err(error) = self.policy.check(hostname, port) else {
+            return true;
+        };
+        debug!(host = ?hostname, port, error = ?error.to_string(), "wisp: WT TCP host policy reject");
+        emit_report(
+            ReportErrorType::HostPolicyBlocked,
+            ReportInput {
+                context: Some(ConnectionContext {
+                    client_ip: Some(self.client_ip.clone()),
+                    client_ip_hash: self.client_hash.clone(),
+                    transport: Some(Transport::Wt),
+                    ..Default::default()
+                }),
+                hostname: Some(hostname.to_owned()),
+                port: Some(port),
+                stream_type: Some(wisp_reports::StreamType::Tcp),
+                wisp_close_code: Some(i32::from(CLOSE_HOST_BLOCKED)),
+                ..Default::default()
+            },
+        );
+        false
     }
 
     fn tcp_open_allowed(&self, hostname: &str) -> bool {
@@ -887,6 +1373,57 @@ impl SessionLimits {
     }
 }
 
+/// When a bridged stream or flow last moved data, in either direction. Both
+/// pumps of a bridge share one, so a download that is still receiving keeps
+/// the stream alive even though the client sends nothing.
+struct Activity {
+    started: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        })
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(now, Ordering::Relaxed);
+    }
+
+    fn quiet_for(&self) -> Duration {
+        self.started
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.last_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// Resolves once `activity` has been quiet for `idle`. `None` (an idle
+/// timeout of 0) never resolves.
+async fn idle_expired(activity: &Activity, idle: Option<Duration>) {
+    let Some(idle) = idle else {
+        return std::future::pending().await;
+    };
+    loop {
+        let quiet = activity.quiet_for();
+        if quiet >= idle {
+            return;
+        }
+        tokio::time::sleep(idle - quiet).await;
+    }
+}
+
+/// An idle timeout from the config: `default_ms` when unset, none for 0.
+fn idle_limit(configured_ms: Option<u64>, default_ms: u64) -> Option<Duration> {
+    match configured_ms.unwrap_or(default_ms) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    }
+}
+
 /// Hot loop: per-session, accept bidi streams and bridge to TCP/WT_PROXY_SUB.
 async fn accept_streams_loop(
     session: Arc<WebTransportSession<MsQuicConnection, Bytes>>,
@@ -895,6 +1432,8 @@ async fn accept_streams_loop(
     proxy_controller: Option<Arc<ProxyController>>,
     client_ip: String,
     limits: SessionLimits,
+    tasks: TaskTracker,
+    cancel: CancellationToken,
 ) {
     loop {
         let accepted = match session.accept_bi().await {
@@ -910,28 +1449,45 @@ async fn accept_streams_loop(
         };
         let bidi = match accepted {
             AcceptedBi::BidiStream(_, b) => b,
-            AcceptedBi::Request(..) => continue,
+            AcceptedBi::Request(_, stream) => {
+                // One WebTransport session per connection; a second CONNECT (or
+                // any other request) gets an answer instead of a silent reset.
+                tasks.spawn(reject_request(
+                    stream,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    HeaderMap::new(),
+                ));
+                continue;
+            }
         };
         let connector = connector.clone();
         let client_ip = client_ip.clone();
         let limits = limits.clone();
         let wt_proxies = wt_proxies.clone();
         let proxy_controller = proxy_controller.clone();
-        tokio::spawn(async move {
-            if let Err(e) = bridge_one_stream(
-                bidi,
-                connector,
-                wt_proxies,
-                proxy_controller,
-                &client_ip,
-                &limits,
-            )
-            .await
-            {
+        let cancel = cancel.clone();
+        tasks.spawn(async move {
+            let bridged = tokio::select! {
+                _ = cancel.cancelled() => return,
+                bridged = bridge_one_stream(
+                    bidi,
+                    connector,
+                    wt_proxies,
+                    proxy_controller,
+                    &limits,
+                ) => bridged,
+            };
+            if let Err(e) = bridged {
                 debug!(client_ip = %client_ip, error = %e, "wisp: stream bridge ended");
             }
         });
     }
+}
+
+/// Reset both halves of a stream the server refuses.
+fn refuse_stream(send: &mut WtBidiSend, recv: &mut WtBidiRecv, code: u8) {
+    send.reset(u64::from(code));
+    recv.stop_sending(u64::from(code));
 }
 
 /// Reads the bidi header (priority + kind + tail) off the first bytes, then
@@ -944,7 +1500,6 @@ async fn bridge_one_stream(
     connector: Arc<TcpConnector>,
     wt_proxies: Option<Arc<WtProxyRegistry>>,
     proxy_controller: Option<Arc<ProxyController>>,
-    client_ip: &str,
     limits: &SessionLimits,
 ) -> Result<(), BridgeError> {
     let (mut send, mut recv) = H3BidiStream::<Bytes>::split(bidi);
@@ -1001,18 +1556,27 @@ async fn bridge_one_stream(
 
     match header.kind {
         BidiStreamKind::Tcp { hostname, port } => {
+            if !limits.options.allow_tcp_streams {
+                refuse_stream(&mut send, &mut recv, CLOSE_HOST_BLOCKED);
+                return Err(BridgeError::Proxy("TCP streams are disabled".to_owned()));
+            }
+            if !limits.tcp_destination_allowed(&hostname, port) {
+                refuse_stream(&mut send, &mut recv, CLOSE_HOST_BLOCKED);
+                return Err(BridgeError::Proxy(
+                    "destination blocked by policy".to_owned(),
+                ));
+            }
             if !limits.tcp_open_allowed(&hostname) {
-                info!(
-                    client_ip = %client_ip,
-                    host = %hostname,
+                debug!(
+                    host = ?hostname,
                     port,
                     "wisp: TCP bridge rejected (stream-open / dns rate limit)"
                 );
+                refuse_stream(&mut send, &mut recv, CLOSE_THROTTLED);
                 return Ok(());
             }
-            info!(
-                client_ip = %client_ip,
-                host = %hostname,
+            debug!(
+                host = ?hostname,
                 port,
                 priority = header.priority,
                 "wisp: TCP bridge open"
@@ -1027,10 +1591,15 @@ async fn bridge_one_stream(
                         .unwrap_or(10_000)
                         .max(1),
                 );
+                // Nothing is dialed until the client's first bytes are
+                // classified, so a server-first service never gets to speak
+                // before inspection, and the TLS SNI or HTTP Host must name
+                // the host the stream asked for.
+                let mut inspector = Inspector::new(Some(&hostname));
                 tokio::time::timeout(inspection_timeout, async {
                     loop {
                         let inspected_len = rx_buf.len().min(inspection_max);
-                        match inspect(&rx_buf[..inspected_len], &limits.options) {
+                        match inspector.feed(&rx_buf[..inspected_len], &limits.options) {
                             InspectionDecision::Allow(_) => {
                                 return Ok::<(), BridgeError>(());
                             }
@@ -1060,7 +1629,8 @@ async fn bridge_one_stream(
                     }
                 })
                 .await
-                .map_err(|_| BridgeError::Io("protocol inspection timed out".to_owned()))??;
+                .map_err(|_| BridgeError::Io("protocol inspection timed out".to_owned()))?
+                .inspect_err(|_| refuse_stream(&mut send, &mut recv, CLOSE_HOST_BLOCKED))?;
             }
             let leftover = rx_buf.split().freeze();
             if !leftover.is_empty() && !limits.tcp_bytes_allowed(leftover.len() as u64) {
@@ -1068,25 +1638,25 @@ async fn bridge_one_stream(
                     "client->upstream byte rate exceeded".to_owned(),
                 ));
             }
-            let tcp = match proxy_controller.as_ref() {
-                Some(controller) => {
-                    let policy = HostPolicy::from_options(&limits.options);
-                    controller
-                        .connect_tcp(&hostname, port, limits.options.force_proxy, &policy)
-                        .await
-                        .map(|(stream, _)| stream)
-                        .map_err(|e| BridgeError::Proxy(e.to_string()))?
-                }
-                None => {
-                    if limits.options.force_proxy {
-                        return Err(BridgeError::Proxy(
-                            "force_proxy requires proxy control".to_owned(),
-                        ));
-                    }
-                    connector
-                        .connect(&hostname, port)
-                        .await
-                        .map_err(|e| BridgeError::Proxy(e.to_string()))?
+            let dialed = match proxy_controller.as_ref() {
+                Some(controller) => controller
+                    .connect_tcp(&hostname, port, limits.options.force_proxy, &limits.policy)
+                    .await
+                    .map(|(stream, _)| stream)
+                    .map_err(|e| BridgeError::Proxy(e.to_string())),
+                None if limits.options.force_proxy => Err(BridgeError::Proxy(
+                    "force_proxy requires proxy control".to_owned(),
+                )),
+                None => connector
+                    .connect(&hostname, port)
+                    .await
+                    .map_err(|e| BridgeError::Proxy(e.to_string())),
+            };
+            let tcp = match dialed {
+                Ok(tcp) => tcp,
+                Err(error) => {
+                    refuse_stream(&mut send, &mut recv, CLOSE_NETWORK_ERROR);
+                    return Err(error);
                 }
             };
             let (mut tcp_read, mut tcp_write) = tcp.into_split();
@@ -1098,30 +1668,18 @@ async fn bridge_one_stream(
                     .map_err(|e| BridgeError::Io(format!("tcp write (initial): {e}")))?;
             }
 
-            let idle = Duration::from_millis(
-                limits
-                    .options
-                    .stream_idle_timeout_ms
-                    .unwrap_or(600_000)
-                    .max(1),
-            );
+            let idle = idle_limit(limits.options.stream_idle_timeout_ms, 600_000);
+            let activity = Activity::new();
+            let up_activity = activity.clone();
             let limits_up = limits.clone();
             let wt_to_tcp = async move {
                 loop {
-                    let chunk = match tokio::time::timeout(
-                        idle,
-                        std::future::poll_fn(|cx| recv.poll_data(cx)),
-                    )
-                    .await
-                    {
-                        Ok(r) => r.map_err(|e| BridgeError::Io(format!("wt recv: {e:?}")))?,
-                        Err(_) => {
-                            let _ = tcp_write.shutdown().await;
-                            return Ok::<(), BridgeError>(());
-                        }
-                    };
+                    let chunk = std::future::poll_fn(|cx| recv.poll_data(cx))
+                        .await
+                        .map_err(|e| BridgeError::Io(format!("wt recv: {e:?}")))?;
                     match chunk {
                         Some(b) if b.has_remaining() => {
+                            up_activity.touch();
                             if !limits_up.tcp_bytes_allowed(b.chunk().len() as u64) {
                                 return Err(BridgeError::Io(
                                     "client->upstream byte rate exceeded".into(),
@@ -1140,17 +1698,25 @@ async fn bridge_one_stream(
                     }
                 }
             };
+            let down_activity = activity.clone();
             let limits_down = limits.clone();
             let tcp_to_wt = async move {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
-                    let n = match tokio::time::timeout(idle, tcp_read.read(&mut buf)).await {
-                        Ok(r) => r.map_err(|e| BridgeError::Io(format!("tcp read: {e}")))?,
-                        Err(_) => return Ok::<(), BridgeError>(()),
-                    };
+                    let n = tcp_read
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| BridgeError::Io(format!("tcp read: {e}")))?;
                     if n == 0 {
+                        // The upstream finished cleanly, so finish the stream
+                        // too; dropping it would reset it, and the client would
+                        // read a truncated response as an error.
+                        std::future::poll_fn(|cx| send.poll_finish(cx))
+                            .await
+                            .map_err(|e| BridgeError::Io(format!("wt finish: {e:?}")))?;
                         return Ok::<(), BridgeError>(());
                     }
+                    down_activity.touch();
                     if !limits_down.tcp_bytes_allowed(n as u64) {
                         return Err(BridgeError::Io(
                             "upstream->client byte rate exceeded".into(),
@@ -1168,10 +1734,17 @@ async fn bridge_one_stream(
                 }
             };
 
-            let (a, b) = tokio::join!(wt_to_tcp, tcp_to_wt);
-            a?;
-            b?;
-            Ok(())
+            tokio::select! {
+                result = async {
+                    let (a, b) = tokio::join!(wt_to_tcp, tcp_to_wt);
+                    a?;
+                    b
+                } => result,
+                _ = idle_expired(&activity, idle) => {
+                    debug!(host = ?hostname, port, "wisp: TCP bridge idle, closing");
+                    Ok(())
+                }
+            }
         }
         BidiStreamKind::WtProxySub { session_id } => {
             let Some(registry) = wt_proxies else {
@@ -1258,26 +1831,19 @@ async fn bridge_downstream_to_upstream(
             .map_err(|e| BridgeError::Io(format!("upstream WT initial write: {e}")))?;
     }
 
-    let idle = Duration::from_millis(
-        limits
-            .options
-            .stream_idle_timeout_ms
-            .unwrap_or(600_000)
-            .max(1),
-    );
+    let idle = idle_limit(limits.options.stream_idle_timeout_ms, 600_000);
+    let activity = Activity::new();
+    let up_activity = activity.clone();
     let upstream_cancel = upstream.cancel.clone();
     let up_limits = limits.clone();
     let downstream_to_upstream = async move {
         loop {
-            let chunk = tokio::time::timeout(
-                idle,
-                std::future::poll_fn(|cx| downstream_recv.poll_data(cx)),
-            )
-            .await
-            .map_err(|_| BridgeError::Io("downstream WT stream idle timeout".to_owned()))?
-            .map_err(|e| BridgeError::Io(format!("downstream WT receive: {e:?}")))?;
+            let chunk = std::future::poll_fn(|cx| downstream_recv.poll_data(cx))
+                .await
+                .map_err(|e| BridgeError::Io(format!("downstream WT receive: {e:?}")))?;
             match chunk {
                 Some(bytes) if bytes.has_remaining() => {
+                    up_activity.touch();
                     if !up_limits.tcp_bytes_allowed(bytes.chunk().len() as u64) {
                         return Err(BridgeError::Io(
                             "client->upstream byte rate exceeded".to_owned(),
@@ -1299,23 +1865,21 @@ async fn bridge_downstream_to_upstream(
             }
         }
     };
+    let down_activity = activity.clone();
     let down_limits = limits.clone();
     let upstream_to_downstream = async move {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
-            let read = tokio::time::timeout(
-                idle,
-                tokio::io::AsyncReadExt::read(&mut upstream_recv, &mut buffer),
-            )
-            .await
-            .map_err(|_| BridgeError::Io("upstream WT stream idle timeout".to_owned()))?
-            .map_err(|e| BridgeError::Io(format!("upstream WT read: {e}")))?;
+            let read = tokio::io::AsyncReadExt::read(&mut upstream_recv, &mut buffer)
+                .await
+                .map_err(|e| BridgeError::Io(format!("upstream WT read: {e}")))?;
             if read == 0 {
                 std::future::poll_fn(|cx| downstream_send.poll_finish(cx))
                     .await
                     .map_err(|e| BridgeError::Io(format!("downstream WT finish: {e:?}")))?;
                 return Ok::<(), BridgeError>(());
             }
+            down_activity.touch();
             if !down_limits.tcp_bytes_allowed(read as u64) {
                 return Err(BridgeError::Io(
                     "upstream->client byte rate exceeded".to_owned(),
@@ -1335,6 +1899,9 @@ async fn bridge_downstream_to_upstream(
 
     tokio::select! {
         _ = upstream_cancel.cancelled() => Ok(()),
+        _ = idle_expired(&activity, idle) => {
+            Err(BridgeError::Io("WT proxy stream idle timeout".to_owned()))
+        }
         result = async {
             let (a, b) = tokio::join!(downstream_to_upstream, upstream_to_downstream);
             a?;
@@ -1349,10 +1916,11 @@ fn pump_upstream_session(
     downstream: Arc<WebTransportSession<MsQuicConnection, Bytes>>,
     datagram_tx: mpsc::Sender<DatagramEgress>,
     limits: SessionLimits,
+    tasks: TaskTracker,
 ) {
     let datagram_upstream = upstream.clone();
     let datagram_limits = limits.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let payload = tokio::select! {
                 _ = datagram_upstream.cancel.cancelled() => return,
@@ -1396,7 +1964,8 @@ fn pump_upstream_session(
     let stream_upstream = upstream.clone();
     let stream_downstream = downstream.clone();
     let stream_limits = limits.clone();
-    tokio::spawn(async move {
+    let stream_tasks = tasks.clone();
+    tasks.spawn(async move {
         loop {
             let accepted = tokio::select! {
                 _ = stream_upstream.cancel.cancelled() => return,
@@ -1434,7 +2003,7 @@ fn pump_upstream_session(
             let upstream = stream_upstream.clone();
             let limits = stream_limits.clone();
             let priority = upstream_send.priority().unwrap_or(0);
-            tokio::spawn(async move {
+            stream_tasks.spawn(async move {
                 let open_timeout = Duration::from_millis(
                     limits.options.connect_timeout_ms.unwrap_or(10_000).max(1),
                 );
@@ -1485,7 +2054,7 @@ fn pump_upstream_session(
     });
 
     let uni_upstream = upstream.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let accepted = tokio::select! {
                 _ = uni_upstream.cancel.cancelled() => return,
@@ -1501,7 +2070,7 @@ fn pump_upstream_session(
         }
     });
 
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let closed = upstream.session.closed().await;
         let (code, reason) = match closed {
             web_transport_quinn::SessionError::WebTransportError(
@@ -1528,25 +2097,18 @@ async fn bridge_upstream_to_downstream(
     limits: SessionLimits,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), BridgeError> {
-    let idle = Duration::from_millis(
-        limits
-            .options
-            .stream_idle_timeout_ms
-            .unwrap_or(600_000)
-            .max(1),
-    );
+    let idle = idle_limit(limits.options.stream_idle_timeout_ms, 600_000);
+    let activity = Activity::new();
+    let up_activity = activity.clone();
     let up_limits = limits.clone();
     let downstream_to_upstream = async move {
         loop {
-            let chunk = tokio::time::timeout(
-                idle,
-                std::future::poll_fn(|cx| downstream_recv.poll_data(cx)),
-            )
-            .await
-            .map_err(|_| BridgeError::Io("downstream WT stream idle timeout".to_owned()))?
-            .map_err(|e| BridgeError::Io(format!("downstream WT receive: {e:?}")))?;
+            let chunk = std::future::poll_fn(|cx| downstream_recv.poll_data(cx))
+                .await
+                .map_err(|e| BridgeError::Io(format!("downstream WT receive: {e:?}")))?;
             match chunk {
                 Some(bytes) if bytes.has_remaining() => {
+                    up_activity.touch();
                     if !up_limits.tcp_bytes_allowed(bytes.chunk().len() as u64) {
                         return Err(BridgeError::Io(
                             "client->upstream byte rate exceeded".to_owned(),
@@ -1568,23 +2130,21 @@ async fn bridge_upstream_to_downstream(
             }
         }
     };
+    let down_activity = activity.clone();
     let down_limits = limits;
     let upstream_to_downstream = async move {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
-            let read = tokio::time::timeout(
-                idle,
-                tokio::io::AsyncReadExt::read(&mut upstream_recv, &mut buffer),
-            )
-            .await
-            .map_err(|_| BridgeError::Io("upstream WT stream idle timeout".to_owned()))?
-            .map_err(|e| BridgeError::Io(format!("upstream WT read: {e}")))?;
+            let read = tokio::io::AsyncReadExt::read(&mut upstream_recv, &mut buffer)
+                .await
+                .map_err(|e| BridgeError::Io(format!("upstream WT read: {e}")))?;
             if read == 0 {
                 std::future::poll_fn(|cx| downstream_send.poll_finish(cx))
                     .await
                     .map_err(|e| BridgeError::Io(format!("downstream WT finish: {e:?}")))?;
                 return Ok::<(), BridgeError>(());
             }
+            down_activity.touch();
             if !down_limits.tcp_bytes_allowed(read as u64) {
                 return Err(BridgeError::Io(
                     "upstream->client byte rate exceeded".to_owned(),
@@ -1604,6 +2164,9 @@ async fn bridge_upstream_to_downstream(
 
     tokio::select! {
         _ = upstream.cancel.cancelled() => Ok(()),
+        _ = idle_expired(&activity, idle) => {
+            Err(BridgeError::Io("WT proxy stream idle timeout".to_owned()))
+        }
         result = async {
             let (a, b) = tokio::join!(downstream_to_upstream, upstream_to_downstream);
             a?;
@@ -1682,6 +2245,56 @@ struct BridgeSink {
     proxy_controller: Option<Arc<ProxyController>>,
     proxy_control_negotiated: bool,
     udp_slots: Option<Arc<Semaphore>>,
+    /// Signalled once the reply to the latest UDP_OPEN has been queued.
+    udp_reply_tail: Option<oneshot::Receiver<()>>,
+    /// Tasks the session waits for before releasing its connection slot.
+    tasks: TaskTracker,
+}
+
+/// One UDP_OPEN's place in the reply order. UDP_OPENED carries no request id,
+/// so a client can only match replies to its requests by order: every
+/// UDP_OPEN gets exactly one reply (UDP_OPENED, or UDP_CLOSE with a reason),
+/// queued after the reply to the UDP_OPEN before it, however long each bind
+/// takes.
+struct UdpReplyTurn {
+    after: Option<oneshot::Receiver<()>>,
+    done: oneshot::Sender<()>,
+}
+
+impl UdpReplyTurn {
+    async fn reply(self, control_writer: &mpsc::Sender<Bytes>, frame: Bytes) {
+        if let Some(after) = self.after {
+            // An error means the earlier turn was dropped without replying,
+            // which also frees this one.
+            let _ = after.await;
+        }
+        let _ = control_writer.send(frame).await;
+        let _ = self.done.send(());
+    }
+}
+
+impl BridgeSink {
+    fn next_udp_reply_turn(&mut self) -> UdpReplyTurn {
+        let (done, next) = oneshot::channel();
+        UdpReplyTurn {
+            after: self.udp_reply_tail.replace(next),
+            done,
+        }
+    }
+
+    /// Refuse a UDP_OPEN with a UDP_CLOSE for a fresh flow id, in reply order.
+    fn refuse_udp_open(&mut self, reason: u8) {
+        let flow_id = self.flows.alloc_id();
+        let turn = self.next_udp_reply_turn();
+        let control_writer = self.control_writer.clone();
+        self.tasks.spawn(async move {
+            turn.reply(
+                &control_writer,
+                wisp_wire::encode_udp_close_frame(flow_id, reason),
+            )
+            .await;
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -1701,7 +2314,7 @@ impl ControlSink for BridgeSink {
         }
         let reply_tx = self.control_writer.clone();
         let cancel = self.flow_shutdown.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {}
@@ -1714,15 +2327,25 @@ impl ControlSink for BridgeSink {
         });
     }
     async fn on_udp_open(&mut self, frame: UdpOpenFrame) {
+        // UDP opens spend the stream-open budget, as a stream open does,
+        // rather than the control-message budget: running out refuses this
+        // flow and leaves the session up.
+        if !self.limits.stream_open_allowed() {
+            debug!(host = ?frame.hostname, "wisp: UDP_OPEN rejected: stream-open rate limit");
+            self.refuse_udp_open(CLOSE_THROTTLED);
+            return;
+        }
         if !self.limits.dns_allowed(&frame.hostname) {
-            debug!(host = %frame.hostname, "wisp: UDP_OPEN rejected: DNS rate limit");
+            debug!(host = ?frame.hostname, "wisp: UDP_OPEN rejected: DNS rate limit");
+            self.refuse_udp_open(CLOSE_THROTTLED);
             return;
         }
         let flow_permit = match self.udp_slots.as_ref() {
             Some(slots) => match slots.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    debug!(host = %frame.hostname, "wisp: UDP_OPEN rejected: concurrent flow cap");
+                    debug!(host = ?frame.hostname, "wisp: UDP_OPEN rejected: concurrent flow cap");
+                    self.refuse_udp_open(CLOSE_THROTTLED);
                     return;
                 }
             },
@@ -1731,28 +2354,30 @@ impl ControlSink for BridgeSink {
         let flow_cap = self.options.stream_limit_total;
         if flow_cap != 0 && self.flows.len() as u64 >= flow_cap {
             debug!(
-                host = %frame.hostname,
+                host = ?frame.hostname,
                 port = frame.port,
                 cap = flow_cap,
                 "wisp: UDP_OPEN rejected: concurrent flow cap"
             );
+            self.refuse_udp_open(CLOSE_THROTTLED);
             return;
         }
         let flow_id = self.flows.alloc_id();
         debug!(
             flow_id = flow_id,
-            host = %frame.hostname,
+            host = ?frame.hostname,
             port = frame.port,
             "wisp: UDP_OPEN"
         );
+        let turn = self.next_udp_reply_turn();
         let connector = self.udp_connector.clone();
         let datagram_tx = self.datagram_tx.clone();
         let flows = self.flows.clone();
         let control_writer = self.control_writer.clone();
         let limits = self.limits.clone();
         let flow_shutdown = self.flow_shutdown.clone();
-        let max_age_ms = self.options.stream_idle_timeout_ms.unwrap_or(60_000);
-        tokio::spawn(async move {
+        let idle = idle_limit(self.options.stream_idle_timeout_ms, 60_000);
+        self.tasks.spawn(async move {
             open_udp_flow(
                 flow_id,
                 frame,
@@ -1761,9 +2386,10 @@ impl ControlSink for BridgeSink {
                 flows,
                 control_writer,
                 limits,
-                max_age_ms,
+                idle,
                 flow_shutdown,
                 flow_permit,
+                turn,
             )
             .await;
         });
@@ -1784,16 +2410,17 @@ impl ControlSink for BridgeSink {
         let datagram_tx = self.datagram_tx.clone();
         let limits = self.limits.clone();
         let session_cancel = self.flow_shutdown.clone();
-        tokio::spawn(async move {
+        let pump_tasks = self.tasks.clone();
+        self.tasks.spawn(async move {
             let opened = tokio::select! {
                 _ = session_cancel.cancelled() => return,
                 result = registry.open(&url) => result,
             };
             match opened {
                 Ok(upstream) => {
-                    info!(
+                    debug!(
                         session_id = upstream.id,
-                        host = %upstream.session.request().url.host_str().unwrap_or("unknown"),
+                        host = ?upstream.session.request().url.host_str().unwrap_or("unknown"),
                         "wisp: upstream WebTransport session opened"
                     );
                     send_wt_uni_reply(
@@ -1801,7 +2428,14 @@ impl ControlSink for BridgeSink {
                         wisp_wire::encode_wt_proxy_opened_frame(upstream.id),
                     )
                     .await;
-                    pump_upstream_session(registry, upstream, downstream, datagram_tx, limits);
+                    pump_upstream_session(
+                        registry,
+                        upstream,
+                        downstream,
+                        datagram_tx,
+                        limits,
+                        pump_tasks,
+                    );
                 }
                 Err(error) => {
                     debug!(error = %error, "wisp: upstream WebTransport open failed");
@@ -1826,7 +2460,10 @@ impl ControlSink for BridgeSink {
 }
 
 /// Pops one QUIC datagram, parses its class- and kind-prefixed header, and
-/// routes it by kind and flow id.
+/// routes it by kind and flow id. A client that keeps exceeding the datagram
+/// rate, or sends datagrams it did not negotiate or cannot frame, has the
+/// whole session ended through `session_cancel`: leaving the session up with
+/// its datagram path stopped would only strand its UDP flows.
 async fn datagram_demux_loop(
     mut reader: h3_datagram::datagram_handler::DatagramReader<
         wisp_quic_msquic::adapter::MsQuicDatagramReceiver,
@@ -1836,6 +2473,7 @@ async fn datagram_demux_loop(
     limits: SessionLimits,
     udp_negotiated: bool,
     max_datagram_bytes: u32,
+    session_cancel: CancellationToken,
 ) {
     loop {
         let buf = match reader.read_datagram().await {
@@ -1856,7 +2494,8 @@ async fn datagram_demux_loop(
             DatagramDecision::Allow => {}
             DatagramDecision::Drop => continue,
             DatagramDecision::Close => {
-                warn!("wisp: datagram rate exceeded; stopping demux");
+                debug!("wisp: datagram rate exceeded; ending session");
+                session_cancel.cancel();
                 return;
             }
         }
@@ -1864,7 +2503,8 @@ async fn datagram_demux_loop(
             Ok(d) => match d.kind {
                 datagram_kind::UDP => {
                     if !udp_negotiated {
-                        warn!("wisp: UDP datagram received without negotiated extension");
+                        debug!("wisp: UDP datagram received without negotiated extension");
+                        session_cancel.cancel();
                         return;
                     }
                     match flows.route(d.flow_id, d.payload) {
@@ -1878,7 +2518,8 @@ async fn datagram_demux_loop(
                 }
                 datagram_kind::WT_PROXY => {
                     let Some(registry) = &wt_proxies else {
-                        warn!("wisp: WT_PROXY datagram received without negotiated extension");
+                        debug!("wisp: WT_PROXY datagram received without negotiated extension");
+                        session_cancel.cancel();
                         return;
                     };
                     let Some(upstream) = registry.get(d.flow_id) else {
@@ -1900,7 +2541,8 @@ async fn datagram_demux_loop(
                 }
             },
             Err(e) => {
-                warn!(error = %e, "wisp: malformed datagram");
+                debug!(error = %e, "wisp: malformed datagram; ending session");
+                session_cancel.cancel();
                 return;
             }
         }
@@ -1908,8 +2550,9 @@ async fn datagram_demux_loop(
 }
 
 /// Bring a UDP flow online: bind upstream, spawn recv pump, register tx side
-/// so the demux task can shovel client datagrams upstream. Sends UDP_OPENED
-/// back on the control bidi when the upstream is ready.
+/// so the demux task can shovel client datagrams upstream. Replies to the
+/// UDP_OPEN, in request order, with UDP_OPENED once the upstream is ready or
+/// UDP_CLOSE if it cannot be reached.
 async fn open_udp_flow(
     flow_id: u32,
     frame: UdpOpenFrame,
@@ -1918,9 +2561,10 @@ async fn open_udp_flow(
     flows: Arc<UdpFlowRegistry>,
     control_writer: mpsc::Sender<Bytes>,
     limits: SessionLimits,
-    max_age_ms: u64,
+    idle: Option<Duration>,
     session_cancel: CancellationToken,
     flow_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    turn: UdpReplyTurn,
 ) {
     let sock = tokio::select! {
         _ = session_cancel.cancelled() => return,
@@ -1928,10 +2572,24 @@ async fn open_udp_flow(
             match result {
                 Ok(sock) => sock,
                 Err(e) => {
-                    debug!(error = %e, host = %frame.hostname, port = frame.port, "wisp: UDP bind failed");
-                    let _ = control_writer
-                        .send(wisp_wire::encode_udp_close_frame(flow_id, 0x03))
-                        .await;
+                    debug!(error = %e, host = ?frame.hostname, port = frame.port, "wisp: UDP bind failed");
+                    let reason = if matches!(
+                        e,
+                        wisp_proxy::ProxyError::HostBlocked(_)
+                            | wisp_proxy::ProxyError::PortBlocked(_)
+                            | wisp_proxy::ProxyError::DomainNotWhitelisted(_)
+                            | wisp_proxy::ProxyError::LoopbackBlocked(_)
+                            | wisp_proxy::ProxyError::PrivateBlocked(_)
+                    ) {
+                        CLOSE_HOST_BLOCKED
+                    } else {
+                        CLOSE_NETWORK_ERROR
+                    };
+                    turn.reply(
+                        &control_writer,
+                        wisp_wire::encode_udp_close_frame(flow_id, reason),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1947,14 +2605,16 @@ async fn open_udp_flow(
         },
     );
 
-    let _ = control_writer
-        .send(wisp_wire::encode_udp_opened_frame(flow_id))
+    turn.reply(&control_writer, wisp_wire::encode_udp_opened_frame(flow_id))
         .await;
 
     let sock = Arc::new(sock);
+    // Traffic either way keeps the flow open.
+    let activity = Activity::new();
 
     let sock_send = sock.clone();
     let cancel_send = cancel.clone();
+    let send_activity = activity.clone();
     let mut pumps = JoinSet::new();
     pumps.spawn(async move {
         loop {
@@ -1962,6 +2622,7 @@ async fn open_udp_flow(
                 _ = cancel_send.cancelled() => return,
                 maybe = upstream_rx.recv() => {
                     let Some(payload) = maybe else { return };
+                    send_activity.touch();
                     if let Err(e) = sock_send.send(&payload).await {
                         debug!(error = %e, "wisp: UDP upstream send failed");
                         return;
@@ -1975,16 +2636,12 @@ async fn open_udp_flow(
     let cancel_recv = cancel.clone();
     let datagram_tx_recv = datagram_tx.clone();
     let recv_limits = limits;
-    let max_age = std::time::Duration::from_millis(max_age_ms);
+    let recv_activity = activity.clone();
     pumps.spawn(async move {
         let mut buf = vec![0u8; 65_536];
         loop {
             tokio::select! {
                 _ = cancel_recv.cancelled() => return,
-                _ = tokio::time::sleep(max_age) => {
-                    debug!(flow_id, "wisp: UDP flow idle, closing");
-                    return;
-                }
                 res = sock_recv.recv(&mut buf) => {
                     let n = match res {
                         Ok(n) => n,
@@ -1993,6 +2650,7 @@ async fn open_udp_flow(
                             return;
                         }
                     };
+                    recv_activity.touch();
                     match recv_limits.datagram_decision(n as u64) {
                         DatagramDecision::Allow => {}
                         DatagramDecision::Drop => {
@@ -2022,11 +2680,17 @@ async fn open_udp_flow(
         }
     });
 
+    pumps.spawn(async move {
+        idle_expired(&activity, idle).await;
+        debug!(flow_id, "wisp: UDP flow idle, closing");
+    });
+
     tokio::select! {
         _ = cancel.cancelled() => {}
         _ = pumps.join_next() => {}
     }
     cancel.cancel();
+    pumps.abort_all();
     while pumps.join_next().await.is_some() {}
     if !session_cancel.is_cancelled() {
         let _ = control_writer
@@ -2041,10 +2705,6 @@ async fn open_udp_flow(
 enum HandlerError {
     #[error("h3 build: {0}")]
     H3Build(String),
-    #[error("h3 accept: {0}")]
-    H3Accept(String),
-    #[error("h3 resolve: {0}")]
-    H3Resolve(String),
     #[error("wt accept: {0}")]
     WtAccept(String),
     #[error("control accept: {0}")]
@@ -2053,8 +2713,6 @@ enum HandlerError {
     Handshake(#[from] HandshakeError),
     #[error("control: {0}")]
     Control(String),
-    #[error("ws-over-h3: {0}")]
-    WsH3(String),
 }
 
 /// Wraps the first bidi stream of a WT session as the wisp-wt control bidi.
@@ -2223,6 +2881,100 @@ mod tests {
         assert!(caps.try_acquire("other.example".to_owned()).is_none());
         drop(guard);
         assert!(caps.try_acquire("other.example".to_owned()).is_some());
+    }
+
+    #[test]
+    fn idle_limit_treats_zero_as_disabled() {
+        assert_eq!(idle_limit(None, 600_000), Some(Duration::from_secs(600)));
+        assert_eq!(
+            idle_limit(Some(2_000), 600_000),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(idle_limit(Some(0), 600_000), None);
+    }
+
+    #[tokio::test]
+    async fn idle_timer_counts_activity_from_either_direction() {
+        let activity = Activity::new();
+        let idle = Some(Duration::from_millis(400));
+        let expired = idle_expired(&activity, idle);
+        tokio::pin!(expired);
+        // Traffic every 100 ms, from whichever pump, keeps a 400 ms timer from
+        // firing for well past 400 ms.
+        for _ in 0..8 {
+            tokio::select! {
+                _ = &mut expired => panic!("an active stream must not idle out"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => activity.touch(),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), &mut expired)
+            .await
+            .expect("a quiet stream idles out");
+    }
+
+    #[tokio::test]
+    async fn zero_idle_timeout_never_fires() {
+        let activity = Activity::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), idle_expired(&activity, None))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_open_replies_keep_request_order() {
+        let (writer, mut replies) = mpsc::channel::<Bytes>(8);
+        let mut tail: Option<oneshot::Receiver<()>> = None;
+        let mut turn = || {
+            let (done, next) = oneshot::channel();
+            UdpReplyTurn {
+                after: tail.replace(next),
+                done,
+            }
+        };
+        let (first, second, third) = (turn(), turn(), turn());
+        // The later opens finish first; their replies still wait their turn.
+        let late = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                third.reply(&writer, Bytes::from_static(b"3")).await;
+            }
+        });
+        let middle = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                second.reply(&writer, Bytes::from_static(b"2")).await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            replies.try_recv().is_err(),
+            "nothing before the first reply"
+        );
+        first.reply(&writer, Bytes::from_static(b"1")).await;
+        late.await.unwrap();
+        middle.await.unwrap();
+        let order: Vec<Bytes> = std::iter::from_fn(|| replies.try_recv().ok()).collect();
+        assert_eq!(order, [&b"1"[..], b"2", b"3"]);
+    }
+
+    #[tokio::test]
+    async fn dropped_udp_reply_turn_frees_the_next() {
+        let (writer, mut replies) = mpsc::channel::<Bytes>(8);
+        let (done, next) = oneshot::channel();
+        drop(done);
+        let (later_done, _) = oneshot::channel();
+        UdpReplyTurn {
+            after: Some(next),
+            done: later_done,
+        }
+        .reply(&writer, Bytes::from_static(b"after a cancelled open"))
+        .await;
+        assert_eq!(
+            replies.try_recv().unwrap(),
+            Bytes::from_static(b"after a cancelled open")
+        );
     }
 
     #[test]

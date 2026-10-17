@@ -10,9 +10,17 @@
 //! outbound path carries a real h3 session too. Each test checks that an
 //! unbanned client is served end to end (Wisp data through to a local TCP echo
 //! server), that a banned client is refused with a `WISP_IP_HASH_BANNED`
-//! report, and that clearing the ban admits the next session again.
+//! report, and that clearing the ban admits the next session again. A banned
+//! address is refused at the QUIC level, before its handshake, so the refusal
+//! shows up as a failed connection.
+//!
+//! The same harness also covers the QUIC hardening that only a live
+//! connection exercises: an oversized request header block, several
+//! WS-over-H3 sessions on one connection, a TCP bridge finishing its stream at
+//! upstream EOF, and destination policy on WebTransport TCP streams.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +34,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wisp_config::{WispAuthRegistry, WispWtServerOptions};
 use wisp_dos::{ConnectionLimiter, DosGuard};
-use wisp_iphash::{hash_client_ip, IpHashBans};
+use wisp_iphash::{hash_client_ip_keyed, IpHashBans};
 use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_reports::{set_report_hook, Report, ReportErrorType};
 use wisp_server::{serve, H3WsContext, ServeExtras, ServeHandle};
@@ -83,6 +91,11 @@ async fn spawn_echo() -> u16 {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    /// Start with the defaults below, then let `configure` adjust them.
+    async fn start_with(configure: impl FnOnce(&mut WispWtServerOptions)) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -117,6 +130,7 @@ impl Harness {
         options.base.protocol_inspection = false;
         options.websocket.enabled = true;
         options.websocket.endpoint = Some(WS_PATH.to_owned());
+        configure(&mut options);
         let options = Arc::new(options);
 
         // One ban set shared by both transports, the way the runtime wires it.
@@ -167,7 +181,7 @@ impl Harness {
     }
 
     fn loopback_hash() -> String {
-        hash_client_ip(Some("127.0.0.1"), None).expect("loopback hashes")
+        hash_client_ip_keyed(Some("127.0.0.1")).expect("loopback hashes")
     }
 
     fn ban(&self) {
@@ -179,8 +193,9 @@ impl Harness {
     }
 
     /// A fresh QUIC connection from its own client socket, so every session is
-    /// a new connection the server has to admit or refuse.
-    async fn connect(&self) -> (quinn::Endpoint, quinn::Connection) {
+    /// a new connection the server has to admit or refuse. `None` when the
+    /// server refused the connection.
+    async fn connect(&self) -> Option<(quinn::Endpoint, quinn::Connection)> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         roots.add(self.cert.clone()).expect("trust the test cert");
@@ -202,8 +217,15 @@ impl Harness {
         )
         .await
         .expect("QUIC handshake finishes")
-        .expect("QUIC handshake succeeds");
-        (endpoint, connection)
+        .ok()?;
+        Some((endpoint, connection))
+    }
+
+    /// Like [`Harness::connect`], for a client that must be admitted.
+    async fn connect_admitted(&self) -> (quinn::Endpoint, quinn::Connection) {
+        self.connect()
+            .await
+            .expect("the server admits the QUIC connection")
     }
 
     async fn expect_ban_report(&mut self) {
@@ -341,7 +363,9 @@ enum Outcome {
 /// Open a WS-over-H3 session, and when it is admitted push `hello` through a
 /// Wisp TCP stream to the echo server and read it back.
 async fn ws_session(harness: &Harness) -> Outcome {
-    let (endpoint, connection) = harness.connect().await;
+    let Some((endpoint, connection)) = harness.connect().await else {
+        return Outcome::Refused;
+    };
     let (mut send_request, driver) = h3_client(connection.clone()).await;
     let mut stream = timeout(
         STEP,
@@ -476,7 +500,7 @@ impl MsQuicClient {
 /// Open a WS-over-H3 session from an msquic client through
 /// [`MsQuicConnection::connect`], the adapter's outbound path.
 async fn msquic_ws_session(harness: &Harness, client: &MsQuicClient) -> Outcome {
-    let connection = timeout(
+    let connected = timeout(
         STEP,
         MsQuicConnection::connect(
             &client.registration,
@@ -486,8 +510,11 @@ async fn msquic_ws_session(harness: &Harness, client: &MsQuicClient) -> Outcome 
         ),
     )
     .await
-    .expect("msquic handshake finishes")
-    .expect("msquic handshake succeeds");
+    .expect("msquic handshake finishes");
+    // A refused connection never completes its handshake.
+    let Ok(connection) = connected else {
+        return Outcome::Refused;
+    };
     let (mut driver, mut send_request) = h3::client::builder()
         .enable_extended_connect(true)
         .build::<_, _, Bytes>(connection)
@@ -540,7 +567,9 @@ async fn read_control_frame(recv: &mut web_transport_quinn::RecvStream) -> u8 {
 /// control handshake and push `hello over wt` through a TCP stream to the echo
 /// server.
 async fn wt_session(harness: &Harness) -> Outcome {
-    let (endpoint, connection) = harness.connect().await;
+    let Some((endpoint, connection)) = harness.connect().await else {
+        return Outcome::Refused;
+    };
     let url = format!("https://localhost:{}{WT_PATH}", harness.addr.port())
         .parse::<url::Url>()
         .expect("session url");
@@ -661,4 +690,276 @@ async fn ws_over_h3_from_msquic_serves_refuses_banned_client_and_serves_again_af
     harness.assert_no_ban_report();
 
     client.close().await;
+}
+
+// QUIC hardening ------------------------------------------------------------
+
+/// QUIC variable-length integer (RFC 9000 section 16).
+fn varint(value: u64) -> Vec<u8> {
+    match value {
+        0..=0x3f => vec![value as u8],
+        0x40..=0x3fff => (value as u16 | 0x4000).to_be_bytes().to_vec(),
+        0x4000..=0x3fff_ffff => (value as u32 | 0x8000_0000).to_be_bytes().to_vec(),
+        _ => (value | 0xc000_0000_0000_0000).to_be_bytes().to_vec(),
+    }
+}
+
+/// An admitted WebTransport session that has finished the wisp-wt control
+/// handshake. The control stream halves are kept so the session stays open.
+struct WtClient {
+    endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+    session: web_transport_quinn::Session,
+    _control: (
+        web_transport_quinn::SendStream,
+        web_transport_quinn::RecvStream,
+    ),
+}
+
+impl WtClient {
+    async fn connect(harness: &Harness) -> Self {
+        let (endpoint, connection) = harness.connect_admitted().await;
+        let url = format!("https://localhost:{}{WT_PATH}", harness.addr.port())
+            .parse::<url::Url>()
+            .expect("session url");
+        let session = timeout(
+            STEP,
+            web_transport_quinn::Session::connect(connection.clone(), url),
+        )
+        .await
+        .expect("the WT CONNECT is answered")
+        .expect("the WT session is admitted");
+        let (mut control_send, mut control_recv) = timeout(STEP, session.open_bi())
+            .await
+            .expect("open control")
+            .expect("control bidi");
+        control_send
+            .write_all(&encode_info_frame(&[]))
+            .await
+            .expect("send client INFO");
+        assert_eq!(
+            read_control_frame(&mut control_recv).await,
+            frame_type::INFO
+        );
+        assert_eq!(
+            read_control_frame(&mut control_recv).await,
+            frame_type::READY
+        );
+        Self {
+            endpoint,
+            connection,
+            session,
+            _control: (control_send, control_recv),
+        }
+    }
+
+    /// Open a TCP stream to `port` on loopback, send `payload`, and read what
+    /// comes back until the server ends the stream. `Err` when it was reset.
+    async fn tcp_round_trip(
+        &self,
+        port: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, web_transport_quinn::ReadToEndError> {
+        let (mut send, mut recv) = timeout(STEP, self.session.open_bi())
+            .await
+            .expect("open tcp")
+            .expect("tcp bidi");
+        let mut first = encode_tcp_stream_header("127.0.0.1", port, 0).to_vec();
+        first.extend_from_slice(payload);
+        send.write_all(&first)
+            .await
+            .expect("send TCP header and data");
+        // The client's send side stays open: the stream must end because the
+        // server ended it.
+        let read = timeout(STEP, recv.read_to_end(64 * 1024))
+            .await
+            .expect("the server ends the stream");
+        drop(send);
+        read
+    }
+
+    fn close(self) {
+        self.session.close(0, b"done");
+        finish(self.endpoint, self.connection, Outcome::Served);
+    }
+}
+
+/// A TCP server that reads one chunk, answers `reply`, and closes.
+async fn spawn_one_shot(reply: &'static [u8]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind one-shot");
+    let port = listener.local_addr().expect("one-shot address").port();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(reply).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_request_header_block_is_refused_without_a_panic() {
+    let _turn = SERIAL.lock().await;
+    let harness = Harness::start().await;
+
+    // A panic in a server task would only end that task here, where tests
+    // unwind, but it aborts the production process. Count them.
+    let panics = Arc::new(AtomicUsize::new(0));
+    let previous_hook = std::panic::take_hook();
+    let counted = panics.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        eprintln!("panic: {info}");
+    }));
+
+    let (endpoint, connection) = harness.connect_admitted().await;
+    let (mut send, mut recv) = timeout(STEP, connection.open_bi())
+        .await
+        .expect("open request stream")
+        .expect("request stream");
+    // QPACK prefix (no dynamic table) and then 30 000 copies of the static
+    // `:method: GET` field line. Building an `http::HeaderMap` for more than
+    // about 24 577 fields panics; the field-section limit refuses the block
+    // long before that.
+    let mut block = vec![0x00, 0x00];
+    block.resize(2 + 30_000, 0xd1);
+    let mut frame = vec![0x01];
+    frame.extend_from_slice(&varint(block.len() as u64));
+    frame.extend_from_slice(&block);
+    send.write_all(&frame).await.expect("send HEADERS");
+    let _ = send.finish();
+    // The server answers 431 or resets the stream; either way it ends.
+    let _ = timeout(STEP, recv.read_to_end(64 * 1024)).await;
+
+    std::panic::set_hook(previous_hook);
+    assert_eq!(
+        panics.load(Ordering::SeqCst),
+        0,
+        "an oversized header block must not panic the server"
+    );
+    finish(endpoint, connection, Outcome::Served);
+    assert!(matches!(ws_session(&harness).await, Outcome::Served));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_over_h3_serves_concurrent_sessions_on_one_connection() {
+    let _turn = SERIAL.lock().await;
+    let harness = Harness::start().await;
+    let (endpoint, connection) = harness.connect_admitted().await;
+    let (mut send_request, driver) = h3_client(connection.clone()).await;
+
+    // Both CONNECTs are open before either session is used.
+    let mut first = timeout(
+        STEP,
+        send_request.send_request(extended_connect(WS_PATH, Protocol::WEBSOCKET)),
+    )
+    .await
+    .expect("first request goes out")
+    .expect("first request stream opens");
+    let mut second = timeout(
+        STEP,
+        send_request.send_request(extended_connect(WS_PATH, Protocol::WEBSOCKET)),
+    )
+    .await
+    .expect("second request goes out")
+    .expect("second request stream opens");
+    assert!(matches!(
+        ws_exchange(&harness, &mut second).await,
+        Outcome::Served
+    ));
+    assert!(matches!(
+        ws_exchange(&harness, &mut first).await,
+        Outcome::Served
+    ));
+    finish_h3(endpoint, connection, driver, Outcome::Served);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webtransport_tcp_stream_finishes_when_the_upstream_closes() {
+    let _turn = SERIAL.lock().await;
+    let harness = Harness::start().await;
+    let port = spawn_one_shot(b"bye").await;
+    let client = WtClient::connect(&harness).await;
+
+    let reply = client
+        .tcp_round_trip(port, b"hi")
+        .await
+        .expect("a clean finish, not a reset");
+    assert_eq!(reply, b"bye");
+    client.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webtransport_tcp_streams_follow_destination_policy() {
+    let _turn = SERIAL.lock().await;
+
+    // A port outside the whitelist is refused before anything is dialed.
+    let harness = Harness::start_with(|options| {
+        options.base.port_whitelist = Some(vec![1]);
+    })
+    .await;
+    let client = WtClient::connect(&harness).await;
+    assert!(client
+        .tcp_round_trip(harness.echo_port, b"blocked")
+        .await
+        .is_err());
+    client.close();
+    drop(harness);
+
+    // So is every TCP stream when TCP streams are turned off.
+    let harness = Harness::start_with(|options| {
+        options.base.allow_tcp_streams = false;
+    })
+    .await;
+    let client = WtClient::connect(&harness).await;
+    assert!(client
+        .tcp_round_trip(harness.echo_port, b"blocked")
+        .await
+        .is_err());
+    client.close();
+    drop(harness);
+
+    // The default policy of this harness still bridges the same stream.
+    let harness = Harness::start().await;
+    let client = WtClient::connect(&harness).await;
+    let port = spawn_one_shot(b"ok").await;
+    assert_eq!(client.tcp_round_trip(port, b"hi").await.unwrap(), b"ok");
+    client.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_handle_closes_from_a_blocking_thread() {
+    let _turn = SERIAL.lock().await;
+    let mut harness = Harness::start().await;
+    assert!(matches!(ws_session(&harness).await, Outcome::Served));
+    let handle = harness.handle.take().expect("serve handle");
+    timeout(
+        STEP,
+        tokio::task::spawn_blocking(move || handle.close_blocking()),
+    )
+    .await
+    .expect("msquic releases every handle")
+    .expect("close task");
+    drop(harness);
+
+    // A new listener in the same process serves again. It takes a new port:
+    // msquic in this build does not receive on a port reopened in-process,
+    // with or without these changes.
+    let harness = Harness::start().await;
+    assert!(matches!(ws_session(&harness).await, Outcome::Served));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn serve_handle_drop_on_a_current_thread_runtime_does_not_hang() {
+    let _turn = SERIAL.lock().await;
+    let harness = Harness::start().await;
+    // A live connection is what teardown has to wait for, and the tasks that
+    // release it run on this thread.
+    let (endpoint, connection) = harness.connect_admitted().await;
+    drop(harness);
+    finish(endpoint, connection, Outcome::Served);
 }
