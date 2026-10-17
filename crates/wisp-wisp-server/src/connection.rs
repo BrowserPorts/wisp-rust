@@ -27,8 +27,8 @@
 //! routed to the proxy-control handler when
 //! [`extension_id::WISP_PROXY_CONTROL`] is negotiated (v2 only).
 //!
-//! The TCP stream-open path runs [`wisp_inspect::inspect`] before
-//! upstream bytes flow.
+//! The TCP stream-open path classifies the client's first bytes with a
+//! [`wisp_inspect::Inspector`] before any upstream bytes flow back.
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -39,16 +39,17 @@ use governor::{
 };
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use wisp_config::{WispServerOptions, WispVersion};
 use wisp_dos::{
-    is_dns_resolution_allowed, is_tcp_stream_open_allowed, ConnectionDosGuard, DosGuard,
-    TcpByteLimiter,
+    is_control_message_allowed, is_dns_resolution_allowed, is_tcp_stream_open_allowed,
+    ConnectionDosGuard, DosGuard, TcpByteLimiter,
 };
-use wisp_proxy::HostPolicy;
+use wisp_proxy::{HostPolicy, NormalizedHost};
 use wisp_wisp::{
     close_reason, encode_close, encode_continue, encode_fin, encode_info, extension_id,
     packet_type, parse_extensions_capped, parse_packet, stream_type, ExtensionEntry, WispError,
@@ -59,6 +60,13 @@ type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 const WISP_MAJOR_VERSION: u8 = 2;
 
+/// How long teardown waits for the egress writer to flush queued frames.
+const EGRESS_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `idle_timeout_ms` when it is unset. A connection always has an idle limit.
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 120_000;
+
+use crate::budget::{BudgetCharge, Budgets};
 use crate::proxy_control::{
     handle_proxy_control_text, proxy_control_error_frame, ProxyControlLimits, ProxyController,
 };
@@ -66,7 +74,40 @@ use crate::stream::{
     activate_writer, drop_slot, shutdown_upstream_write, spawn_tcp_connect, write_upstream,
     StreamTable, TcpEvent, TcpStreamSlot, TcpStreamState, WriteOutcome,
 };
-use crate::udp::{spawn_udp_stream, UdpStreamMsg};
+
+/// The connection's idle limit, `idle_timeout_ms`. Also bounds how long one
+/// write to the client may take.
+fn idle_limit(options: &WispServerOptions) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        options
+            .idle_timeout_ms
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS)
+            .max(1),
+    )
+}
+use crate::udp::{spawn_udp_stream, UdpHandle, UdpStreamMsg};
+
+/// UDP flows by wire stream ID.
+type UdpStreams = HashMap<u32, UdpHandle>;
+
+/// Per-connection limiter for repetitive rejection log lines. The first few
+/// are logged as they happen, then only each power of two, each carrying the
+/// running total, so a client that opens streams in a loop cannot flood the
+/// log.
+#[derive(Debug, Default)]
+pub(crate) struct LogThrottle {
+    count: AtomicU64,
+}
+
+impl LogThrottle {
+    const LOG_FIRST: u64 = 8;
+
+    /// Counts one rejection. `Some(total)` when it should be logged.
+    pub(crate) fn admit(&self) -> Option<u64> {
+        let total = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        (total <= Self::LOG_FIRST || total.is_power_of_two()).then_some(total)
+    }
+}
 
 /// Tagged WS-frame envelope. The transport layer (H2 or H3 + tokio-websockets)
 /// preserves the binary/text distinction so the server can route text frames
@@ -79,7 +120,27 @@ pub enum WispMessage {
 
 struct BudgetedMessage {
     message: WispMessage,
-    permit: OwnedSemaphorePermit,
+    permit: EgressPermit,
+}
+
+/// A queued frame's share of the connection's egress queue and, for DATA,
+/// of the process byte budget. Released once the frame is flushed.
+struct EgressPermit {
+    _queue: OwnedSemaphorePermit,
+    _process: Option<BudgetCharge>,
+}
+
+/// Runs when the egress writer ends, however it ends.
+struct WriterExit {
+    budget: Arc<Semaphore>,
+    done: CancellationToken,
+}
+
+impl Drop for WriterExit {
+    fn drop(&mut self) {
+        self.budget.close();
+        self.done.cancel();
+    }
 }
 
 #[derive(Clone)]
@@ -87,6 +148,8 @@ pub(crate) struct EgressSender {
     tx: mpsc::Sender<BudgetedMessage>,
     flow_tx: mpsc::Sender<BudgetedMessage>,
     budget: Arc<Semaphore>,
+    max_bytes: u32,
+    process: Budgets,
 }
 
 impl EgressSender {
@@ -95,11 +158,36 @@ impl EgressSender {
         flow_tx: mpsc::Sender<BudgetedMessage>,
         max_bytes: usize,
     ) -> Self {
+        let max_bytes = max_bytes.clamp(1, Semaphore::MAX_PERMITS.min(u32::MAX as usize));
         Self {
             tx,
             flow_tx,
             budget: Arc::new(Semaphore::new(max_bytes)),
+            max_bytes: max_bytes as u32,
+            process: Budgets::process_only(),
         }
+    }
+
+    /// Upstream DATA counts against the process budget too; flow control and
+    /// close frames are small and must never wait behind other connections.
+    fn process_cost(message: &WispMessage) -> Option<usize> {
+        match message {
+            WispMessage::Binary(bytes) if bytes.first() == Some(&packet_type::DATA) => {
+                Some(bytes.len())
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves once the queue is not full and the process budget has room,
+    /// so a reader waits here before it reads more from its upstream. Fails
+    /// once the writer is gone.
+    pub(crate) async fn room(&self) -> Result<(), ()> {
+        if self.budget.available_permits() == 0 {
+            drop(self.budget.acquire().await.map_err(|_| ())?);
+        }
+        self.process.room().await;
+        Ok(())
     }
 
     fn channel(&self, message: &WispMessage) -> &mpsc::Sender<BudgetedMessage> {
@@ -120,13 +208,26 @@ impl EgressSender {
     }
 
     pub(crate) async fn send(&self, message: WispMessage) -> Result<(), ()> {
-        let permits = Self::message_cost(&message).ok_or(())?;
-        let permit = self
+        // A frame larger than the whole queue waits for the queue to empty
+        // instead of waiting forever.
+        let permits = Self::message_cost(&message).ok_or(())?.min(self.max_bytes);
+        let queue = self
             .budget
             .clone()
             .acquire_many_owned(permits)
             .await
             .map_err(|_| ())?;
+        let process = match Self::process_cost(&message) {
+            Some(bytes) => {
+                self.process.room().await;
+                Some(self.process.charge(bytes))
+            }
+            None => None,
+        };
+        let permit = EgressPermit {
+            _queue: queue,
+            _process: process,
+        };
         self.channel(&message)
             .send(BudgetedMessage { message, permit })
             .await
@@ -135,12 +236,16 @@ impl EgressSender {
 
     #[cfg(test)]
     fn try_send(&self, message: WispMessage) -> Result<(), ()> {
-        let permits = Self::message_cost(&message).ok_or(())?;
-        let permit = self
+        let permits = Self::message_cost(&message).ok_or(())?.min(self.max_bytes);
+        let queue = self
             .budget
             .clone()
             .try_acquire_many_owned(permits)
             .map_err(|_| ())?;
+        let permit = EgressPermit {
+            _queue: queue,
+            _process: Self::process_cost(&message).map(|bytes| self.process.charge(bytes)),
+        };
         self.channel(&message)
             .try_send(BudgetedMessage { message, permit })
             .map_err(|_| ())
@@ -329,6 +434,11 @@ pub struct ServerContext {
     /// never tells them about. `serve_connection` sets this to a fresh
     /// token before spawning anything and cancels it on exit.
     pub cancel: CancellationToken,
+    /// Throttles the per-rejection log lines of this connection.
+    pub(crate) reject_log: Arc<LogThrottle>,
+    /// Upload bytes held for this connection's streams, against its own
+    /// `max_ingress_bytes_per_connection` and the process budget.
+    pub(crate) ingress: Budgets,
 }
 
 impl ServerContext {
@@ -347,10 +457,14 @@ impl ServerContext {
         dos_store: Arc<DosGuard>,
     ) -> Self {
         let policy = Arc::new(HostPolicy::from_options(&options));
+        let ingress = Budgets::for_connection(options.max_ingress_bytes_per_connection);
         let conn_dos = Arc::new(ConnectionDosGuard::new());
         let tcp_byte_limiter = Arc::new(TcpByteLimiter::new(
             &client_ip, &conn_dos, &options, &dos_store,
         ));
+        if let Some(controller) = proxy_controller.as_ref() {
+            controller.bind_client(&client_ip, None);
+        }
         Self {
             client_ip,
             client_hash,
@@ -363,6 +477,8 @@ impl ServerContext {
             conn_dos,
             tcp_byte_limiter,
             cancel: CancellationToken::new(),
+            reject_log: Arc::new(LogThrottle::default()),
+            ingress,
         }
     }
 
@@ -400,39 +516,86 @@ where
         usize::try_from(ctx.options.max_egress_queue_bytes).unwrap_or(u32::MAX as usize),
     );
 
-    let (control_egress_tx, mut control_egress_rx) = mpsc::channel::<String>(8);
-    let control_concurrency = Arc::new(Semaphore::new(
-        ctx.server_options
-            .max_concurrent_proxy_control_handlers
-            .max(1),
-    ));
+    let control_handlers = ctx
+        .server_options
+        .max_concurrent_proxy_control_handlers
+        .max(1);
+    // Room for the reply of every handler that can be in flight plus a few
+    // busy NACKs, so a reply never waits on another and a NACK is not dropped.
+    let (control_egress_tx, mut control_egress_rx) =
+        mpsc::channel::<String>(control_handlers.saturating_add(8).min(4096));
+    let control_concurrency = Arc::new(Semaphore::new(control_handlers));
 
-    let egress_writer_cancel = ctx.cancel.clone();
-    let egress_writer = tokio::spawn(async move {
+    // Tells the writer to flush what is already queued and close. `ctx.cancel`
+    // is not used for this: it fires first on teardown and would discard the
+    // connection-level CLOSE the main loop just queued.
+    let writer_stop = CancellationToken::new();
+    let egress_writer_stop = writer_stop.clone();
+    // Cancelled when the writer ends for any reason, so the main loop stops
+    // serving a client it can no longer write to. Closing the queue budget
+    // wakes every task waiting to queue a frame.
+    let writer_done = CancellationToken::new();
+    let egress_writer_done = writer_done.clone();
+    let egress_budget = egress_tx.budget.clone();
+    // A client that stops reading stalls each write; past the idle limit it
+    // is dropped instead of pinning its queue and slot forever.
+    let write_timeout = idle_limit(&ctx.options);
+    let mut egress_writer = tokio::spawn(async move {
+        let _exit = WriterExit {
+            budget: egress_budget,
+            done: egress_writer_done,
+        };
         let mut main_closed = false;
         let mut flow_closed = false;
         let mut ctl_closed = false;
-        let mut batch: Vec<(WispMessage, Option<OwnedSemaphorePermit>)> = Vec::with_capacity(64);
-        let mut flushed_permits: Vec<OwnedSemaphorePermit> = Vec::with_capacity(64);
+        let mut stopping = false;
+        let mut batch: Vec<(WispMessage, Option<EgressPermit>)> = Vec::with_capacity(64);
+        let mut flushed_permits: Vec<EgressPermit> = Vec::with_capacity(64);
         while !(main_closed && flow_closed && ctl_closed) {
-            let first = tokio::select! {
-                biased;
-                _ = egress_writer_cancel.cancelled() => break,
-                msg = flow_egress_rx.recv(), if !flow_closed => match msg {
-                    Some(m) => Some((m.message, Some(m.permit))),
-                    None => { flow_closed = true; continue; }
-                },
-                msg = egress_rx.recv(), if !main_closed => match msg {
-                    Some(m) => Some((m.message, Some(m.permit))),
-                    None => { main_closed = true; continue; }
-                },
-                text = control_egress_rx.recv(), if !ctl_closed => match text {
-                    Some(t) => Some((WispMessage::Text(t), None)),
-                    None => { ctl_closed = true; continue; }
-                },
+            // Control replies go first: they are tiny, and bulk data must not
+            // starve them.
+            let first = if stopping {
+                if let Ok(t) = control_egress_rx.try_recv() {
+                    Some((WispMessage::Text(t), None))
+                } else if let Ok(m) = flow_egress_rx.try_recv() {
+                    Some((m.message, Some(m.permit)))
+                } else if let Ok(m) = egress_rx.try_recv() {
+                    Some((m.message, Some(m.permit)))
+                } else {
+                    break;
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = egress_writer_stop.cancelled() => { stopping = true; continue; }
+                    text = control_egress_rx.recv(), if !ctl_closed => match text {
+                        Some(t) => Some((WispMessage::Text(t), None)),
+                        None => { ctl_closed = true; continue; }
+                    },
+                    msg = flow_egress_rx.recv(), if !flow_closed => match msg {
+                        Some(m) => Some((m.message, Some(m.permit))),
+                        None => { flow_closed = true; continue; }
+                    },
+                    msg = egress_rx.recv(), if !main_closed => match msg {
+                        Some(m) => Some((m.message, Some(m.permit))),
+                        None => { main_closed = true; continue; }
+                    },
+                }
             };
             let Some(m) = first else { continue };
             batch.push(m);
+            if !ctl_closed {
+                while batch.len() < 64 {
+                    match control_egress_rx.try_recv() {
+                        Ok(t) => batch.push((WispMessage::Text(t), None)),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            ctl_closed = true;
+                            break;
+                        }
+                    }
+                }
+            }
             while batch.len() < 64 {
                 match flow_egress_rx.try_recv() {
                     Ok(m) => batch.push((m.message, Some(m.permit))),
@@ -453,33 +616,27 @@ where
                     }
                 }
             }
-            if batch.len() < 64 && !ctl_closed {
-                while batch.len() < 64 {
-                    match control_egress_rx.try_recv() {
-                        Ok(t) => batch.push((WispMessage::Text(t), None)),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            ctl_closed = true;
-                            break;
-                        }
-                    }
-                }
-            }
             for (m, permit) in batch.drain(..) {
-                if let Err(e) = outgoing.feed(m).await {
-                    return Err(ServerError::transport(e));
+                match tokio::time::timeout(write_timeout, outgoing.feed(m)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(ServerError::transport(e)),
+                    Err(_) => return Err(ServerError::transport("client write timed out")),
                 }
                 if let Some(permit) = permit {
                     flushed_permits.push(permit);
                 }
             }
-            if let Err(e) = outgoing.flush().await {
-                return Err(ServerError::transport(e));
+            match tokio::time::timeout(write_timeout, outgoing.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(ServerError::transport(e)),
+                Err(_) => return Err(ServerError::transport("client write timed out")),
             }
             flushed_permits.clear();
         }
-        if let Err(e) = outgoing.close().await {
-            return Err(ServerError::transport(e));
+        match tokio::time::timeout(write_timeout, outgoing.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(ServerError::transport(e)),
+            Err(_) => return Err(ServerError::transport("client write timed out")),
         }
         Ok::<(), ServerError>(())
     });
@@ -572,28 +729,71 @@ where
     };
 
     let mut streams = StreamTable::new();
-    let mut udp_streams: HashMap<u32, mpsc::Sender<UdpStreamMsg>> = HashMap::new();
+    let mut udp_streams: UdpStreams = HashMap::new();
     let mut caps = StreamCaps::new(&ctx.server_options);
-    let (stream_done_tx, mut stream_done_rx) = mpsc::channel::<u32>(256);
+    let (stream_done_tx, mut stream_done_rx) = mpsc::channel::<(u32, u64)>(256);
     let (tcp_events_tx, mut tcp_events_rx) = mpsc::channel::<TcpEvent>(256);
-    let control_msg_limiter: Option<DirectLimiter> = build_per_minute_limiter(
-        ctx.server_options
-            .max_control_messages_per_connection_per_minute,
-    );
+    // Proxy control limits and rate budgets are shared across this client's
+    // connections through the process-wide limiter, keyed by client IP.
+    if let Some(controller) = ctx.proxy_controller.as_ref() {
+        controller.bind_ip_budget(ctx.client_ip.clone(), ctx.dos_store.clone());
+    }
     let binary_packet_limiter: Option<DirectLimiter> = build_per_minute_limiter(
         ctx.server_options
             .max_binary_packets_per_connection_per_minute,
     );
     let mut serve_err: Option<ServerError> = None;
 
+    // A connection with no open stream that sends nothing for the idle limit
+    // is closed. A v1 client has no handshake of its own, so its first frame
+    // is due within the handshake timeout instead.
+    let idle = idle_limit(&ctx.options);
+    let mut heard_from_client = resolved_version == ResolvedVersion::V2;
+    let mut last_inbound = tokio::time::Instant::now();
+    let first_deadline = if heard_from_client {
+        idle
+    } else {
+        std::time::Duration::from_millis(ctx.server_options.handshake_timeout_ms.max(1))
+    };
+    let idle_timer = tokio::time::sleep(first_deadline);
+    tokio::pin!(idle_timer);
+    // Uploads held for this connection's streams stop the client from being
+    // read until the upstreams take some of them. One message is still read
+    // and parked meanwhile, so a client that goes away is noticed.
+    let mut parked: Option<WispMessage> = None;
+
     loop {
+        let ingress_open = ctx.ingress.has_room();
         let msg = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => break,
+            // The writer's own error is collected at teardown.
+            _ = writer_done.cancelled() => break,
+            _ = &mut idle_timer => {
+                let now = tokio::time::Instant::now();
+                if !heard_from_client {
+                    tracing::debug!(client_ip = %ctx.client_ip, "wisp: closing connection: no first frame");
+                    break;
+                }
+                let quiet_until = last_inbound + idle;
+                if now >= quiet_until && streams.is_empty() && udp_streams.is_empty() {
+                    tracing::debug!(client_ip = %ctx.client_ip, "wisp: closing idle connection");
+                    break;
+                }
+                // Quiet but with streams open: look again in a while.
+                let next = if now < quiet_until {
+                    quiet_until
+                } else {
+                    now + (idle / 4).max(std::time::Duration::from_millis(1))
+                };
+                idle_timer.as_mut().reset(next);
+                continue;
+            }
             ev = tcp_events_rx.recv() => {
                 match ev {
-                    Some(TcpEvent::Ready { stream_id, write, reader }) => {
-                        if let Some(slot) = streams.get_mut(stream_id) {
+                    Some(TcpEvent::Ready { stream_id, generation, write, reader, gate }) => {
+                        if let Some(slot) = streams.get_gen_mut(stream_id, generation) {
+                            slot.set_gate(gate, ctx.options.protocol_inspection);
                             if let WriteOutcome::DropStream(reason) = activate_writer(
                                     slot,
                                     write,
@@ -616,37 +816,72 @@ where
                                     drop_slot(slot);
                                 }
                                 caps.release(stream_id);
-                            } else if (negotiated.stream_open_confirmation
+                            } else if negotiated.stream_open_confirmation
                                 && egress_tx
                                     .send(WispMessage::Binary(encode_continue(
                                         stream_id,
                                         ctx.server_options.buffer_size,
                                     )))
                                     .await
-                                    .is_err())
-                                || (slot.upstream_eof
-                                    && finish_upstream_read(stream_id, &mut streams, &mut caps, &egress_tx)
-                                        .await
-                                        .is_err())
+                                    .is_err()
                             {
                                 serve_err = Some(ServerError::ClientClosed);
                                 break;
+                            } else {
+                                // Upstream bytes may flow now: the open
+                                // confirmation is ahead of them in the queue.
+                                slot.confirm_open();
+                                if slot.upstream_eof
+                                    && finish_upstream_read(stream_id, &mut streams, &mut caps, &egress_tx)
+                                        .await
+                                        .is_err()
+                                {
+                                    serve_err = Some(ServerError::ClientClosed);
+                                    break;
+                                }
                             }
                         } else {
                             drop(write);
                             reader.abort();
                         }
                     }
-                    Some(TcpEvent::Failed { stream_id })
-                    | Some(TcpEvent::ReaderDone { stream_id })
-                    | Some(TcpEvent::WriterDone { stream_id }) => {
-                        if let Some(slot) = streams.remove(stream_id) {
+                    Some(TcpEvent::Failed { stream_id, generation })
+                    | Some(TcpEvent::ReaderDone { stream_id, generation })
+                    | Some(TcpEvent::WriterDone { stream_id, generation }) => {
+                        if let Some(slot) = streams.remove_gen(stream_id, generation) {
                             drop_slot(slot);
-                            caps.release(stream_id);
+                            caps.release_gen(stream_id, generation);
                         }
                     }
-                    Some(TcpEvent::ReadEof { stream_id }) => {
-                        let Some(slot) = streams.get_mut(stream_id) else {
+                    Some(TcpEvent::InspectionTimeout { stream_id, generation }) => {
+                        let pending = streams
+                            .get_gen_mut(stream_id, generation)
+                            .is_some_and(|slot| slot.inspection_pending());
+                        if pending {
+                            if let Some(rejections) = ctx.reject_log.admit() {
+                                tracing::warn!(
+                                    stream_id,
+                                    rejections,
+                                    "wisp tcp protocol inspection timed out"
+                                );
+                            }
+                            if close_tcp_stream(
+                                stream_id,
+                                close_reason::TRANSFER_TIMEOUT,
+                                &mut streams,
+                                &mut caps,
+                                &egress_tx,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                serve_err = Some(ServerError::ClientClosed);
+                                break;
+                            }
+                        }
+                    }
+                    Some(TcpEvent::ReadEof { stream_id, generation }) => {
+                        let Some(slot) = streams.get_gen_mut(stream_id, generation) else {
                             continue;
                         };
                         slot.upstream_eof = true;
@@ -660,8 +895,8 @@ where
                             break;
                         }
                     }
-                    Some(TcpEvent::WriteShut { stream_id }) => {
-                        let Some(slot) = streams.get_mut(stream_id) else {
+                    Some(TcpEvent::WriteShut { stream_id, generation }) => {
+                        let Some(slot) = streams.get_gen_mut(stream_id, generation) else {
                             continue;
                         };
                         slot.write_shut = true;
@@ -678,14 +913,36 @@ where
                 continue;
             }
             done = stream_done_rx.recv() => {
-                if let Some(stream_id) = done {
-                    udp_streams.remove(&stream_id);
-                    caps.release(stream_id);
+                if let Some((stream_id, generation)) = done {
+                    // A flow that ended after its ID was reused must not
+                    // remove the new flow.
+                    if udp_streams
+                        .get(&stream_id)
+                        .is_some_and(|udp| udp.generation == generation)
+                    {
+                        udp_streams.remove(&stream_id);
+                        caps.release_gen(stream_id, generation);
+                    }
                 }
                 continue;
             }
-            recv = incoming.next() => match recv {
-                Some(Ok(m)) => m,
+            _ = std::future::ready(()), if ingress_open && parked.is_some() => {
+                match parked.take() {
+                    Some(m) => m,
+                    None => continue,
+                }
+            }
+            _ = ctx.ingress.room(), if !ingress_open => continue,
+            recv = incoming.next(), if parked.is_none() => match recv {
+                Some(Ok(m)) => {
+                    heard_from_client = true;
+                    last_inbound = tokio::time::Instant::now();
+                    if !ingress_open {
+                        parked = Some(m);
+                        continue;
+                    }
+                    m
+                }
                 Some(Err(e)) => {
                     serve_err = Some(ServerError::transport(e));
                     break;
@@ -789,19 +1046,22 @@ where
                 let Some(controller) = ctx.proxy_controller.as_ref() else {
                     continue;
                 };
-                if let Some(lim) = control_msg_limiter.as_ref() {
-                    if lim.check().is_err() {
-                        tracing::warn!(
-                            "wisp: closing connection: per-conn proxy_control rate exceeded",
-                        );
-                        let _ = egress_tx
-                            .send(WispMessage::Binary(encode_close(
-                                0,
-                                close_reason::CONN_THROTTLED,
-                            )))
-                            .await;
-                        break;
-                    }
+                // Both the per-connection and the per-IP control limits, as on
+                // the WebTransport path.
+                if !is_control_message_allowed(
+                    &ctx.client_ip,
+                    &ctx.conn_dos,
+                    &ctx.options,
+                    &ctx.dos_store,
+                ) {
+                    tracing::warn!("wisp: closing connection: proxy_control rate exceeded");
+                    let _ = egress_tx
+                        .send(WispMessage::Binary(encode_close(
+                            0,
+                            close_reason::CONN_THROTTLED,
+                        )))
+                        .await;
+                    break;
                 }
                 let sem_permit = match control_concurrency.clone().try_acquire_owned() {
                     Ok(p) => p,
@@ -846,17 +1106,25 @@ where
     for (_, slot) in streams.drain() {
         drop_slot(slot);
     }
+    for (_, udp) in udp_streams.drain() {
+        udp.abort();
+    }
     ctx.cancel.cancel();
     drop(egress_tx);
     drop(control_egress_tx);
-    match egress_writer.await {
-        Ok(Ok(())) => {}
-        Ok(Err(sink_err)) => {
+    // The writer flushes what is already queued, such as the CLOSE that
+    // explains why the connection ended, then closes the sink. The wait is
+    // short so a client that stopped reading cannot hold the teardown.
+    writer_stop.cancel();
+    match tokio::time::timeout(EGRESS_FLUSH_TIMEOUT, &mut egress_writer).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(sink_err))) => {
             if serve_err.is_none() {
                 serve_err = Some(sink_err);
             }
         }
-        Err(_join_err) => {}
+        Ok(Err(_join_err)) => {}
+        Err(_elapsed) => egress_writer.abort(),
     }
     if let Some(e) = serve_err {
         return Err(e);
@@ -1069,7 +1337,9 @@ mod proxy_control_compat_tests {
 pub(crate) struct StreamCaps {
     total: u32,
     host_counts: HashMap<String, u32>,
-    host_keys: HashMap<u32, String>,
+    /// Host key and generation of each admitted stream, by wire stream ID.
+    host_keys: HashMap<u32, (String, u64)>,
+    next_generation: u64,
     open_limiter: Option<DirectLimiter>,
     stream_limit_total: u32,
     stream_limit_per_host: Option<u32>,
@@ -1083,6 +1353,7 @@ impl StreamCaps {
             total: 0,
             host_counts: HashMap::new(),
             host_keys: HashMap::new(),
+            next_generation: 1,
             open_limiter,
             stream_limit_total: opts.stream_limit_total,
             stream_limit_per_host: opts.stream_limit_per_host,
@@ -1093,7 +1364,9 @@ impl StreamCaps {
         format!("{}:{port}", host.to_ascii_lowercase())
     }
 
-    fn try_admit(&mut self, stream_id: u32, host: &str, port: u16) -> Result<(), AdmitDenied> {
+    /// Admits a stream and returns its generation, which tells it apart from
+    /// earlier streams that used the same wire ID.
+    fn try_admit(&mut self, stream_id: u32, host: &str, port: u16) -> Result<u64, AdmitDenied> {
         if self.stream_limit_total > 0 && self.total >= self.stream_limit_total {
             return Err(AdmitDenied::TotalCap);
         }
@@ -1111,12 +1384,15 @@ impl StreamCaps {
         }
         self.total = self.total.saturating_add(1);
         *self.host_counts.entry(key.clone()).or_insert(0) += 1;
-        self.host_keys.insert(stream_id, key);
-        Ok(())
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.host_keys.insert(stream_id, (key, generation));
+        Ok(generation)
     }
 
+    /// Releases the stream currently holding `stream_id`.
     fn release(&mut self, stream_id: u32) {
-        if let Some(key) = self.host_keys.remove(&stream_id) {
+        if let Some((key, _)) = self.host_keys.remove(&stream_id) {
             self.total = self.total.saturating_sub(1);
             if let Some(c) = self.host_counts.get_mut(&key) {
                 *c = c.saturating_sub(1);
@@ -1124,6 +1400,21 @@ impl StreamCaps {
                     self.host_counts.remove(&key);
                 }
             }
+        }
+    }
+}
+
+impl StreamCaps {
+    /// Releases `stream_id` only if it is still held by the stream that
+    /// `generation` was issued to, so a late completion cannot free the cap of
+    /// a newer stream that reused the ID.
+    fn release_gen(&mut self, stream_id: u32, generation: u64) {
+        if self
+            .host_keys
+            .get(&stream_id)
+            .is_some_and(|(_, held)| *held == generation)
+        {
+            self.release(stream_id);
         }
     }
 }
@@ -1215,6 +1506,31 @@ mod stream_caps_tests {
     }
 
     #[test]
+    fn stale_generation_cannot_release_a_reused_id() {
+        let mut caps = StreamCaps::new(&opts(2, None, 0));
+        let old = caps.try_admit(5, "a", 80).unwrap();
+        caps.release(5);
+        let new = caps.try_admit(5, "b", 80).unwrap();
+        assert_ne!(old, new);
+        caps.release_gen(5, old);
+        assert_eq!(caps.total, 1, "the new stream keeps its cap");
+        assert!(caps.try_admit(6, "c", 80).is_ok());
+        assert!(matches!(
+            caps.try_admit(7, "d", 80),
+            Err(AdmitDenied::TotalCap)
+        ));
+        caps.release_gen(5, new);
+        assert_eq!(caps.total, 1);
+    }
+
+    #[test]
+    fn log_throttle_logs_the_first_few_then_powers_of_two() {
+        let throttle = LogThrottle::default();
+        let logged: Vec<u64> = (0..100).filter_map(|_| throttle.admit()).collect();
+        assert_eq!(logged, vec![1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64]);
+    }
+
+    #[test]
     fn release_decrements_host_count() {
         let mut caps = StreamCaps::new(&opts(100, Some(1), 0));
         assert!(caps.try_admit(1, "h", 80).is_ok());
@@ -1228,7 +1544,7 @@ async fn handle_data(
     stream_id: u32,
     payload: Bytes,
     streams: &mut StreamTable,
-    udp_streams: &mut HashMap<u32, mpsc::Sender<UdpStreamMsg>>,
+    udp_streams: &mut UdpStreams,
     caps: &mut StreamCaps,
     ctx: &ServerContext,
     egress: &EgressSender,
@@ -1256,12 +1572,9 @@ async fn handle_data(
                 }
                 caps.release(stream_id);
             }
-            WriteOutcome::SendContinue => {
+            WriteOutcome::SendContinue(credit) => {
                 if egress
-                    .send(WispMessage::Binary(encode_continue(
-                        stream_id,
-                        ctx.server_options.buffer_size,
-                    )))
+                    .send(WispMessage::Binary(encode_continue(stream_id, credit)))
                     .await
                     .is_err()
                 {
@@ -1293,12 +1606,12 @@ async fn handle_data(
 async fn handle_packet(
     packet: WispPacket,
     streams: &mut StreamTable,
-    udp_streams: &mut HashMap<u32, mpsc::Sender<UdpStreamMsg>>,
+    udp_streams: &mut UdpStreams,
     caps: &mut StreamCaps,
     ctx: &ServerContext,
     negotiated: &NegotiatedExtensions,
     egress: &EgressSender,
-    stream_done_tx: &mpsc::Sender<u32>,
+    stream_done_tx: &mpsc::Sender<(u32, u64)>,
     tcp_events: &mpsc::Sender<TcpEvent>,
 ) -> Result<(), ServerError> {
     match packet {
@@ -1319,20 +1632,29 @@ async fn handle_packet(
                     return Err(ServerError::StreamCollision(conn.stream_id));
                 }
             }
-            let needs_dns = conn.hostname.parse::<std::net::IpAddr>().is_err();
-            let dns_allowed = !needs_dns
-                || is_dns_resolution_allowed(
-                    &ctx.client_ip,
-                    &conn.hostname,
-                    &ctx.options,
-                    &ctx.dos_store,
-                );
+            // Only a name that passes the destination policy costs a DNS
+            // token, keyed by its normalized spelling. A refused host never
+            // reaches the resolver; the dial task re-checks and reports it.
+            let checked = if conn.stream_type == stream_type::UDP {
+                ctx.policy.check_udp_host(&conn.hostname, conn.port)
+            } else {
+                ctx.policy.check_host(&conn.hostname, conn.port)
+            };
+            let dns_allowed = match &checked {
+                Ok(NormalizedHost::Name(name)) => {
+                    is_dns_resolution_allowed(&ctx.client_ip, name, &ctx.options, &ctx.dos_store)
+                }
+                _ => true,
+            };
             if !dns_allowed {
-                tracing::info!(
-                    stream_id = conn.stream_id,
-                    host = %conn.hostname,
-                    "wisp connect rejected: dns resolution rate limit"
-                );
+                if let Some(rejections) = ctx.reject_log.admit() {
+                    tracing::info!(
+                        stream_id = conn.stream_id,
+                        host = ?conn.hostname,
+                        rejections,
+                        "wisp connect rejected: dns resolution rate limit"
+                    );
+                }
                 let _ = egress
                     .send(WispMessage::Binary(encode_close(
                         conn.stream_id,
@@ -1349,12 +1671,15 @@ async fn handle_packet(
                         &ctx.options,
                         &ctx.dos_store,
                     ) {
-                        tracing::info!(
-                            stream_id = conn.stream_id,
-                            host = %conn.hostname,
-                            port = conn.port,
-                            "wisp tcp connect rejected: stream-open rate limit"
-                        );
+                        if let Some(rejections) = ctx.reject_log.admit() {
+                            tracing::info!(
+                                stream_id = conn.stream_id,
+                                host = ?conn.hostname,
+                                port = conn.port,
+                                rejections,
+                                "wisp tcp connect rejected: stream-open rate limit"
+                            );
+                        }
                         let _ = egress
                             .send(WispMessage::Binary(encode_close(
                                 conn.stream_id,
@@ -1363,42 +1688,61 @@ async fn handle_packet(
                             .await;
                         return Ok(());
                     }
-                    if let Err(reason) = caps.try_admit(conn.stream_id, &conn.hostname, conn.port) {
-                        tracing::info!(
-                            stream_id = conn.stream_id,
-                            host = %conn.hostname,
-                            port = conn.port,
-                            ?reason,
-                            "wisp tcp connect rejected: stream cap"
-                        );
-                        let _ = egress
-                            .send(WispMessage::Binary(encode_close(
-                                conn.stream_id,
-                                close_reason::CONN_THROTTLED,
-                            )))
-                            .await;
-                        return Ok(());
-                    }
-                    streams.insert(conn.stream_id, TcpStreamSlot::connecting());
-                    spawn_tcp_connect(
+                    let generation = match caps.try_admit(conn.stream_id, &conn.hostname, conn.port)
+                    {
+                        Ok(generation) => generation,
+                        Err(reason) => {
+                            if let Some(rejections) = ctx.reject_log.admit() {
+                                tracing::info!(
+                                    stream_id = conn.stream_id,
+                                    host = ?conn.hostname,
+                                    port = conn.port,
+                                    ?reason,
+                                    rejections,
+                                    "wisp tcp connect rejected: stream cap"
+                                );
+                            }
+                            let _ = egress
+                                .send(WispMessage::Binary(encode_close(
+                                    conn.stream_id,
+                                    close_reason::CONN_THROTTLED,
+                                )))
+                                .await;
+                            return Ok(());
+                        }
+                    };
+                    let mut slot = TcpStreamSlot::connecting_for(generation, Some(&conn.hostname));
+                    slot.set_dial(spawn_tcp_connect(
                         conn.stream_id,
+                        generation,
                         conn.hostname.clone(),
                         conn.port,
                         negotiated.tcp_half_close,
+                        slot.activity(),
                         ctx.clone(),
                         egress.clone(),
                         tcp_events.clone(),
-                    );
+                    ));
+                    streams.insert(conn.stream_id, slot);
                 }
                 stream_type::UDP if negotiated.udp => {
-                    if let Err(reason) = caps.try_admit(conn.stream_id, &conn.hostname, conn.port) {
-                        tracing::info!(
-                            stream_id = conn.stream_id,
-                            host = %conn.hostname,
-                            port = conn.port,
-                            ?reason,
-                            "wisp udp connect rejected: stream cap"
-                        );
+                    // UDP opens share the TCP stream-open budget, per
+                    // connection and per client IP.
+                    if !is_tcp_stream_open_allowed(
+                        &ctx.client_ip,
+                        &ctx.conn_dos,
+                        &ctx.options,
+                        &ctx.dos_store,
+                    ) {
+                        if let Some(rejections) = ctx.reject_log.admit() {
+                            tracing::info!(
+                                stream_id = conn.stream_id,
+                                host = ?conn.hostname,
+                                port = conn.port,
+                                rejections,
+                                "wisp udp connect rejected: stream-open rate limit"
+                            );
+                        }
                         let _ = egress
                             .send(WispMessage::Binary(encode_close(
                                 conn.stream_id,
@@ -1407,15 +1751,39 @@ async fn handle_packet(
                             .await;
                         return Ok(());
                     }
-                    let tx = spawn_udp_stream(
+                    let generation = match caps.try_admit(conn.stream_id, &conn.hostname, conn.port)
+                    {
+                        Ok(generation) => generation,
+                        Err(reason) => {
+                            if let Some(rejections) = ctx.reject_log.admit() {
+                                tracing::info!(
+                                    stream_id = conn.stream_id,
+                                    host = ?conn.hostname,
+                                    port = conn.port,
+                                    ?reason,
+                                    rejections,
+                                    "wisp udp connect rejected: stream cap"
+                                );
+                            }
+                            let _ = egress
+                                .send(WispMessage::Binary(encode_close(
+                                    conn.stream_id,
+                                    close_reason::CONN_THROTTLED,
+                                )))
+                                .await;
+                            return Ok(());
+                        }
+                    };
+                    let udp = spawn_udp_stream(
                         conn.stream_id,
+                        generation,
                         conn.hostname.clone(),
                         conn.port,
                         ctx.clone(),
                         egress.clone(),
                         stream_done_tx.clone(),
                     );
-                    udp_streams.insert(conn.stream_id, tx);
+                    udp_streams.insert(conn.stream_id, udp);
                 }
                 _ => {
                     let _ = egress
@@ -1451,7 +1819,10 @@ async fn handle_packet(
                 drop_slot(slot);
                 caps.release(close.stream_id);
             } else if let Some(udp) = udp_streams.remove(&close.stream_id) {
+                // Aborting also stops a flow that is still resolving its
+                // destination, which a queued Close would not reach.
                 let _ = udp.try_send(UdpStreamMsg::Close);
+                udp.abort();
                 caps.release(close.stream_id);
             }
         }
@@ -1542,8 +1913,12 @@ async fn release_finished(
 }
 
 /// Normalize a per-minute limit from the u64 config space into governor's u32
-/// rate space. The `UNLIMITED` sentinel (`u64::MAX`, set via `-1` in TOML) and
-/// `0` both mean "no limiter"; any other value is clamped into `u32`.
+/// rate space. The `UNLIMITED` sentinel (`u64::MAX`, set via `-1` in TOML)
+/// becomes `0`, which here means "no limiter"; any other value is clamped into
+/// `u32`. A configured `0` never reaches this for a rate limit, because
+/// `validate()` refuses it (wisp-dos would read it as "deny all"); the one
+/// documented zero is `max_binary_packets_per_connection_per_minute`, where
+/// `0` means disabled.
 fn per_minute_u32(v: u64) -> u32 {
     if v == u64::MAX {
         return 0;
@@ -1843,16 +2218,10 @@ mod serve_connection_tests {
                 .unwrap();
         }
 
-        match next_packet(&mut out_rx).await {
-            WispPacket::Continue(c) if c.stream_id == 1 => {}
-            WispPacket::Close(c) if c.stream_id == 1 => {
-                panic!(
-                    "initial credit window closed early with reason {}",
-                    c.reason
-                )
-            }
-            other => panic!("expected stream flow-control update, got {other:?}"),
-        }
+        // The upstream takes nothing, so the stream earns no new credit, and
+        // the full initial window must not close it either.
+        expect_quiet(&mut out_rx).await;
+        assert!(!handle.is_finished());
 
         drop(in_tx);
         let _ = timeout(Duration::from_secs(2), handle).await;
@@ -2295,6 +2664,781 @@ mod serve_connection_tests {
 
         drop(in_tx);
         let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    fn queue(in_tx: &fmpsc::UnboundedSender<Result<WispMessage, std::io::Error>>, packet: Bytes) {
+        in_tx
+            .unbounded_send(Ok(WispMessage::Binary(packet)))
+            .unwrap();
+    }
+
+    fn tcp_connect(stream_id: u32, hostname: &str, port: u16) -> Bytes {
+        encode_connect(&ConnectPacket {
+            stream_id,
+            stream_type: stream_type::TCP,
+            port,
+            hostname: hostname.to_owned(),
+        })
+    }
+
+    #[tokio::test]
+    async fn connection_close_reason_is_delivered() {
+        // The CLOSE used to lose a race with the writer's cancellation on
+        // every run, so repeat it.
+        for _ in 0..20 {
+            let mut options = (*loopback_test_options(6002)).clone();
+            options.max_binary_packets_per_connection_per_minute = 2;
+            let ctx = test_ctx(Arc::new(options), false);
+            let (in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+            match next_packet(&mut out_rx).await {
+                WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+                other => panic!("expected handshake CONTINUE, got {other:?}"),
+            }
+            for _ in 0..3 {
+                queue(&in_tx, encode_data(1, b"x"));
+            }
+            assert_eq!(
+                next_packet(&mut out_rx).await,
+                close(0, close_reason::CONN_THROTTLED)
+            );
+            let _ = timeout(Duration::from_secs(2), handle).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_violation_close_reason_is_delivered() {
+        let ctx = test_ctx(loopback_test_options(6002), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, &[]).await;
+        send_packet(&mut in_tx, encode_data(0, b"x")).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(0, close_reason::CLIENT_ERROR)
+        );
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("connection must end")
+            .unwrap();
+        assert!(matches!(result, Err(ServerError::ProtocolViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn reused_stream_id_never_reaches_the_old_destination() {
+        let old = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_port = old.local_addr().unwrap().port();
+        let (new_port, echo) = echo_listener().await;
+        let mut options = (*loopback_test_options(new_port)).clone();
+        options.port_whitelist = Some(vec![old_port, new_port]);
+        let ctx = test_ctx(Arc::new(options), false);
+        let (in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+
+        // All queued before the server runs, so the first stream's dial has
+        // not completed when its ID is reused.
+        queue(&in_tx, tcp_connect(5, "127.0.0.1", old_port));
+        queue(&in_tx, encode_data(5, b"for-old"));
+        queue(&in_tx, encode_close(5, close_reason::VOLUNTARY));
+        queue(&in_tx, tcp_connect(5, "127.0.0.1", new_port));
+        queue(&in_tx, encode_data(5, b"for-new"));
+
+        // Echo of exactly the new stream's payload: nothing of the old
+        // stream's reached it.
+        expect_data(&mut out_rx, 5, b"for-new").await;
+
+        // The old destination may have received what the client sent while
+        // its stream was open, but never what was sent to the new one.
+        let mut seen = Vec::new();
+        if let Ok(Ok((mut sock, _))) = timeout(Duration::from_millis(300), old.accept()).await {
+            let mut buf = [0u8; 64];
+            while let Ok(Ok(n)) = timeout(Duration::from_millis(300), sock.read(&mut buf)).await {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+        }
+        assert!(
+            !String::from_utf8_lossy(&seen).contains("for-new"),
+            "old destination received {seen:?}"
+        );
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn closing_a_connecting_stream_aborts_its_dial() {
+        // The echo listener serves one connection. Were the first stream's
+        // dial left running after CLOSE it would take that connection, and
+        // the second stream's would never be answered. The cap of one also
+        // has to be free again by the second CONNECT.
+        let mut options = (*loopback_test_options(6002)).clone();
+        options.stream_limit_total = 1;
+        options.port_whitelist = None;
+        let ctx = test_ctx(Arc::new(options), false);
+        let (in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        let (port, echo) = echo_listener().await;
+        queue(&in_tx, tcp_connect(1, "127.0.0.1", port));
+        queue(&in_tx, encode_close(1, close_reason::VOLUNTARY));
+        queue(&in_tx, tcp_connect(2, "127.0.0.1", port));
+        queue(&in_tx, encode_data(2, b"second"));
+        expect_data(&mut out_rx, 2, b"second").await;
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn reused_udp_stream_id_reaches_the_new_flow() {
+        let old = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (old_port, new_port) = (
+            old.local_addr().unwrap().port(),
+            new.local_addr().unwrap().port(),
+        );
+        let mut options = (*loopback_test_options(new_port)).clone();
+        options.port_whitelist = Some(vec![old_port, new_port]);
+        let ctx = test_ctx(Arc::new(options), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, &[extension_id::UDP]).await;
+
+        let udp_connect = |port| {
+            encode_connect(&ConnectPacket {
+                stream_id: 7,
+                stream_type: stream_type::UDP,
+                port,
+                hostname: "127.0.0.1".to_owned(),
+            })
+        };
+        queue(&in_tx, udp_connect(old_port));
+        queue(&in_tx, encode_close(7, close_reason::VOLUNTARY));
+        queue(&in_tx, udp_connect(new_port));
+        queue(&in_tx, encode_data(7, b"udp-new"));
+
+        let mut buf = [0u8; 32];
+        let (n, _) = timeout(Duration::from_secs(2), new.recv_from(&mut buf))
+            .await
+            .expect("new flow got no datagram")
+            .unwrap();
+        assert_eq!(&buf[..n], b"udp-new");
+
+        // The first flow ending must not have unregistered the new one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        queue(&in_tx, encode_data(7, b"second"));
+        let (n, _) = timeout(Duration::from_secs(2), new.recv_from(&mut buf))
+            .await
+            .expect("new flow was black-holed")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second");
+        assert!(
+            timeout(Duration::from_millis(200), old.recv_from(&mut buf))
+                .await
+                .map_or(true, |got| got.is_err() || &buf[..4] != b"udp-"),
+            "old flow received the new flow's datagram"
+        );
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    fn udp_connect(stream_id: u32, hostname: &str, port: u16) -> Bytes {
+        encode_connect(&ConnectPacket {
+            stream_id,
+            stream_type: stream_type::UDP,
+            port,
+            hostname: hostname.to_owned(),
+        })
+    }
+
+    /// Runs one UDP open against a local socket and returns the first packet
+    /// the server sends for that stream, plus whether a datagram arrived.
+    async fn udp_open_outcome(
+        edit: impl FnOnce(&mut WispServerOptions, u16),
+    ) -> (WispPacket, bool) {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let mut options = (*loopback_test_options(port)).clone();
+        edit(&mut options, port);
+        let ctx = test_ctx(Arc::new(options), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, &[extension_id::UDP]).await;
+        queue(&in_tx, udp_connect(7, "127.0.0.1", port));
+        queue(&in_tx, encode_data(7, b"leak"));
+        let first = next_packet(&mut out_rx).await;
+        let mut buf = [0u8; 16];
+        let arrived = timeout(Duration::from_millis(300), target.recv_from(&mut buf))
+            .await
+            .is_ok_and(|got| got.is_ok());
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        (first, arrived)
+    }
+
+    #[tokio::test]
+    async fn udp_is_refused_where_tcp_must_be_proxied() {
+        let (first, arrived) = udp_open_outcome(|o, _| o.force_proxy = true).await;
+        assert_eq!(first, close(7, close_reason::HOST_BLOCKED));
+        assert!(!arrived, "no datagram may leave from the server's address");
+        let (first, arrived) = udp_open_outcome(|_, _| {}).await;
+        assert!(matches!(first, WispPacket::Continue(_)), "got {first:?}");
+        assert!(arrived);
+    }
+
+    #[tokio::test]
+    async fn udp_port_whitelist_limits_udp_destinations() {
+        let (first, arrived) =
+            udp_open_outcome(|o, port| o.udp_port_whitelist = Some(vec![port.wrapping_add(1)]))
+                .await;
+        assert_eq!(first, close(7, close_reason::HOST_BLOCKED));
+        assert!(!arrived);
+        let (first, arrived) =
+            udp_open_outcome(|o, port| o.udp_port_whitelist = Some(vec![port])).await;
+        assert!(matches!(first, WispPacket::Continue(_)), "got {first:?}");
+        assert!(arrived);
+    }
+
+    #[tokio::test]
+    async fn udp_opens_are_rate_limited_like_tcp() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let mut options = (*loopback_test_options(port)).clone();
+        options.max_tcp_stream_opens_per_connection_per_minute = 1;
+        let ctx = test_ctx(Arc::new(options), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, &[extension_id::UDP]).await;
+        queue(&in_tx, udp_connect(7, "127.0.0.1", port));
+        assert!(matches!(
+            next_packet(&mut out_rx).await,
+            WispPacket::Continue(_)
+        ));
+        queue(&in_tx, udp_connect(9, "127.0.0.1", port));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(9, close_reason::CONN_THROTTLED)
+        );
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_host_costs_no_dns_token() {
+        let mut options = (*loopback_test_options(443)).clone();
+        options.port_whitelist = Some(vec![443]);
+        options.domain_blacklist = Some(vec!["blocked.example".to_owned()]);
+        options.max_dns_resolutions_per_ip_per_minute = 1;
+        // Bounds the lookup of the allowed name well inside next_packet's wait.
+        options.connect_timeout_ms = Some(500);
+        let ctx = test_ctx(Arc::new(options), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, &[]).await;
+        // Refused names, in any spelling, are closed as blocked and do not
+        // spend the single DNS token.
+        for (id, host) in [
+            (3, "blocked.example"),
+            (5, "BLOCKED.example."),
+            (7, "16843009"),
+        ] {
+            queue(&in_tx, tcp_connect(id, host, 443));
+            assert_eq!(
+                next_packet(&mut out_rx).await,
+                close(id, close_reason::HOST_BLOCKED)
+            );
+        }
+        // The token is still there for an allowed name (`.invalid` never
+        // resolves, so the stream then fails, but not as throttled).
+        queue(&in_tx, tcp_connect(9, "nothing.invalid", 443));
+        assert_ne!(
+            next_packet(&mut out_rx).await,
+            close(9, close_reason::CONN_THROTTLED)
+        );
+        queue(&in_tx, tcp_connect(11, "other.invalid", 443));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(11, close_reason::CONN_THROTTLED)
+        );
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    fn inspecting_options(port: u16, timeout_ms: u64) -> Arc<WispServerOptions> {
+        let mut options = (*loopback_test_options(port)).clone();
+        options.protocol_inspection = true;
+        options.protocol_inspection_timeout_ms = Some(timeout_ms);
+        Arc::new(options)
+    }
+
+    #[tokio::test]
+    async fn server_first_output_is_held_until_the_client_is_classified() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"SSH-2.0-banner\r\n").await.unwrap();
+            let mut request = vec![0u8; 256];
+            let n = sock.read(&mut request).await.unwrap();
+            request.truncate(n);
+            request
+        });
+        let ctx = test_ctx(inspecting_options(port, 5_000), false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        send_packet(&mut in_tx, tcp_connect(1, "127.0.0.1", port)).await;
+        // The banner is waiting on the socket, but nothing is forwarded while
+        // the client has sent nothing to classify.
+        expect_quiet(&mut out_rx).await;
+
+        let request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        send_packet(&mut in_tx, encode_data(1, request)).await;
+        expect_data(&mut out_rx, 1, b"SSH-2.0-banner\r\n").await;
+        assert_eq!(upstream.await.unwrap(), request);
+
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn open_confirmation_precedes_upstream_first_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"hello-first").await.unwrap();
+            sock
+        });
+        let ctx = test_ctx(loopback_test_options(port), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        send_packet(&mut in_tx, tcp_connect(1, "127.0.0.1", port)).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) if c.stream_id == 1 => {}
+            other => panic!("expected open confirmation first, got {other:?}"),
+        }
+        expect_data(&mut out_rx, 1, b"hello-first").await;
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        let _ = upstream.await;
+    }
+
+    #[tokio::test]
+    async fn silent_stream_hits_the_inspection_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ctx = test_ctx(inspecting_options(port, 200), false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        send_packet(&mut in_tx, tcp_connect(1, "127.0.0.1", port)).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::TRANSFER_TIMEOUT)
+        );
+        // A dripping client is bounded the same way: bytes that never form a
+        // request do not postpone the deadline.
+        send_packet(&mut in_tx, tcp_connect(3, "127.0.0.1", port)).await;
+        send_packet(&mut in_tx, encode_data(3, b"GET / HTTP/1.1\r\n")).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(3, close_reason::TRANSFER_TIMEOUT)
+        );
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn connect_method_is_blocked_on_a_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ctx = test_ctx(inspecting_options(port, 5_000), false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        send_packet(&mut in_tx, tcp_connect(1, "127.0.0.1", port)).await;
+        send_packet(
+            &mut in_tx,
+            encode_data(
+                1,
+                b"CONNECT evil.example:22 HTTP/1.1\r\nHost: evil.example:22\r\n\r\n",
+            ),
+        )
+        .await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::HOST_BLOCKED)
+        );
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn host_header_must_name_the_connect_hostname() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // What each of the two connections sent before it ended.
+        let upstream = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 256];
+                let n = sock.read(&mut request).await.unwrap();
+                request.truncate(n);
+                received.push(request);
+            }
+            received
+        });
+        let ctx = test_ctx(inspecting_options(port, 5_000), false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        // Fronting: the stream was opened to localhost but speaks for another host.
+        send_packet(&mut in_tx, tcp_connect(1, "localhost", port)).await;
+        send_packet(
+            &mut in_tx,
+            encode_data(1, b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::HOST_BLOCKED)
+        );
+
+        let request = format!("GET / HTTP/1.1\r\nHost: LOCALHOST.:{port}\r\n\r\n");
+        send_packet(&mut in_tx, tcp_connect(3, "localhost", port)).await;
+        send_packet(&mut in_tx, encode_data(3, request.as_bytes())).await;
+        let received = upstream.await.unwrap();
+        assert!(received[0].is_empty(), "blocked stream leaked bytes");
+        assert_eq!(received[1], request.as_bytes());
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn control_messages_are_limited_per_ip_across_connections() {
+        let mut options = (*loopback_test_options(6002)).clone();
+        options.max_control_messages_per_ip_per_minute = 2;
+        options.max_control_messages_per_connection_per_minute = UNLIMITED;
+        let options = Arc::new(options);
+        let server_options = Arc::new(ServerOptions::from_wisp(&options, true));
+        let template = crate::ProxyControllerTemplate::new(Vec::new());
+        let dos = Arc::new(DosGuard::new());
+        let connect = || {
+            let ctx = ServerContext::new(
+                "198.51.100.7".to_owned(),
+                None,
+                options.clone(),
+                server_options.clone(),
+                Some(template.spawn(server_options.proxy_control_limits(), None)),
+                true,
+                dos.clone(),
+            );
+            spawn_serve(ctx)
+        };
+        let list = || WispMessage::Text(r#"{"type":"proxy_list_providers"}"#.to_owned());
+
+        let (mut first_tx, mut first_rx, first) = connect().await;
+        v2_handshake(
+            &mut first_tx,
+            &mut first_rx,
+            &[extension_id::WISP_PROXY_CONTROL],
+        )
+        .await;
+        for _ in 0..2 {
+            first_tx.send(Ok(list())).await.unwrap();
+            match timeout(Duration::from_secs(2), first_rx.next()).await {
+                Ok(Some(WispMessage::Text(reply))) => assert!(reply.contains("providers")),
+                other => panic!("expected a control reply, got {other:?}"),
+            }
+        }
+
+        // A second connection from the same IP finds the budget spent, though
+        // its own per-connection limit is off.
+        let (mut second_tx, mut second_rx, second) = connect().await;
+        v2_handshake(
+            &mut second_tx,
+            &mut second_rx,
+            &[extension_id::WISP_PROXY_CONTROL],
+        )
+        .await;
+        second_tx.send(Ok(list())).await.unwrap();
+        loop {
+            let msg = timeout(Duration::from_secs(2), second_rx.next())
+                .await
+                .expect("second connection was never throttled")
+                .expect("second connection closed without a reason");
+            if let WispMessage::Binary(frame) = msg {
+                assert_eq!(
+                    parse_packet(frame).unwrap(),
+                    close(0, close_reason::CONN_THROTTLED)
+                );
+                break;
+            }
+        }
+        drop(first_tx);
+        drop(second_tx);
+        let _ = timeout(Duration::from_secs(2), first).await;
+        let _ = timeout(Duration::from_secs(2), second).await;
+    }
+
+    /// Accepts every connection and never reads from it.
+    async fn stalled_upstream() -> (u16, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(16 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(64).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn many_streams_stay_within_the_connection_upload_budget() {
+        const BUDGET: usize = 512 * 1024;
+        const CHUNK: usize = 32 * 1024;
+        let (port, upstream) = stalled_upstream().await;
+        let mut options = (*loopback_test_options(port)).clone();
+        options.max_ingress_bytes_per_connection = BUDGET as u64;
+        let ctx = test_ctx(Arc::new(options), false);
+        let ingress = ctx.ingress.clone();
+        let (in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+
+        // Eight streams, each well inside its credit, together offer 16 MiB
+        // to upstreams that take nothing past their socket buffers.
+        let chunk = vec![b'x'; CHUNK];
+        for stream_id in 1..=8 {
+            queue(&in_tx, tcp_connect(stream_id, "127.0.0.1", port));
+        }
+        for _ in 0..64 {
+            for stream_id in 1..=8 {
+                queue(&in_tx, encode_data(stream_id, &chunk));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let held = ingress.connection_used();
+        assert!(held >= BUDGET / 2, "the budget was never reached: {held}");
+        assert!(
+            held < BUDGET + CHUNK,
+            "held {held} bytes, past the {BUDGET} byte budget"
+        );
+        // Backpressure, not a close.
+        expect_quiet(&mut out_rx).await;
+        assert!(!handle.is_finished());
+
+        upstream.abort();
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(5), handle).await;
+        assert_eq!(ingress.connection_used(), 0, "teardown releases every byte");
+    }
+
+    #[tokio::test]
+    async fn credit_compliant_client_is_paced_not_closed() {
+        const CHUNK: usize = 8 * 1024;
+        const PACKETS: usize = 512;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(16 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let mut options = (*loopback_test_options(listener.local_addr().unwrap().port())).clone();
+        options.buffer_size = 64;
+        options.continue_threshold = 32;
+        options.max_pending_packets_per_stream = 128;
+        options.max_pending_bytes_per_stream = 128 * 1024;
+        let ctx = test_ctx(Arc::new(options), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        let mut upstream = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+        // A slow upstream: small reads with a pause between them.
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut total = 0;
+            loop {
+                match upstream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break total,
+                    Ok(n) => {
+                        total += n;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        });
+
+        // The client sends only while it holds credit, as the protocol asks.
+        let chunk = vec![b'x'; CHUNK];
+        let mut credit = 64u32;
+        let mut sent = 0;
+        let on_packet = |packet: WispPacket, credit: &mut u32| match packet {
+            WispPacket::Continue(c) if c.stream_id == 1 => *credit = c.remaining,
+            WispPacket::Close(c) => panic!("compliant client closed with reason {:#x}", c.reason),
+            other => panic!("unexpected packet {other:?}"),
+        };
+        while sent < PACKETS {
+            while let Ok(WispMessage::Binary(frame)) = out_rx.try_recv() {
+                on_packet(parse_packet(frame).unwrap(), &mut credit);
+            }
+            if credit == 0 {
+                let packet = timeout(Duration::from_secs(5), next_packet(&mut out_rx))
+                    .await
+                    .expect("credit never came back");
+                on_packet(packet, &mut credit);
+                continue;
+            }
+            send_packet(&mut in_tx, encode_data(1, &chunk)).await;
+            credit -= 1;
+            sent += 1;
+        }
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        let total = timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("upstream never finished")
+            .unwrap();
+        assert_eq!(total, CHUNK * PACKETS);
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn upload_to_a_quiet_upstream_is_not_cut() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut options = (*loopback_test_options(port)).clone();
+        options.stream_idle_timeout_ms = Some(300);
+        let ctx = test_ctx(Arc::new(options), false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        send_packet(&mut in_tx, tcp_connect(1, "127.0.0.1", port)).await;
+        let (mut upstream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("upstream accept timed out")
+            .unwrap();
+        // The upstream only listens; the client keeps sending for four idle
+        // windows.
+        for _ in 0..12 {
+            send_packet(&mut in_tx, encode_data(1, b"tick")).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(msg) = out_rx.try_recv() {
+                panic!("upload was interrupted by {msg:?}");
+            }
+        }
+        let mut received = vec![0u8; 48];
+        timeout(Duration::from_secs(2), upstream.read_exact(&mut received))
+            .await
+            .expect("upstream missed the upload")
+            .unwrap();
+        assert_eq!(received, b"tick".repeat(12));
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn idle_connection_without_streams_closes() {
+        let mut options = (*loopback_test_options(6002)).clone();
+        options.idle_timeout_ms = Some(300);
+        let ctx = test_ctx(Arc::new(options), true);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, &[]).await;
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("an idle connection was never closed")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        drop(in_tx);
+    }
+
+    #[tokio::test]
+    async fn v1_client_must_send_a_first_frame_in_time() {
+        let mut options = (*loopback_test_options(6002)).clone();
+        options.handshake_timeout_ms = Some(200);
+        options.idle_timeout_ms = Some(60_000);
+        let ctx = test_ctx(Arc::new(options), false);
+        let (in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("a silent v1 client was never closed")
+            .unwrap()
+            .unwrap();
+        drop(in_tx);
+    }
+
+    /// A client transport that never accepts a frame, like a peer that has
+    /// stopped reading with its window full.
+    struct StalledSink;
+
+    impl Sink<WispMessage> for StalledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: WispMessage,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn client_that_stops_reading_is_dropped() {
+        let mut options = (*loopback_test_options(6002)).clone();
+        options.idle_timeout_ms = Some(300);
+        let ctx = test_ctx(Arc::new(options), false);
+        let (in_tx, in_rx) = fmpsc::unbounded::<Result<WispMessage, std::io::Error>>();
+        let handle = tokio::spawn(serve_connection(StalledSink, in_rx, ctx));
+        let result = timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("a client that never reads was never dropped")
+            .unwrap();
+        assert!(result.is_err(), "{result:?}");
+        drop(in_tx);
     }
 
     #[test]

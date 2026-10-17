@@ -13,35 +13,45 @@
 //! idle, or by closing the writer's channel so the writer task drains it and
 //! then shuts down. An upstream EOF stops the reader and is reported to the
 //! mux, which sends the FIN and releases the stream once both sides are done.
+//!
+//! Upload credit follows the upstream: a payload the upstream has not taken
+//! yet is held in a [`StreamFlow`], and CONTINUE is granted as the upstream
+//! drains, so a client that honours its credit is paced rather than closed.
+//! Held bytes count against the connection's and the process's byte budgets.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::{lookup_host, TcpStream};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout;
 use tracing::warn;
-use wisp_config::WispServerOptions;
-use wisp_inspect::{inspect, BlockReason, InspectionDecision};
+use wisp_inspect::{BlockReason, InspectionDecision, Inspector};
 use wisp_proxy::{HostPolicy, ProxyError};
 use wisp_wisp::{
     close_reason, encode_close, encode_continue, write_data_header, PACKET_HEADER_LEN,
 };
 
+use crate::budget::{BudgetCharge, Budgets};
 use crate::connection::{EgressSender, ServerContext, WispMessage};
 use crate::proxy_control::ProxyConnectError;
 
 const READ_CHUNK: usize = 128 * 1024;
 const READ_BUFFER_POOL_CAPACITY: usize = 256;
 const WRITE_BATCH_CAPACITY: usize = 64;
+/// Upstream reads shorter than this are copied out of the pooled buffer, so
+/// a frame waiting in the egress queue pins only its own length and not the
+/// whole read buffer the egress budget does not see.
+const COPY_READS_BELOW: usize = 16 * 1024;
 pub(crate) const TCP_SOCKET_BUF: usize = 512 * 1024;
 
 #[derive(Default)]
@@ -127,27 +137,19 @@ enum OpenFail {
     Proxy(ProxyConnectError),
 }
 
+/// Checks `host:port` against the policy, resolves a name through the shared
+/// cached resolver (never the blocking system resolver) and checks every
+/// address it returns.
 pub(crate) async fn resolve_checked(
     host: &str,
     port: u16,
     policy: &HostPolicy,
 ) -> Result<Vec<SocketAddr>, ConnectError> {
-    let addrs: Vec<SocketAddr> = lookup_host((host, port))
-        .await
-        .map_err(|source| ConnectError::DnsLookup {
-            host: host.to_owned(),
-            source,
-        })?
-        .collect();
-    if addrs.is_empty() {
-        return Err(ConnectError::NoAddresses(host.to_owned()));
-    }
-    for sa in &addrs {
-        policy.check_ip(sa.ip())?;
-    }
-    Ok(addrs)
+    Ok(policy.resolve(host, port).await?)
 }
 
+/// Errors worth one more round of dials: the listener was not there yet or
+/// dropped the handshake. A timeout already spent its budget and is final.
 fn connect_error_is_retryable(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -155,17 +157,33 @@ fn connect_error_is_retryable(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::AddrInUse
-            | std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::Interrupted
     )
 }
 
-/// A blackholed IPv6 route never returns, and the dial budget is one timeout
-/// for the whole attempt. Trying IPv4 first reaches a working A record instead
-/// of spending that budget on the AAAA answer.
-fn prefer_ipv4(addrs: &mut [SocketAddr]) {
-    addrs.sort_by_key(|sa| sa.is_ipv6());
+/// Orders addresses for dialing, alternating families and starting with the
+/// preferred one. With staggered attempts a blackholed IPv6 route then costs
+/// one stagger delay, not the whole dial budget.
+fn interleave_families(addrs: &mut Vec<SocketAddr>, ipv6_first: bool) {
+    let (mut first, mut second): (VecDeque<SocketAddr>, VecDeque<SocketAddr>) =
+        addrs.drain(..).partition(|sa| sa.is_ipv6() == ipv6_first);
+    while !first.is_empty() || !second.is_empty() {
+        if let Some(sa) = first.pop_front() {
+            addrs.push(sa);
+        }
+        if let Some(sa) = second.pop_front() {
+            addrs.push(sa);
+        }
+    }
 }
+
+/// While one dial is pending, the next address starts after this long.
+const DIAL_STAGGER: Duration = Duration::from_millis(250);
+/// Addresses dialed for one stream at most.
+const MAX_DIAL_ADDRS: usize = 8;
+/// Pauses before each extra round, taken only when every attempt of the
+/// previous round was refused or reset. Each address gets at most three SYNs.
+const DIAL_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(200)];
 
 pub(crate) async fn connect_checked_tcp(
     host: &str,
@@ -173,31 +191,92 @@ pub(crate) async fn connect_checked_tcp(
     policy: &HostPolicy,
 ) -> Result<TcpStream, ConnectError> {
     let mut addrs = resolve_checked(host, port, policy).await?;
-    prefer_ipv4(&mut addrs);
-    let mut last: Option<std::io::Error> = None;
-    for attempt in 0..8u32 {
-        for sa in &addrs {
-            match TcpStream::connect(*sa).await {
-                Ok(s) => {
-                    tune_tcp(&s);
-                    return Ok(s);
-                }
-                Err(e) => {
-                    let retry = connect_error_is_retryable(&e);
-                    last = Some(e);
-                    if !retry {
-                        continue;
-                    }
+    interleave_families(
+        &mut addrs,
+        matches!(
+            policy.dns.result_order,
+            wisp_config::DnsResultOrder::Ipv6first
+        ),
+    );
+    addrs.truncate(MAX_DIAL_ADDRS);
+    let stream = dial_addrs(&addrs, policy.dns.timeout).await?;
+    tune_tcp(&stream);
+    Ok(stream)
+}
+
+/// Dials `addrs` with staggered starts (each attempt has its own timeout) and
+/// returns the first connection. A round where every attempt was refused or
+/// reset is retried after a short pause, up to [`DIAL_RETRY_BACKOFF`].
+async fn dial_addrs(
+    addrs: &[SocketAddr],
+    per_attempt: Duration,
+) -> Result<TcpStream, ConnectError> {
+    let mut last = None;
+    for backoff in std::iter::once(None).chain(DIAL_RETRY_BACKOFF.iter().map(Some)) {
+        if let Some(delay) = backoff {
+            tokio::time::sleep(*delay).await;
+        }
+        match dial_round(addrs, per_attempt).await {
+            Ok(stream) => return Ok(stream),
+            Err((error, retryable)) => {
+                last = Some(error);
+                if !retryable {
+                    break;
                 }
             }
-        }
-        if attempt + 1 < 8 {
-            tokio::time::sleep(Duration::from_millis(1 << attempt.min(4))).await;
         }
     }
     Err(ConnectError::Tcp(last.unwrap_or_else(|| {
         std::io::Error::other("no address connected")
     })))
+}
+
+async fn dial_one(addr: SocketAddr, per_attempt: Duration) -> std::io::Result<TcpStream> {
+    match timeout(per_attempt, TcpStream::connect(addr)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timed out",
+        )),
+    }
+}
+
+/// One pass over `addrs`. On failure, returns the last error and whether
+/// every attempt failed in a retryable way.
+async fn dial_round(
+    addrs: &[SocketAddr],
+    per_attempt: Duration,
+) -> Result<TcpStream, (std::io::Error, bool)> {
+    let mut attempts = FuturesUnordered::new();
+    let mut next = 0;
+    let mut last: Option<std::io::Error> = None;
+    let mut retryable = true;
+    loop {
+        if attempts.is_empty() {
+            let Some(addr) = addrs.get(next) else {
+                break;
+            };
+            attempts.push(dial_one(*addr, per_attempt));
+            next += 1;
+        }
+        tokio::select! {
+            Some(result) = attempts.next() => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    retryable &= connect_error_is_retryable(&error);
+                    last = Some(error);
+                }
+            },
+            _ = tokio::time::sleep(DIAL_STAGGER), if next < addrs.len() => {
+                attempts.push(dial_one(addrs[next], per_attempt));
+                next += 1;
+            }
+        }
+    }
+    match last {
+        Some(error) => Err((error, retryable)),
+        None => Err((std::io::Error::other("no address to dial"), false)),
+    }
 }
 
 pub(crate) fn tune_tcp(stream: &TcpStream) {
@@ -207,56 +286,269 @@ pub(crate) fn tune_tcp(stream: &TcpStream) {
     let _ = sock.set_send_buffer_size(TCP_SOCKET_BUF);
 }
 
+/// A stream's tasks report back by wire stream ID plus the generation the mux
+/// gave that stream when it opened. The client may reuse an ID right after
+/// CLOSE, so an event whose generation no longer matches the slot belongs to
+/// an earlier stream and is ignored.
 pub(crate) enum TcpEvent {
     Ready {
         stream_id: u32,
+        generation: u64,
         write: OwnedWriteHalf,
-        reader: JoinHandle<()>,
+        reader: ReaderHandle,
+        /// Opens the reader's gate; see [`UpstreamGate`].
+        gate: oneshot::Sender<()>,
     },
     Failed {
         stream_id: u32,
+        generation: u64,
     },
     ReaderDone {
         stream_id: u32,
+        generation: u64,
     },
     WriterDone {
         stream_id: u32,
+        generation: u64,
     },
     ReadEof {
         stream_id: u32,
+        generation: u64,
     },
     WriteShut {
         stream_id: u32,
+        generation: u64,
+    },
+    /// The protocol inspection deadline passed.
+    InspectionTimeout {
+        stream_id: u32,
+        generation: u64,
     },
 }
 
-struct QueuedWrite {
+/// Aborts the reader task when dropped, so a reader whose slot is gone, or
+/// whose `Ready` event never reached the mux, cannot keep forwarding upstream
+/// bytes under a stream ID that may already belong to another stream.
+pub(crate) struct ReaderHandle(JoinHandle<()>);
+
+impl ReaderHandle {
+    pub(crate) fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for ReaderHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Holds the upstream reader back until the client has been told the stream
+/// is open and, when protocol inspection is on, the client's first bytes have
+/// been classified. Without it a server-first service streams to the client
+/// before inspection has judged anything, and its first DATA can overtake the
+/// open-confirmation CONTINUE.
+pub(crate) struct UpstreamGate {
+    tx: Option<oneshot::Sender<()>>,
+    confirmed: bool,
+    classified: bool,
+}
+
+impl UpstreamGate {
+    fn release_if_ready(&mut self) {
+        if self.confirmed && self.classified {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// First client bytes held back while the protocol is classified. The timer
+/// task is aborted when the state is dropped, whether the stream was
+/// classified or torn down.
+pub(crate) struct InspectionState {
+    buf: BytesMut,
+    inspector: Inspector,
+    timer: Option<JoinHandle<()>>,
+}
+
+impl Drop for InspectionState {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+    }
+}
+
+/// Last time a stream moved bytes in either direction. Client DATA, writes
+/// to the upstream and reads from it all reset it, so the stream idle timer
+/// does not cut an upload to an upstream that has nothing to say.
+pub(crate) struct Activity {
+    start: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) fn touch(&self) {
+        self.last_ms
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn idle_for(&self, idle: Option<Duration>) -> bool {
+        let Some(idle) = idle else {
+            return false;
+        };
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        elapsed.saturating_sub(self.last_ms.load(Ordering::Relaxed)) >= idle.as_millis() as u64
+    }
+}
+
+/// Upload credit for one stream. CONTINUE is granted as the upstream takes
+/// the client's bytes rather than as they are queued: after
+/// `continue_threshold` payloads have been written, the client is told how
+/// many more the stream can hold. While the stream holds more than
+/// `max_pending_bytes_per_stream` unwritten bytes no credit is granted.
+pub(crate) struct StreamFlow {
+    counters: Mutex<FlowCounters>,
+    budgets: Budgets,
+    buffer_size: u32,
+    threshold: u32,
+    soft_bytes: usize,
+}
+
+#[derive(Default)]
+struct FlowCounters {
+    held_packets: usize,
+    held_bytes: usize,
+    written_since_grant: u32,
+}
+
+impl StreamFlow {
+    fn new(budgets: Budgets, buffer_size: u32, threshold: u32, soft_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            counters: Mutex::new(FlowCounters::default()),
+            budgets,
+            buffer_size,
+            threshold: threshold.max(1),
+            soft_bytes,
+        })
+    }
+
+    fn for_ctx(ctx: &ServerContext) -> Arc<Self> {
+        Self::new(
+            ctx.ingress.clone(),
+            ctx.server_options.buffer_size,
+            ctx.server_options.continue_threshold,
+            usize::try_from(ctx.options.max_pending_bytes_per_stream).unwrap_or(usize::MAX),
+        )
+    }
+
+    fn counters(&self) -> MutexGuard<'_, FlowCounters> {
+        self.counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Holds `bytes` of one payload until the returned guard is dropped.
+    fn hold(self: &Arc<Self>, bytes: usize) -> HeldBytes {
+        let mut counters = self.counters();
+        counters.held_packets += 1;
+        counters.held_bytes = counters.held_bytes.saturating_add(bytes);
+        drop(counters);
+        HeldBytes {
+            flow: self.clone(),
+            bytes,
+            _charge: self.budgets.charge(bytes),
+        }
+    }
+
+    fn held_packets(&self) -> usize {
+        self.counters().held_packets
+    }
+
+    /// A payload went to the upstream without being held.
+    fn note_written(&self) {
+        let mut counters = self.counters();
+        counters.written_since_grant = counters.written_since_grant.saturating_add(1);
+    }
+
+    /// Credit to grant now, if the upstream has taken enough since the last
+    /// grant. The value is the room left in the client's window.
+    fn take_grant(&self) -> Option<u32> {
+        let mut counters = self.counters();
+        if counters.written_since_grant < self.threshold || counters.held_bytes > self.soft_bytes {
+            return None;
+        }
+        let room = (self.buffer_size as usize).saturating_sub(counters.held_packets);
+        if room == 0 {
+            return None;
+        }
+        counters.written_since_grant = 0;
+        Some(u32::try_from(room).unwrap_or(u32::MAX))
+    }
+}
+
+/// One payload's share of a [`StreamFlow`] and of the byte budgets. Dropping
+/// it means the upstream took the payload, or the stream is gone.
+pub(crate) struct HeldBytes {
+    flow: Arc<StreamFlow>,
+    bytes: usize,
+    _charge: BudgetCharge,
+}
+
+impl Drop for HeldBytes {
+    fn drop(&mut self) {
+        let mut counters = self.flow.counters();
+        counters.held_packets = counters.held_packets.saturating_sub(1);
+        counters.held_bytes = counters.held_bytes.saturating_sub(self.bytes);
+        counters.written_since_grant = counters.written_since_grant.saturating_add(1);
+    }
+}
+
+/// A client payload the upstream has not taken yet.
+pub(crate) struct QueuedWrite {
     data: Bytes,
-    _permit: OwnedSemaphorePermit,
+    _held: HeldBytes,
 }
 
 pub(crate) struct QueuedWriter {
     tx: Option<mpsc::Sender<QueuedWrite>>,
-    byte_budget: Arc<Semaphore>,
     task: JoinHandle<()>,
 }
 
 pub(crate) enum TcpStreamState {
     Connecting {
-        pending: Vec<Bytes>,
-        pending_bytes: usize,
+        pending: Vec<QueuedWrite>,
     },
     Live {
         write: Option<OwnedWriteHalf>,
         queued: Option<QueuedWriter>,
-        inspection_buf: Option<BytesMut>,
-        reader: JoinHandle<()>,
+        inspection: Option<InspectionState>,
+        reader: ReaderHandle,
     },
 }
 
 pub(crate) struct TcpStreamSlot {
     pub state: TcpStreamState,
-    packets_since_continue: u32,
+    /// Distinguishes this stream from earlier ones that used the same wire ID.
+    pub generation: u64,
+    /// Hostname the client asked for; the inspected SNI or Host must match it.
+    host: Option<String>,
+    /// The dial task, aborted with the slot so a stale dial cannot activate a
+    /// later stream or hold a connection open after CLOSE.
+    dial: Option<AbortHandle>,
+    gate: Option<UpstreamGate>,
+    activity: Arc<Activity>,
+    /// Upload credit and held bytes, made with the first payload.
+    flow: Option<Arc<StreamFlow>>,
     /// The client sent FIN; no more DATA is valid.
     pub client_fin: bool,
     /// The upstream write half has been shut down.
@@ -266,13 +558,22 @@ pub(crate) struct TcpStreamSlot {
 }
 
 impl TcpStreamSlot {
+    #[cfg(test)]
     pub(crate) fn connecting() -> Self {
+        Self::connecting_for(0, None)
+    }
+
+    pub(crate) fn connecting_for(generation: u64, host: Option<&str>) -> Self {
         Self {
             state: TcpStreamState::Connecting {
                 pending: Vec::new(),
-                pending_bytes: 0,
             },
-            packets_since_continue: 0,
+            generation,
+            host: host.map(str::to_owned),
+            dial: None,
+            gate: None,
+            activity: Activity::new(),
+            flow: None,
             client_fin: false,
             write_shut: false,
             upstream_eof: false,
@@ -284,25 +585,71 @@ impl TcpStreamSlot {
         self.write_shut && self.upstream_eof
     }
 
-    pub(crate) fn queue_pending(
+    pub(crate) fn set_dial(&mut self, dial: AbortHandle) {
+        self.dial = Some(dial);
+    }
+
+    /// The activity clock the stream's reader idles against.
+    pub(crate) fn activity(&self) -> Arc<Activity> {
+        self.activity.clone()
+    }
+
+    fn flow_for(&mut self, ctx: &ServerContext) -> Arc<StreamFlow> {
+        self.flow
+            .get_or_insert_with(|| StreamFlow::for_ctx(ctx))
+            .clone()
+    }
+
+    /// Installs the gate the reader waits on. `inspecting` is whether the
+    /// client's first bytes still have to be classified.
+    pub(crate) fn set_gate(&mut self, tx: oneshot::Sender<()>, inspecting: bool) {
+        self.gate = Some(UpstreamGate {
+            tx: Some(tx),
+            confirmed: false,
+            classified: !inspecting,
+        });
+    }
+
+    /// The client has been told the stream is open (or needs no telling).
+    pub(crate) fn confirm_open(&mut self) {
+        if let Some(gate) = self.gate.as_mut() {
+            gate.confirmed = true;
+            gate.release_if_ready();
+        }
+    }
+
+    /// Protocol inspection is still waiting on the client's first bytes.
+    pub(crate) fn inspection_pending(&self) -> bool {
+        matches!(
+            &self.state,
+            TcpStreamState::Live {
+                inspection: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Holds DATA that arrived before the dial finished. Only the packet
+    /// count is a hard cap, and a client that honours its credit stays under
+    /// it; the bytes count against the byte budgets, which stop the client
+    /// from being read rather than close the stream.
+    fn queue_pending(
         &mut self,
         payload: Bytes,
+        flow: &Arc<StreamFlow>,
         max_packets: usize,
-        max_bytes: usize,
     ) -> Result<(), u8> {
-        let TcpStreamState::Connecting {
-            pending,
-            pending_bytes,
-        } = &mut self.state
-        else {
+        let TcpStreamState::Connecting { pending } = &mut self.state else {
             return Ok(());
         };
-        let add = payload.len();
-        if pending.len() >= max_packets || pending_bytes.saturating_add(add) > max_bytes {
+        if flow.held_packets() >= max_packets {
             return Err(close_reason::CONN_THROTTLED);
         }
-        pending.push(payload);
-        *pending_bytes += add;
+        let held = flow.hold(payload.len());
+        pending.push(QueuedWrite {
+            data: payload,
+            _held: held,
+        });
         Ok(())
     }
 }
@@ -323,8 +670,19 @@ impl StreamTable {
         self.items.get_mut(&id)
     }
 
+    /// The slot for `id`, only if it is still the stream `generation` opened.
+    pub(crate) fn get_gen_mut(&mut self, id: u32, generation: u64) -> Option<&mut TcpStreamSlot> {
+        self.items
+            .get_mut(&id)
+            .filter(|slot| slot.generation == generation)
+    }
+
     pub(crate) fn contains(&self, id: u32) -> bool {
         self.items.contains_key(&id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     pub(crate) fn insert(&mut self, id: u32, slot: TcpStreamSlot) {
@@ -335,23 +693,37 @@ impl StreamTable {
         self.items.remove(&id)
     }
 
+    /// Removes `id` only if it is still the stream `generation` opened.
+    pub(crate) fn remove_gen(&mut self, id: u32, generation: u64) -> Option<TcpStreamSlot> {
+        if self.get_gen_mut(id, generation).is_some() {
+            self.items.remove(&id)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = (u32, TcpStreamSlot)> + '_ {
         self.items.drain()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tcp_connect(
     stream_id: u32,
+    generation: u64,
     hostname: String,
     port: u16,
     half_close: bool,
+    activity: Arc<Activity>,
     ctx: ServerContext,
     egress: EgressSender,
     events: mpsc::Sender<TcpEvent>,
-) {
+) -> AbortHandle {
     tokio::spawn(async move {
         if let Err(e) = ctx.policy.check(&hostname, port) {
-            warn!(stream_id, %hostname, port, error = %e, "wisp tcp host policy reject");
+            if let Some(rejections) = ctx.reject_log.admit() {
+                warn!(stream_id, host = ?hostname, port, error = ?e.to_string(), rejections, "wisp tcp host policy reject");
+            }
             wisp_reports::emit_report(
                 wisp_reports::ReportErrorType::HostPolicyBlocked,
                 wisp_reports::ReportInput {
@@ -369,7 +741,12 @@ pub(crate) fn spawn_tcp_connect(
                 },
             );
             send_close(&egress, &ctx.cancel, stream_id, close_reason::HOST_BLOCKED).await;
-            let _ = events.send(TcpEvent::Failed { stream_id }).await;
+            let _ = events
+                .send(TcpEvent::Failed {
+                    stream_id,
+                    generation,
+                })
+                .await;
             return;
         }
 
@@ -394,51 +771,97 @@ pub(crate) fn spawn_tcp_connect(
         let upstream = match timeout(connect_timeout, connect_fut).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                warn!(stream_id, %hostname, port, error = %e, "wisp tcp connect failed");
+                if let Some(rejections) = ctx.reject_log.admit() {
+                    warn!(stream_id, host = ?hostname, port, error = ?e.to_string(), rejections, "wisp tcp connect failed");
+                }
                 send_close(&egress, &ctx.cancel, stream_id, close_reason::CONN_REFUSED).await;
-                let _ = events.send(TcpEvent::Failed { stream_id }).await;
+                let _ = events
+                    .send(TcpEvent::Failed {
+                        stream_id,
+                        generation,
+                    })
+                    .await;
                 return;
             }
             Err(_) => {
                 send_close(&egress, &ctx.cancel, stream_id, close_reason::NO_RESPONSE).await;
-                let _ = events.send(TcpEvent::Failed { stream_id }).await;
+                let _ = events
+                    .send(TcpEvent::Failed {
+                        stream_id,
+                        generation,
+                    })
+                    .await;
                 return;
             }
         };
         tune_tcp(&upstream);
 
         let (up_read, write) = upstream.into_split();
-        let reader = spawn_reader(stream_id, up_read, half_close, ctx, egress, events.clone());
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let reader = spawn_reader(
+            stream_id,
+            generation,
+            up_read,
+            half_close,
+            gate_rx,
+            activity,
+            ctx,
+            egress,
+            events.clone(),
+        );
         let _ = events
             .send(TcpEvent::Ready {
                 stream_id,
+                generation,
                 write,
                 reader,
+                gate: gate_tx,
             })
             .await;
-    });
+    })
+    .abort_handle()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_reader(
     stream_id: u32,
+    generation: u64,
     mut up_read: tokio::net::tcp::OwnedReadHalf,
     half_close: bool,
+    gate: oneshot::Receiver<()>,
+    activity: Arc<Activity>,
     ctx: ServerContext,
     egress: EgressSender,
     events: mpsc::Sender<TcpEvent>,
-) -> JoinHandle<()> {
+) -> ReaderHandle {
     let meter_tcp = ctx.tcp_byte_limiter.is_active();
     let idle = ctx
         .options
         .stream_idle_timeout_ms
         .filter(|&ms| ms > 0)
         .map(Duration::from_millis);
-    let start = Instant::now();
-    let last_activity = Arc::new(AtomicU64::new(0));
-    tokio::spawn(async move {
+    ReaderHandle(tokio::spawn(async move {
+        // Nothing is read from upstream until the mux opens the gate. A gate
+        // dropped unopened means the stream was torn down first.
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => return,
+            opened = gate => if opened.is_err() {
+                return;
+            },
+        }
+        activity.touch();
         let pool = read_buffer_pool();
         let mut eof = false;
         'read_loop: loop {
+            // Nothing more is read from the upstream while the client's
+            // egress queue, or the process budget, is full.
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => break,
+                room = egress.room() => if room.is_err() {
+                    break;
+                },
+            }
             let mut buf = pool.take();
             if buf.data.capacity() < PACKET_HEADER_LEN + READ_CHUNK {
                 buf.data
@@ -448,7 +871,7 @@ fn spawn_reader(
             tokio::select! {
                 _ = ctx.cancel.cancelled() => break,
                 _ = idle_wait(idle) => {
-                    if idle_exceeded(&last_activity, start, idle) {
+                    if activity.idle_for(idle) {
                         send_close(&egress, &ctx.cancel, stream_id, close_reason::TRANSFER_TIMEOUT).await;
                         break;
                     }
@@ -486,7 +909,7 @@ fn spawn_reader(
                                 }
                             }
                         }
-                        touch(&last_activity, start);
+                        activity.touch();
                         if meter_tcp
                             && !ctx.tcp_byte_limiter.is_allowed(n as u64)
                         {
@@ -495,7 +918,13 @@ fn spawn_reader(
                             break;
                         }
                         write_data_header(stream_id, &mut buf.data);
-                        let frame = Bytes::from_owner(buf);
+                        let frame = if n < COPY_READS_BELOW {
+                            let frame = Bytes::copy_from_slice(&buf.data);
+                            drop(buf);
+                            frame
+                        } else {
+                            Bytes::from_owner(buf)
+                        };
                         let send_res = tokio::select! {
                             biased;
                             _ = ctx.cancel.cancelled() => break,
@@ -522,12 +951,20 @@ fn spawn_reader(
             }
         }
         // The stream stays open for writing, so its idle timeout still runs.
-        if eof && events.send(TcpEvent::ReadEof { stream_id }).await.is_ok() {
+        if eof
+            && events
+                .send(TcpEvent::ReadEof {
+                    stream_id,
+                    generation,
+                })
+                .await
+                .is_ok()
+        {
             loop {
                 tokio::select! {
                     _ = ctx.cancel.cancelled() => break,
                     _ = idle_wait(idle) => {
-                        if idle_exceeded(&last_activity, start, idle) {
+                        if activity.idle_for(idle) {
                             send_close(&egress, &ctx.cancel, stream_id, close_reason::TRANSFER_TIMEOUT).await;
                             break;
                         }
@@ -535,16 +972,24 @@ fn spawn_reader(
                 }
             }
         }
-        let _ = events.send(TcpEvent::ReaderDone { stream_id }).await;
-    })
+        let _ = events
+            .send(TcpEvent::ReaderDone {
+                stream_id,
+                generation,
+            })
+            .await;
+    }))
 }
 
 pub(crate) enum WriteOutcome {
     Ok,
-    SendContinue,
+    /// Grant the client this much CONTINUE credit for the stream.
+    SendContinue(u32),
     DropStream(u8),
 }
 
+/// Hard cap on the payloads one stream holds unwritten. A client that honours
+/// its credit holds at most two windows (one granted, one still in flight).
 fn write_queue_cap(ctx: &ServerContext) -> usize {
     let pending = usize::try_from(ctx.options.max_pending_packets_per_stream).unwrap_or(128);
     pending.clamp(1, 4096)
@@ -576,16 +1021,17 @@ fn try_write_nonblock(write: &mut OwnedWriteHalf, buf: &[u8]) -> NbWrite {
 }
 
 fn apply_inspection(
-    ibuf: &mut BytesMut,
+    state: &mut InspectionState,
     payload: Bytes,
     inspection_max: usize,
-    options: &WispServerOptions,
+    ctx: &ServerContext,
     stream_id: u32,
 ) -> Result<Option<Bytes>, u8> {
+    let ibuf = &mut state.buf;
     let remaining = inspection_max.saturating_sub(ibuf.len());
     let take = remaining.min(payload.len());
     ibuf.extend_from_slice(&payload[..take]);
-    match inspect(ibuf.as_ref(), options) {
+    match state.inspector.feed(ibuf.as_ref(), &ctx.options) {
         InspectionDecision::Allow(_) => {
             let mut out = ibuf.split();
             if take < payload.len() {
@@ -600,13 +1046,17 @@ fn apply_inspection(
             Ok(None)
         }
         InspectionDecision::Block { reason } => {
-            warn!(
-                stream_id,
-                ?reason,
-                "wisp tcp protocol inspection blocked stream"
-            );
+            if let Some(rejections) = ctx.reject_log.admit() {
+                warn!(
+                    stream_id,
+                    ?reason,
+                    rejections,
+                    "wisp tcp protocol inspection blocked stream"
+                );
+            }
             Err(match reason {
                 BlockReason::ProtocolNotAllowed
+                | BlockReason::HostMismatch
                 | BlockReason::H2cDisallowed
                 | BlockReason::TlsWithoutAlpnDisallowed
                 | BlockReason::QuicInitialDisallowed => close_reason::HOST_BLOCKED,
@@ -616,13 +1066,17 @@ fn apply_inspection(
     }
 }
 
-fn accepted_packet(counter: &mut u32, threshold: u32) -> WriteOutcome {
-    *counter = counter.saturating_add(1);
-    if *counter >= threshold {
-        *counter = 0;
-        WriteOutcome::SendContinue
-    } else {
-        WriteOutcome::Ok
+fn grant_outcome(flow: &StreamFlow) -> WriteOutcome {
+    flow.take_grant()
+        .map_or(WriteOutcome::Ok, WriteOutcome::SendContinue)
+}
+
+/// The upstream took a payload: release what it held, or count it if it was
+/// never held.
+fn taken(flow: &StreamFlow, held: Option<HeldBytes>) {
+    match held {
+        Some(held) => drop(held),
+        None => flow.note_written(),
     }
 }
 
@@ -636,16 +1090,28 @@ pub(crate) fn write_upstream(
     egress: &EgressSender,
     events: &mpsc::Sender<TcpEvent>,
 ) -> WriteOutcome {
+    slot.activity.touch();
     if matches!(slot.state, TcpStreamState::Connecting { .. }) {
-        let max_packets = write_queue_cap(ctx);
-        let max_pending =
-            usize::try_from(ctx.options.max_pending_bytes_per_stream).unwrap_or(usize::MAX);
-        if let Err(reason) = slot.queue_pending(payload, max_packets, max_pending) {
+        let flow = slot.flow_for(ctx);
+        if let Err(reason) = slot.queue_pending(payload, &flow, write_queue_cap(ctx)) {
             return WriteOutcome::DropStream(reason);
         }
         return WriteOutcome::Ok;
     }
+    write_live(slot, payload, None, stream_id, ctx, egress, events)
+}
 
+/// Writes one payload to a live stream. `held` is set when the payload was
+/// already held while the stream was connecting.
+fn write_live(
+    slot: &mut TcpStreamSlot,
+    payload: Bytes,
+    held: Option<HeldBytes>,
+    stream_id: u32,
+    ctx: &ServerContext,
+    egress: &EgressSender,
+    events: &mpsc::Sender<TcpEvent>,
+) -> WriteOutcome {
     if ctx.tcp_byte_limiter.is_active() && !ctx.tcp_byte_limiter.is_allowed(payload.len() as u64) {
         warn!(
             stream_id,
@@ -654,29 +1120,36 @@ pub(crate) fn write_upstream(
         return WriteOutcome::DropStream(close_reason::CONN_THROTTLED);
     }
 
+    let generation = slot.generation;
+    let flow = slot.flow_for(ctx);
+    let activity = slot.activity.clone();
     let TcpStreamState::Live {
         write,
         queued,
-        inspection_buf,
+        inspection,
         ..
     } = &mut slot.state
     else {
         return WriteOutcome::Ok;
     };
 
-    let payload = if let Some(buffer) = inspection_buf.as_mut() {
+    let payload = if let Some(state) = inspection.as_mut() {
         let inspection_max =
             usize::try_from(ctx.options.protocol_inspection_max_bytes).unwrap_or(usize::MAX);
-        match apply_inspection(buffer, payload, inspection_max, &ctx.options, stream_id) {
+        match apply_inspection(state, payload, inspection_max, ctx, stream_id) {
             Ok(Some(payload)) => {
-                *inspection_buf = None;
+                *inspection = None;
+                if let Some(gate) = slot.gate.as_mut() {
+                    gate.classified = true;
+                    gate.release_if_ready();
+                }
                 payload
             }
             Ok(None) => {
-                return accepted_packet(
-                    &mut slot.packets_since_continue,
-                    ctx.server_options.continue_threshold,
-                );
+                // The inspection buffer, capped at protocol_inspection_max_bytes,
+                // took the bytes.
+                taken(&flow, held);
+                return grant_outcome(&flow);
             }
             Err(reason) => return WriteOutcome::DropStream(reason),
         }
@@ -687,30 +1160,29 @@ pub(crate) fn write_upstream(
     if let Some(write_half) = write.as_mut() {
         match try_write_nonblock(write_half, &payload) {
             NbWrite::Done => {
-                return accepted_packet(
-                    &mut slot.packets_since_continue,
-                    ctx.server_options.continue_threshold,
-                );
+                taken(&flow, held);
+                return grant_outcome(&flow);
             }
             NbWrite::Wrote(n) => {
                 let rest = payload.slice(n..);
+                let held = held.unwrap_or_else(|| flow.hold(rest.len()));
                 let write_half = write.take().expect("write half present");
-                let Some(writer) = spawn_writer(
+                *queued = Some(spawn_writer(
                     stream_id,
+                    generation,
                     write_half,
-                    rest,
+                    QueuedWrite {
+                        data: rest,
+                        _held: held,
+                    },
+                    flow,
+                    activity,
                     ctx.clone(),
                     egress.clone(),
                     events.clone(),
                     write_queue_cap(ctx),
-                ) else {
-                    return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
-                };
-                *queued = Some(writer);
-                return accepted_packet(
-                    &mut slot.packets_since_continue,
-                    ctx.server_options.continue_threshold,
-                );
+                ));
+                return WriteOutcome::Ok;
             }
             NbWrite::Failed => {
                 return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
@@ -724,22 +1196,21 @@ pub(crate) fn write_upstream(
     let Some(tx) = writer.tx.as_ref() else {
         return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
     };
-    let permit_count = u32::try_from(payload.len().max(1)).unwrap_or(u32::MAX);
-    let Ok(permit) = writer
-        .byte_budget
-        .clone()
-        .try_acquire_many_owned(permit_count)
-    else {
-        return WriteOutcome::DropStream(close_reason::CONN_THROTTLED);
+    let held = match held {
+        Some(held) => held,
+        None => {
+            // Past two windows the client is ignoring its credit.
+            if flow.held_packets() >= write_queue_cap(ctx) {
+                return WriteOutcome::DropStream(close_reason::CONN_THROTTLED);
+            }
+            flow.hold(payload.len())
+        }
     };
     match tx.try_send(QueuedWrite {
         data: payload,
-        _permit: permit,
+        _held: held,
     }) {
-        Ok(()) => accepted_packet(
-            &mut slot.packets_since_continue,
-            ctx.server_options.continue_threshold,
-        ),
+        Ok(()) => WriteOutcome::Ok,
         Err(mpsc::error::TrySendError::Full(_)) => {
             WriteOutcome::DropStream(close_reason::CONN_THROTTLED)
         }
@@ -754,7 +1225,7 @@ pub(crate) fn write_upstream(
 pub(crate) async fn activate_writer(
     slot: &mut TcpStreamSlot,
     write: OwnedWriteHalf,
-    reader: JoinHandle<()>,
+    reader: ReaderHandle,
     stream_id: u32,
     ctx: &ServerContext,
     egress: &EgressSender,
@@ -771,18 +1242,25 @@ pub(crate) async fn activate_writer(
     slot.state = TcpStreamState::Live {
         write: Some(write),
         queued: None,
-        inspection_buf: ctx.options.protocol_inspection.then(BytesMut::new),
+        inspection: ctx.options.protocol_inspection.then(|| InspectionState {
+            buf: BytesMut::new(),
+            inspector: Inspector::new(slot.host.as_deref()),
+            timer: Some(spawn_inspection_timer(
+                stream_id,
+                slot.generation,
+                ctx,
+                events,
+            )),
+        }),
         reader,
     };
-    for payload in pending {
-        match write_upstream(slot, payload, stream_id, ctx, egress, events) {
+    for queued in pending {
+        let QueuedWrite { data, _held: held } = queued;
+        match write_live(slot, data, Some(held), stream_id, ctx, egress, events) {
             WriteOutcome::DropStream(reason) => return WriteOutcome::DropStream(reason),
-            WriteOutcome::SendContinue => {
+            WriteOutcome::SendContinue(credit) => {
                 if egress
-                    .send(WispMessage::Binary(encode_continue(
-                        stream_id,
-                        ctx.server_options.buffer_size,
-                    )))
+                    .send(WispMessage::Binary(encode_continue(stream_id, credit)))
                     .await
                     .is_err()
                 {
@@ -806,15 +1284,15 @@ pub(crate) async fn shutdown_upstream_write(slot: &mut TcpStreamSlot) -> WriteOu
     let TcpStreamState::Live {
         write,
         queued,
-        inspection_buf,
+        inspection,
         ..
     } = &mut slot.state
     else {
         return WriteOutcome::Ok;
     };
-    if inspection_buf
+    if inspection
         .as_ref()
-        .is_some_and(|buffer| !buffer.is_empty())
+        .is_some_and(|state| !state.buf.is_empty())
     {
         return WriteOutcome::DropStream(close_reason::HOST_BLOCKED);
     }
@@ -834,32 +1312,24 @@ pub(crate) async fn shutdown_upstream_write(slot: &mut TcpStreamSlot) -> WriteOu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_writer(
     stream_id: u32,
+    generation: u64,
     mut write: OwnedWriteHalf,
-    first: Bytes,
+    first: QueuedWrite,
+    flow: Arc<StreamFlow>,
+    activity: Arc<Activity>,
     ctx: ServerContext,
     egress: EgressSender,
     events: mpsc::Sender<TcpEvent>,
     queue_capacity: usize,
-) -> Option<QueuedWriter> {
-    let byte_capacity = usize::try_from(ctx.options.max_pending_bytes_per_stream)
-        .unwrap_or(usize::MAX)
-        .min(u32::MAX as usize);
-    let byte_budget = Arc::new(Semaphore::new(byte_capacity));
-    let first_permits = u32::try_from(first.len().max(1)).ok()?;
-    let permit = byte_budget
-        .clone()
-        .try_acquire_many_owned(first_permits)
-        .ok()?;
-    let (tx, mut rx) = mpsc::channel::<QueuedWrite>(queue_capacity);
+) -> QueuedWriter {
+    let (tx, mut rx) = mpsc::channel::<QueuedWrite>(queue_capacity.max(1));
     let task = tokio::spawn(async move {
         let run = async {
             let mut batch = VecDeque::with_capacity(WRITE_BATCH_CAPACITY);
-            batch.push_back(QueuedWrite {
-                data: first,
-                _permit: permit,
-            });
+            batch.push_back(first);
             loop {
                 while batch.len() < WRITE_BATCH_CAPACITY {
                     match rx.try_recv() {
@@ -868,9 +1338,20 @@ fn spawn_writer(
                         Err(mpsc::error::TryRecvError::Disconnected) => break,
                     }
                 }
-                write_batch_cancel(&mut write, &mut batch, &ctx.cancel)
+                write_batch_cancel(&mut write, &mut batch, &activity, &ctx.cancel)
                     .await
                     .map_err(|()| close_reason::NETWORK_ERROR)?;
+                // Credit follows what the upstream has taken.
+                if let Some(credit) = flow.take_grant() {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = ctx.cancel.cancelled() => return Ok(false),
+                        r = egress.send(WispMessage::Binary(encode_continue(stream_id, credit))) => r,
+                    };
+                    if sent.is_err() {
+                        return Ok(false);
+                    }
+                }
                 let queued = tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => return Ok(false),
@@ -891,26 +1372,68 @@ fn spawn_writer(
 
         match run.await {
             Ok(true) => {
-                let _ = events.send(TcpEvent::WriteShut { stream_id }).await;
+                let _ = events
+                    .send(TcpEvent::WriteShut {
+                        stream_id,
+                        generation,
+                    })
+                    .await;
             }
             Ok(false) => {
-                let _ = events.send(TcpEvent::WriterDone { stream_id }).await;
+                let _ = events
+                    .send(TcpEvent::WriterDone {
+                        stream_id,
+                        generation,
+                    })
+                    .await;
             }
             Err(reason) => {
                 send_close(&egress, &ctx.cancel, stream_id, reason).await;
-                let _ = events.send(TcpEvent::WriterDone { stream_id }).await;
+                let _ = events
+                    .send(TcpEvent::WriterDone {
+                        stream_id,
+                        generation,
+                    })
+                    .await;
             }
         }
     });
-    Some(QueuedWriter {
-        tx: Some(tx),
-        byte_budget,
-        task,
+    QueuedWriter { tx: Some(tx), task }
+}
+
+/// Starts the clock on a stream's protocol inspection. Like WebTransport, an
+/// unset `protocol_inspection_timeout_ms` means the 10 s default, never no limit.
+fn spawn_inspection_timer(
+    stream_id: u32,
+    generation: u64,
+    ctx: &ServerContext,
+    events: &mpsc::Sender<TcpEvent>,
+) -> JoinHandle<()> {
+    let limit = Duration::from_millis(
+        ctx.options
+            .protocol_inspection_timeout_ms
+            .unwrap_or(10_000)
+            .max(1),
+    );
+    let events = events.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(limit).await;
+        let _ = events
+            .send(TcpEvent::InspectionTimeout {
+                stream_id,
+                generation,
+            })
+            .await;
     })
 }
 
-pub(crate) fn drop_slot(slot: TcpStreamSlot) {
-    if let TcpStreamState::Live { queued, reader, .. } = slot.state {
+/// Tears down every task a slot owns. Dropping the slot aborts the reader
+/// and the inspection timer; the dial and the writer are aborted here.
+pub(crate) fn drop_slot(mut slot: TcpStreamSlot) {
+    if let Some(dial) = slot.dial.take() {
+        dial.abort();
+    }
+    if let TcpStreamState::Live { queued, reader, .. } = &slot.state {
         if let Some(writer) = queued {
             writer.task.abort();
         }
@@ -935,6 +1458,7 @@ fn advance_write_batch(batch: &mut VecDeque<QueuedWrite>, mut written: usize) {
 async fn write_batch_cancel(
     write: &mut OwnedWriteHalf,
     batch: &mut VecDeque<QueuedWrite>,
+    activity: &Activity,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), ()> {
     while !batch.is_empty() {
@@ -947,7 +1471,10 @@ async fn write_batch_cancel(
         let slices = &slices[..slice_count];
         match write.try_write_vectored(slices) {
             Ok(0) => return Err(()),
-            Ok(n) => advance_write_batch(batch, n),
+            Ok(n) => {
+                activity.touch();
+                advance_write_batch(batch, n);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 let written = tokio::select! {
                     biased;
@@ -957,6 +1484,7 @@ async fn write_batch_cancel(
                 if written == 0 {
                     return Err(());
                 }
+                activity.touch();
                 advance_write_batch(batch, written);
             }
             Err(_) => return Err(()),
@@ -976,18 +1504,6 @@ pub(crate) async fn send_close(
         _ = cancel.cancelled() => Ok(()),
         r = egress.send(WispMessage::Binary(encode_close(stream_id, reason))) => r.map_err(|_| ()),
     };
-}
-
-fn touch(last: &AtomicU64, start: Instant) {
-    last.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-}
-
-fn idle_exceeded(last: &AtomicU64, start: Instant, idle: Option<Duration>) -> bool {
-    let Some(idle) = idle else {
-        return false;
-    };
-    let elapsed = start.elapsed().as_millis() as u64;
-    elapsed.saturating_sub(last.load(Ordering::Relaxed)) >= idle.as_millis() as u64
 }
 
 async fn idle_wait(idle: Option<Duration>) {
@@ -1065,26 +1581,52 @@ mod tests {
         assert!(t.get_mut(2).is_some());
     }
 
-    #[test]
-    fn continue_threshold_counts_packets() {
-        let mut packets = 0;
-        for _ in 0..3 {
-            assert!(matches!(accepted_packet(&mut packets, 4), WriteOutcome::Ok));
-        }
-        assert!(matches!(
-            accepted_packet(&mut packets, 4),
-            WriteOutcome::SendContinue
-        ));
-        assert_eq!(packets, 0);
+    fn test_flow(buffer_size: u32, threshold: u32, soft_bytes: usize) -> Arc<StreamFlow> {
+        StreamFlow::new(
+            Budgets::for_connection(1 << 20),
+            buffer_size,
+            threshold,
+            soft_bytes,
+        )
     }
 
     #[test]
-    fn connecting_queue_has_independent_byte_cap() {
-        let mut slot = TcpStreamSlot::connecting();
-        assert!(slot
-            .queue_pending(Bytes::from_static(b"1234"), 2, 4)
-            .is_ok());
-        assert!(slot.queue_pending(Bytes::from_static(b"5"), 2, 4).is_err());
+    fn credit_is_granted_as_the_upstream_takes_payloads() {
+        let flow = test_flow(8, 4, 1 << 20);
+        let held: Vec<HeldBytes> = (0..6).map(|_| flow.hold(10)).collect();
+        assert_eq!(flow.take_grant(), None, "nothing written yet");
+        let mut held = held.into_iter();
+        for _ in 0..3 {
+            drop(held.next());
+        }
+        assert_eq!(flow.take_grant(), None, "three of four written");
+        flow.note_written();
+        // Four written, three still held: the window has five slots left.
+        assert_eq!(flow.take_grant(), Some(5));
+        assert_eq!(flow.take_grant(), None, "the count restarts after a grant");
+    }
+
+    #[test]
+    fn credit_waits_while_the_stream_holds_too_many_bytes() {
+        let flow = test_flow(8, 1, 100);
+        let big = flow.hold(150);
+        flow.note_written();
+        assert_eq!(flow.take_grant(), None, "150 held bytes exceed 100");
+        drop(big);
+        assert_eq!(flow.take_grant(), Some(8));
+    }
+
+    #[test]
+    fn held_bytes_count_against_the_connection_budget() {
+        let budgets = Budgets::for_connection(100);
+        let flow = StreamFlow::new(budgets.clone(), 8, 4, 1 << 20);
+        let first = flow.hold(60);
+        let second = flow.hold(60);
+        assert_eq!(budgets.connection_used(), 120);
+        assert!(!budgets.has_room());
+        drop(first);
+        drop(second);
+        assert_eq!(budgets.connection_used(), 0);
     }
 
     #[test]
@@ -1092,20 +1634,92 @@ mod tests {
         let v6 = SocketAddr::from(([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1], 443));
         let v4 = SocketAddr::from(([1, 2, 3, 4], 443));
         let v6_later = SocketAddr::from(([0x2001, 0x0db8, 0, 0, 0, 0, 0, 2], 443));
+        let v4_later = SocketAddr::from(([1, 2, 3, 5], 443));
         let mut addrs = vec![v6, v4, v6_later];
-        prefer_ipv4(&mut addrs);
-        assert_eq!(addrs[0], v4);
-        assert!(addrs[1].is_ipv6());
-        assert!(addrs[2].is_ipv6());
-        assert_eq!(addrs[1], v6);
-        assert_eq!(addrs[2], v6_later);
+        interleave_families(&mut addrs, false);
+        assert_eq!(addrs, vec![v4, v6, v6_later]);
+        let mut addrs = vec![v6, v4, v6_later, v4_later];
+        interleave_families(&mut addrs, false);
+        assert_eq!(addrs, vec![v4, v6, v4_later, v6_later]);
+        let mut addrs = vec![v4, v4_later, v6];
+        interleave_families(&mut addrs, true);
+        assert_eq!(addrs, vec![v6, v4, v4_later]);
+    }
+
+    #[tokio::test]
+    async fn blackholed_first_address_does_not_starve_the_next() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        // TEST-NET-1 is not routed, so this attempt hangs until its timeout.
+        let dead = SocketAddr::from(([192, 0, 2, 1], live.port()));
+        let started = Instant::now();
+        let stream = dial_addrs(&[dead, live], Duration::from_secs(5))
+            .await
+            .expect("the second address connects");
+        assert_eq!(stream.peer_addr().unwrap(), live);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the second attempt starts after the stagger, not after the first times out"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_dials_are_retried_a_bounded_number_of_times() {
+        use tokio::net::TcpListener;
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let started = Instant::now();
+        let err = dial_addrs(&[addr], Duration::from_secs(1))
+            .await
+            .expect_err("nothing listens");
+        assert!(
+            matches!(err, ConnectError::Tcp(e) if e.kind() == std::io::ErrorKind::ConnectionRefused)
+        );
+        // Three rounds with 50 ms and 200 ms pauses, not eight with backoff.
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn resolve_checked_rejects_numeric_aliases_and_blocked_addresses() {
+        let policy = HostPolicy::from_options(&WispServerOptions {
+            allow_direct_ip: false,
+            ..WispServerOptions::default()
+        });
+        for host in ["16843009", "0x01010101", "1.1.1", "0177.0.0.1"] {
+            assert!(
+                matches!(
+                    resolve_checked(host, 443, &policy).await,
+                    Err(ConnectError::Policy(ProxyError::InvalidHost))
+                ),
+                "{host}"
+            );
+        }
+        let policy = HostPolicy::from_options(&WispServerOptions {
+            allow_direct_ip: true,
+            ip_blacklist: Some(vec!["203.0.113.0/24".to_owned()]),
+            ..WispServerOptions::default()
+        });
+        assert!(matches!(
+            resolve_checked("203.0.113.9", 443, &policy).await,
+            Err(ConnectError::Policy(ProxyError::HostBlocked(_)))
+        ));
     }
 
     #[test]
-    fn connecting_queue_has_packet_cap() {
+    fn connecting_queue_has_packet_cap_but_no_byte_cap() {
         let mut slot = TcpStreamSlot::connecting();
-        assert!(slot.queue_pending(Bytes::from_static(b"1"), 1, 4).is_ok());
-        assert!(slot.queue_pending(Bytes::from_static(b"2"), 1, 4).is_err());
+        let flow = test_flow(8, 4, 4);
+        assert!(slot
+            .queue_pending(Bytes::from_static(b"larger than the soft cap"), &flow, 2)
+            .is_ok());
+        assert!(slot
+            .queue_pending(Bytes::from_static(b"2"), &flow, 2)
+            .is_ok());
+        assert!(slot
+            .queue_pending(Bytes::from_static(b"3"), &flow, 2)
+            .is_err());
     }
 
     #[tokio::test]
@@ -1162,9 +1776,49 @@ mod tests {
             port_whitelist: Some(vec![80, 443]),
             ..WispServerOptions::default()
         });
-        let addrs = resolve_checked("127.0.0.1", 9, &policy)
+        // The dial path checks the whole policy, port included, not only the
+        // resolved addresses.
+        assert!(matches!(
+            resolve_checked("127.0.0.1", 9, &policy).await,
+            Err(ConnectError::Policy(ProxyError::PortBlocked(9)))
+        ));
+        let addrs = resolve_checked("127.0.0.1", 443, &policy)
             .await
             .expect("loopback allowed");
         assert!(addrs.iter().all(|a| a.ip().is_loopback()));
+    }
+
+    #[test]
+    fn stream_table_ignores_a_stale_generation() {
+        let mut t = StreamTable::new();
+        t.insert(5, TcpStreamSlot::connecting_for(1, None));
+        assert!(t.remove(5).is_some());
+        t.insert(5, TcpStreamSlot::connecting_for(2, None));
+        assert!(t.get_gen_mut(5, 1).is_none());
+        assert!(t.remove_gen(5, 1).is_none());
+        assert!(t.contains(5), "the reused ID still holds the new stream");
+        assert!(t.get_gen_mut(5, 2).is_some());
+        assert!(t.remove_gen(5, 2).is_some());
+        assert!(!t.contains(5));
+    }
+
+    #[test]
+    fn upstream_gate_opens_only_after_confirmation_and_classification() {
+        let mut slot = TcpStreamSlot::connecting();
+        let (tx, mut rx) = oneshot::channel();
+        slot.set_gate(tx, true);
+        slot.confirm_open();
+        assert!(rx.try_recv().is_err(), "unclassified stream stays gated");
+        let gate = slot.gate.as_mut().unwrap();
+        gate.classified = true;
+        gate.release_if_ready();
+        assert!(rx.try_recv().is_ok());
+
+        let mut slot = TcpStreamSlot::connecting();
+        let (tx, mut rx) = oneshot::channel();
+        slot.set_gate(tx, false);
+        assert!(rx.try_recv().is_err(), "unconfirmed stream stays gated");
+        slot.confirm_open();
+        assert!(rx.try_recv().is_ok());
     }
 }

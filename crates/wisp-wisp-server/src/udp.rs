@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, warn};
 use wisp_dos::{datagram_limit_decision, datagram_limits_active, DatagramDecision};
 use wisp_wisp::{
@@ -21,20 +22,69 @@ pub enum UdpStreamMsg {
     Close,
 }
 
+/// The mux's handle on one UDP flow. `generation` tells a flow apart from an
+/// earlier one that used the same wire stream ID, and `abort` ends the task
+/// even while it is still resolving the destination.
+#[derive(Clone)]
+pub(crate) struct UdpHandle {
+    tx: mpsc::Sender<UdpStreamMsg>,
+    pub(crate) generation: u64,
+    abort: AbortHandle,
+}
+
+impl UdpHandle {
+    pub(crate) fn try_send(
+        &self,
+        msg: UdpStreamMsg,
+    ) -> Result<(), mpsc::error::TrySendError<UdpStreamMsg>> {
+        self.tx.try_send(msg)
+    }
+
+    pub(crate) async fn send(
+        &self,
+        msg: UdpStreamMsg,
+    ) -> Result<(), mpsc::error::SendError<UdpStreamMsg>> {
+        self.tx.send(msg).await
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    pub(crate) fn abort(&self) {
+        self.abort.abort();
+    }
+}
+
+/// Aborts the wrapped task when dropped, so cancelling a flow's task also
+/// stops the receive task it spawned.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) fn spawn_udp_stream(
     stream_id: u32,
+    generation: u64,
     hostname: String,
     port: u16,
     ctx: ServerContext,
     egress: EgressSender,
-    done_tx: mpsc::Sender<u32>,
-) -> mpsc::Sender<UdpStreamMsg> {
+    done_tx: mpsc::Sender<(u32, u64)>,
+) -> UdpHandle {
     let (tx, rx) = mpsc::channel::<UdpStreamMsg>(2048);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         run_udp(stream_id, hostname, port, ctx, egress, rx).await;
-        let _ = done_tx.send(stream_id).await;
+        let _ = done_tx.send((stream_id, generation)).await;
     });
-    tx
+    UdpHandle {
+        tx,
+        generation,
+        abort: task.abort_handle(),
+    }
 }
 
 async fn send_close(
@@ -58,16 +108,45 @@ async fn run_udp(
     egress: EgressSender,
     mut rx: mpsc::Receiver<UdpStreamMsg>,
 ) {
-    if let Err(e) = ctx.policy.check(&hostname, port) {
-        warn!(stream_id, %hostname, port, error = %e, "wisp udp host policy reject");
+    let host = match ctx.policy.check_udp_host(&hostname, port) {
+        Ok(host) => host,
+        Err(e) => {
+            if let Some(rejections) = ctx.reject_log.admit() {
+                warn!(stream_id, ?hostname, port, error = ?e.to_string(), rejections, "wisp udp host policy reject");
+            }
+            send_close(&egress, &ctx.cancel, stream_id, close_reason::HOST_BLOCKED).await;
+            return;
+        }
+    };
+
+    // UDP cannot go through a proxy. Where TCP to this host would be
+    // proxied, or proxying is mandatory, a direct flow would show the
+    // server's own address, so it is refused instead.
+    let proxied = ctx.options.force_proxy
+        || ctx
+            .proxy_controller
+            .as_ref()
+            .is_some_and(|controller| controller.routes_through_proxy(&host.to_string()));
+    if proxied {
+        if let Some(rejections) = ctx.reject_log.admit() {
+            warn!(
+                stream_id,
+                ?hostname,
+                port,
+                rejections,
+                "wisp udp rejected: destination requires a proxy"
+            );
+        }
         send_close(&egress, &ctx.cancel, stream_id, close_reason::HOST_BLOCKED).await;
         return;
     }
 
-    let peer = match crate::stream::resolve_checked(&hostname, port, &ctx.policy).await {
+    let peer = match ctx.policy.resolve_checked(&host, port).await {
         Ok(addrs) => addrs[0],
         Err(e) => {
-            warn!(stream_id, %hostname, port, error = %e, "wisp udp connect rejected");
+            if let Some(rejections) = ctx.reject_log.admit() {
+                warn!(stream_id, ?hostname, port, error = ?e.to_string(), rejections, "wisp udp connect rejected");
+            }
             send_close(
                 &egress,
                 &ctx.cancel,
@@ -92,7 +171,7 @@ async fn run_udp(
         }
     };
     if let Err(e) = socket.connect(peer).await {
-        warn!(stream_id, %hostname, port, error = %e, "wisp udp connect failed");
+        warn!(stream_id, ?hostname, port, error = ?e.to_string(), "wisp udp connect failed");
         send_close(
             &egress,
             &ctx.cancel,
@@ -125,7 +204,7 @@ async fn run_udp(
     let recv_ctx = ctx.clone();
     let recv_last = Arc::clone(&last_activity);
     let recv_idle = idle;
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = AbortOnDrop(tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(PACKET_HEADER_LEN + 65_536);
         loop {
             buf.resize(PACKET_HEADER_LEN + 65_536, 0);
@@ -188,7 +267,7 @@ async fn run_udp(
                 }
             }
         }
-    });
+    }));
 
     loop {
         let msg = tokio::select! {
@@ -252,8 +331,8 @@ async fn run_udp(
         }
     }
     drop(socket);
-    recv_task.abort();
-    let _ = recv_task.await;
+    recv_task.0.abort();
+    let _ = (&mut recv_task.0).await;
 }
 
 fn touch(last: &AtomicU64, start: Instant) {

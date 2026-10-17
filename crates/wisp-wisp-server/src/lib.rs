@@ -10,17 +10,19 @@
 
 #![forbid(unsafe_code)]
 
+mod budget;
 mod connection;
 mod proxy_control;
 mod stream;
 mod udp;
 
+pub use budget::{buffered_bytes_total, set_max_buffered_bytes_total};
 pub use connection::{
     serve_connection, ServerContext, ServerError, ServerOptions, TransportError, WispMessage,
 };
 pub use proxy_control::{
     handle_proxy_control_text, ProxyConnectError, ProxyControlError, ProxyControlLimits,
-    ProxyControlRequest, ProxyController, ProxyControllerTemplate, ProxyRouteConfig,
-    ProxyRouteSnapshot, ProxyRuntimePolicy,
+    ProxyControlRequest, ProxyController, ProxyControllerTemplate, ProxyHopLimits,
+    ProxyRouteConfig, ProxyRouteSnapshot, ProxyRuntimePolicy,
 };
 pub use stream::ConnectError;
