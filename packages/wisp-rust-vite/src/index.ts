@@ -8,6 +8,28 @@ import { connect as connectTls } from "node:tls";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { TomlTable, TomlValue } from "smol-toml";
 import type { Plugin, ProxyOptions, UserConfig } from "vite";
+import {
+  EDGE_SECRET_HEADER,
+  ProxyRejection,
+  WebSocketLimiter,
+  assertSameOrigin,
+  buildUpstreamRequestHeaders,
+  buildUpstreamSocketHeaders,
+  buildUpstreamUrl,
+  canonicalIp,
+  createEdgeTrust,
+  filterUpstreamResponseHeaders,
+  forwardableCloseCode,
+  generateEdgeSecret,
+  isAuthorityPath,
+  isTrustedEdgePeer,
+  mirroredRejectionStatus,
+  positiveIntegerEnv,
+  probeUpstreamStatus,
+  resolveCanonicalClientIp,
+  truncateCloseReason,
+} from "./front-proxy.js";
+import type { EdgeTrust, WebSocketSlot } from "./front-proxy.js";
 
 export type WispRuntimeInput =
   | {
@@ -124,6 +146,11 @@ export type WispRustRuntimeOptions = {
   native?: WispRustNativeModule;
   resolvedWsPort?: number;
   trustedBunFront?: boolean;
+  /**
+   * Secret the native listener requires from the front in trusted_edge mode. Generated per
+   * process when trustedBunFront is set and this is left out.
+   */
+  trustedEdgeSecret?: string;
 };
 
 export type WispRustViteOptions = WispRustRuntimeOptions & {
@@ -142,6 +169,8 @@ export type WispRustProxyContext = {
   proxyPath: string;
   endpointPath: string;
   target: string;
+  /** Present in trusted_edge mode: the secret the native listener expects on each upgrade */
+  edgeSecret?: string;
 };
 
 type RuntimeStatus = Record<string, unknown>;
@@ -161,6 +190,7 @@ type UpgradeServer = ClosableServer & {
 };
 type BunProxySocket = {
   send(data: string | Buffer): number;
+  getBufferedAmount?(): number;
   close(code?: number, reason?: string): unknown;
 };
 type BunAdapterProxySocketData = {
@@ -173,6 +203,7 @@ type BunUpgradeApi = {
     request: Request,
     options: { data: BunAdapterProxySocketData },
   ): boolean;
+  requestIP?(request: Request): { address: string } | null;
 };
 type BunMiddlewareStack = {
   use(
@@ -193,6 +224,9 @@ const DEFAULT_AUTHENTICATED_PROFILE = "authenticated";
 const DEFAULT_AUTHENTICATED_PROVIDERS = ["mullvad", "resi", "mysterium"];
 const MAX_BUN_PENDING_BYTES = 1024 * 1024;
 const BUN_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_WEBSOCKETS = 2048;
+const DEFAULT_MAX_WEBSOCKETS_PER_IP = 128;
+const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 export const DEFAULT_WISP_RUST_VITE_TOML = `
 [wisp.server]
 endpoint = "/wisp/"
@@ -225,6 +259,7 @@ const MULTIPLIED_LIMIT_FIELDS = new Set([
   "maxPendingPacketsPerStream",
   "maxPendingBytesPerStream",
   "maxEgressQueueBytes",
+  "maxIngressBytesPerConnection",
   "maxSessionHops",
   "maxDailyHopsPerIp",
   "maxConnectionStartsPerIpPerMinute",
@@ -254,14 +289,22 @@ const MULTIPLIED_LIMIT_FIELDS = new Set([
 export class WispRustRuntime {
   readonly native: WispRustNativeModule;
   readonly instance: WispRust;
+  /** Secret sent on every upgrade to the native listener, set only in trusted_edge mode */
+  readonly edgeSecret: string | undefined;
 
   private startPromise: Promise<RuntimeStatus> | undefined;
   private stopPromise: Promise<RuntimeStatus> | undefined;
 
   constructor(options: WispRustRuntimeOptions = {}) {
     this.native = options.native ?? loadNative();
-    this.instance = createNativeRuntime(this.native, options);
-    configureAuthenticatedProfile(this.instance, options);
+    this.edgeSecret = options.trustedBunFront
+      ? (options.trustedEdgeSecret ?? generateEdgeSecret())
+      : undefined;
+    const resolved = this.edgeSecret
+      ? { ...options, trustedEdgeSecret: this.edgeSecret }
+      : options;
+    this.instance = createNativeRuntime(this.native, resolved);
+    configureAuthenticatedProfile(this.instance, resolved);
   }
 
   async start(): Promise<RuntimeStatus> {
@@ -312,6 +355,7 @@ export class WispRustRuntime {
       proxyPath: mountPath,
       endpointPath,
       target,
+      edgeSecret: this.edgeSecret,
     };
   }
 
@@ -327,6 +371,9 @@ export class WispRustRuntime {
       ws: true,
       changeOrigin: true,
       secure: context.boundUrl.protocol === "wss:",
+      headers: context.edgeSecret
+        ? { [EDGE_SECRET_HEADER]: context.edgeSecret }
+        : undefined,
       rewrite:
         context.proxyPath === context.endpointPath
           ? undefined
@@ -453,18 +500,32 @@ export type WispRustBunProxyOptions = WispRustRuntimeOptions & {
   idleTimeout?: number;
   trustedBunFront?: boolean;
   stopOnSignals?: boolean;
+  /** Most WebSockets held at once, WISP_FRONT_MAX_WEBSOCKETS or 2048 */
+  maxWebSockets?: number;
+  /** Most WebSockets held for one client address, WISP_FRONT_MAX_WEBSOCKETS_PER_IP or 128 */
+  maxWebSocketsPerIp?: number;
+  /** Most bytes held for one WebSocket that is not draining, WISP_FRONT_MAX_BUFFERED_BYTES or 4 MiB */
+  maxBufferedBytes?: number;
+  /** Replaces Cloudflare's ranges as the peers whose CF-Connecting-IP is believed */
+  trustedEdgeCidrs?: string[];
+  /** Runs before the upstream connect; return false to refuse the upgrade with 403 */
+  checkOrigin?: (
+    origin: string | null,
+    request: Request,
+  ) => boolean | Promise<boolean>;
 };
 
 type BunProxyMessage = string | Buffer;
 type BunProxySocketData = {
-  upstreamUrl: string;
-  origin?: string;
-  forwardedFor?: string;
-  protocols: string[];
-  upstream?: WebSocket;
-  pending: BunProxyMessage[];
-  pendingBytes: number;
-  connectTimer?: ReturnType<typeof setTimeout>;
+  upstream: WebSocket;
+  slot: WebSocketSlot;
+  downstream?: Bun.ServerWebSocket<BunProxySocketData>;
+  /** Upstream frames that arrived before the client socket opened */
+  queued: BunProxyMessage[];
+  queuedBytes: number;
+  maxBufferedBytes: number;
+  closed: boolean;
+  closeInfo?: { code: number; reason: string };
 };
 
 export type WispRustBunProxy = {
@@ -492,123 +553,130 @@ export async function serveWispRustBunProxy(
       new URL(target),
     ]),
   );
+  const edgeTrust = createEdgeTrust(options.trustedEdgeCidrs);
+  const limiter = new WebSocketLimiter(
+    options.maxWebSockets ??
+      positiveIntegerEnv("WISP_FRONT_MAX_WEBSOCKETS", DEFAULT_MAX_WEBSOCKETS),
+    options.maxWebSocketsPerIp ??
+      positiveIntegerEnv(
+        "WISP_FRONT_MAX_WEBSOCKETS_PER_IP",
+        DEFAULT_MAX_WEBSOCKETS_PER_IP,
+      ),
+  );
+  const maxBufferedBytes =
+    options.maxBufferedBytes ??
+    positiveIntegerEnv(
+      "WISP_FRONT_MAX_BUFFERED_BYTES",
+      DEFAULT_MAX_BUFFERED_BYTES,
+    );
+
+  const handleRequest = async (
+    request: Request,
+    activeServer: Bun.Server<BunProxySocketData>,
+  ): Promise<Response | undefined> => {
+    const requestUrl = new URL(request.url);
+    // Upstream URLs are built from a fixed origin, and a path that names an authority is
+    // never a request for this app
+    if (isAuthorityPath(requestUrl.pathname)) {
+      return new Response("Invalid request path", { status: 400 });
+    }
+    const peer = activeServer.requestIP(request)?.address;
+    const clientIp = resolveCanonicalClientIp(edgeTrust, peer, request.headers);
+    if (!clientIp) {
+      return new Response("Client address unavailable", { status: 400 });
+    }
+    const selectedAppTarget =
+      appTargets.get(requestUrl.hostname.toLowerCase()) ?? appTarget;
+    if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const mount = options.resolveProxyPath
+        ? await options.resolveProxyPath(request)
+        : context.proxyPath;
+      const connectionContext = mount === null
+        ? null
+        : { ...context, proxyPath: normalizeMountPath(mount) };
+      const toWisp =
+        connectionContext !== null &&
+        pathMatchesMount(requestUrl.pathname, connectionContext.proxyPath);
+      return openProxiedWebSocket({
+        request,
+        server: activeServer,
+        upstreamUrl:
+          toWisp && connectionContext
+            ? wispWebSocketUrl(requestUrl, connectionContext)
+            : appWebSocketUrl(requestUrl, selectedAppTarget),
+        target: toWisp ? context.boundUrl : selectedAppTarget,
+        clientIp,
+        // The secret is for the native listener only, never for the app
+        edgeSecret: toWisp ? runtime.edgeSecret : undefined,
+        limiter,
+        maxBufferedBytes,
+        checkOrigin: options.checkOrigin,
+      });
+    }
+    return proxyBunHttpRequest(request, requestUrl, selectedAppTarget, {
+      clientIp,
+      trustedPeer: isTrustedEdgePeer(edgeTrust, peer),
+    });
+  };
 
   const server = Bun.serve<BunProxySocketData>({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 8081,
     idleTimeout: options.idleTimeout ?? 255,
     async fetch(request, activeServer) {
-      const requestUrl = new URL(request.url);
-      const forwardedFor = appendForwardedFor(
-        request.headers.get("x-forwarded-for"),
-        activeServer.requestIP(request)?.address,
-      );
-      const selectedAppTarget =
-        appTargets.get(requestUrl.hostname.toLowerCase()) ?? appTarget;
-      if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-        const mount = options.resolveProxyPath
-          ? await options.resolveProxyPath(request)
-          : context.proxyPath;
-        const connectionContext = mount === null
-          ? null
-          : { ...context, proxyPath: normalizeMountPath(mount) };
-        const upstreamUrl = connectionContext && pathMatchesMount(requestUrl.pathname, connectionContext.proxyPath)
-          ? wispWebSocketUrl(requestUrl, connectionContext)
-          : appWebSocketUrl(requestUrl, selectedAppTarget);
-        const protocols = (request.headers.get("sec-websocket-protocol") ?? "")
-          .split(",")
-          .map((protocol) => protocol.trim())
-          .filter(Boolean);
-        const upgraded = activeServer.upgrade(request, {
-          data: {
-            upstreamUrl,
-            origin: request.headers.get("origin") ?? undefined,
-            forwardedFor,
-            protocols,
-            pending: [],
-            pendingBytes: 0,
-          },
-        });
-        return upgraded
-          ? undefined
-          : new Response("WebSocket upgrade failed", { status: 500 });
+      try {
+        return await handleRequest(request, activeServer);
+      } catch (error) {
+        if (error instanceof ProxyRejection) {
+          return new Response(error.message, { status: error.status });
+        }
+        console.error("wisp-rust-vite: proxy request failed", error);
+        return new Response("Bad gateway", { status: 502 });
       }
-      return proxyBunHttpRequest(
-        request,
-        requestUrl,
-        selectedAppTarget,
-        forwardedFor,
-      );
     },
     websocket: {
+      // Bun holds at most this much for a client that has stopped reading, and drops the rest
+      backpressureLimit: maxBufferedBytes,
       open(socket) {
-        const headers: Record<string, string> = {};
-        if (socket.data.origin) headers.Origin = socket.data.origin;
-        if (socket.data.forwardedFor)
-          headers["X-Forwarded-For"] = socket.data.forwardedFor;
-        const upstream = new WebSocket(socket.data.upstreamUrl, {
-          headers: Object.keys(headers).length > 0 ? headers : undefined,
-          protocols: socket.data.protocols,
-        });
-        socket.data.upstream = upstream;
-        upstream.binaryType = "arraybuffer";
-        socket.data.connectTimer = setTimeout(() => {
-          socket.data.pending.length = 0;
-          socket.data.pendingBytes = 0;
-          socket.close(1013, "Upstream WebSocket connection timed out");
-          upstream.close();
-        }, BUN_UPSTREAM_CONNECT_TIMEOUT_MS);
-        upstream.addEventListener("open", () => {
-          clearTimeout(socket.data.connectTimer);
-          socket.data.connectTimer = undefined;
-          for (const message of socket.data.pending) upstream.send(message);
-          socket.data.pending.length = 0;
-          socket.data.pendingBytes = 0;
-        });
-        upstream.addEventListener("message", (event) => {
-          socket.send(
-            typeof event.data === "string"
-              ? event.data
-              : Buffer.from(event.data as ArrayBuffer),
-          );
-        });
-        upstream.addEventListener("close", (event) => {
-          clearTimeout(socket.data.connectTimer);
-          socket.data.connectTimer = undefined;
-          socket.close(normalizeWebSocketCloseCode(event.code), event.reason);
-        });
-        upstream.addEventListener("error", () => {
-          clearTimeout(socket.data.connectTimer);
-          socket.data.connectTimer = undefined;
-          socket.close(1011, "Upstream WebSocket failed");
-        });
+        const data = socket.data;
+        data.downstream = socket;
+        if (data.closed) {
+          const info = data.closeInfo ?? { code: 1011, reason: "" };
+          socket.close(info.code, info.reason);
+          return;
+        }
+        const queued = data.queued.splice(0);
+        data.queuedBytes = 0;
+        for (const message of queued) relayToClient(data, message);
       },
       message(socket, message) {
-        const upstream = socket.data.upstream;
-        if (upstream?.readyState === WebSocket.OPEN) {
+        const data = socket.data;
+        if (data.closed) return;
+        const upstream = data.upstream;
+        if (upstream.readyState !== WebSocket.OPEN) {
+          shutdownProxySocket(data, 1011, "Upstream WebSocket is not open", "local");
+          return;
+        }
+        if (
+          upstream.bufferedAmount + bunProxyMessageBytes(message) >
+          data.maxBufferedBytes
+        ) {
+          shutdownProxySocket(
+            data,
+            1009,
+            "Upstream WebSocket is not reading fast enough",
+            "local",
+          );
+          return;
+        }
+        try {
           upstream.send(message);
-        } else {
-          const messageBytes = bunProxyMessageBytes(message);
-          if (socket.data.pendingBytes + messageBytes > MAX_BUN_PENDING_BYTES) {
-            socket.data.pending.length = 0;
-            socket.data.pendingBytes = 0;
-            socket.close(1009, "Upstream WebSocket queue limit exceeded");
-            upstream?.close();
-            return;
-          }
-          socket.data.pending.push(message);
-          socket.data.pendingBytes += messageBytes;
+        } catch {
+          shutdownProxySocket(data, 1011, "Upstream WebSocket failed", "local");
         }
       },
       close(socket, code, reason) {
-        clearTimeout(socket.data.connectTimer);
-        socket.data.connectTimer = undefined;
-        socket.data.pending.length = 0;
-        socket.data.pendingBytes = 0;
-        const upstream = socket.data.upstream;
-        if (upstream && upstream.readyState < WebSocket.CLOSING) {
-          upstream.close(normalizeWebSocketCloseCode(code), reason);
-        }
+        shutdownProxySocket(socket.data, code, reason, "downstream");
       },
     },
   });
@@ -651,56 +719,255 @@ function bunProxyMessageBytes(message: BunProxyMessage): number {
 function wispWebSocketUrl(
   requestUrl: URL,
   context: WispRustProxyContext,
-): string {
-  const upstream = new URL(context.boundUrl);
-  upstream.pathname = rewriteMountPath(
-    requestUrl.pathname,
-    context.proxyPath,
-    context.endpointPath,
+): URL {
+  return buildUpstreamUrl(
+    context.boundUrl,
+    rewriteMountPath(
+      requestUrl.pathname,
+      context.proxyPath,
+      context.endpointPath,
+    ),
+    requestUrl.search,
+    "ws",
   );
-  upstream.search = requestUrl.search;
-  return upstream.href;
 }
 
-function appWebSocketUrl(requestUrl: URL, appTarget: URL): string {
-  const upstream = new URL(requestUrl.pathname + requestUrl.search, appTarget);
-  upstream.protocol = appTarget.protocol === "https:" ? "wss:" : "ws:";
-  return upstream.href;
+function appWebSocketUrl(requestUrl: URL, appTarget: URL): URL {
+  return buildUpstreamUrl(
+    appTarget,
+    requestUrl.pathname,
+    requestUrl.search,
+    "ws",
+  );
+}
+
+/** Ends both halves of a proxied WebSocket once, releasing its connection slot */
+function shutdownProxySocket(
+  data: BunProxySocketData,
+  code: number,
+  reason: string | undefined,
+  from: "downstream" | "upstream" | "local",
+) {
+  if (data.closed) return;
+  data.closed = true;
+  data.slot.release();
+  data.queued.length = 0;
+  data.queuedBytes = 0;
+  const closeCode = forwardableCloseCode(code);
+  const closeReason = truncateCloseReason(reason);
+  data.closeInfo = { code: closeCode, reason: closeReason };
+  if (from !== "downstream" && data.downstream) {
+    try {
+      data.downstream.close(closeCode, closeReason);
+    } catch {
+      // The client socket is already gone
+    }
+  }
+  if (from !== "upstream") closeUpstreamSocket(data.upstream, closeCode, closeReason);
+}
+
+function closeUpstreamSocket(upstream: WebSocket, code: number, reason: string) {
+  if (upstream.readyState >= WebSocket.CLOSING) return;
+  try {
+    upstream.close(code, reason);
+  } catch {
+    // A code the client API refuses to send still has to end the connection
+    try {
+      upstream.close();
+    } catch {
+      // Already closed
+    }
+  }
+}
+
+/** Sends one upstream frame to the client, holding it until the client socket has opened */
+function relayToClient(data: BunProxySocketData, payload: BunProxyMessage) {
+  if (data.closed) return;
+  const socket = data.downstream;
+  if (!socket) {
+    const bytes = bunProxyMessageBytes(payload);
+    if (data.queuedBytes + bytes > data.maxBufferedBytes) {
+      shutdownProxySocket(data, 1009, "Queue limit exceeded", "local");
+      return;
+    }
+    data.queued.push(payload);
+    data.queuedBytes += bytes;
+    return;
+  }
+  // 0 means Bun dropped the frame, and a deep buffer means the client is not reading
+  if (
+    socket.send(payload) === 0 ||
+    socket.getBufferedAmount() > data.maxBufferedBytes
+  ) {
+    shutdownProxySocket(
+      data,
+      1009,
+      "Client is not reading fast enough",
+      "local",
+    );
+  }
+}
+
+/**
+ * Connects the upstream socket first and only then accepts the client's upgrade, so a refusal
+ * reaches the client as the same HTTP status and the subprotocol is the one upstream chose.
+ */
+async function openProxiedWebSocket(input: {
+  request: Request;
+  server: Bun.Server<BunProxySocketData>;
+  upstreamUrl: URL;
+  target: URL;
+  clientIp: string;
+  edgeSecret?: string;
+  limiter: WebSocketLimiter;
+  maxBufferedBytes: number;
+  checkOrigin?: WispRustBunProxyOptions["checkOrigin"];
+}): Promise<Response | undefined> {
+  const { request, upstreamUrl } = input;
+  const slot = input.limiter.acquire(input.clientIp);
+  if (typeof slot === "string") {
+    return new Response(
+      slot === "total"
+        ? "Too many connections"
+        : "Too many connections from this address",
+      {
+        status: slot === "total" ? 503 : 429,
+        headers: { "retry-after": "5", "cache-control": "private, no-store" },
+      },
+    );
+  }
+  let upstream: WebSocket | undefined;
+  let handedOff = false;
+  try {
+    const origin = request.headers.get("origin");
+    if (input.checkOrigin && !(await input.checkOrigin(origin, request))) {
+      return new Response("Origin not allowed", { status: 403 });
+    }
+    const protocols = (request.headers.get("sec-websocket-protocol") ?? "")
+      .split(",")
+      .map((protocol) => protocol.trim())
+      .filter(Boolean);
+    const headers = buildUpstreamSocketHeaders({
+      origin,
+      clientIp: input.clientIp,
+      edgeSecret: input.edgeSecret,
+    });
+    // Rechecked here because this is the last step before the connection is made
+    assertSameOrigin(upstreamUrl, input.target, "ws");
+    const socket = new WebSocket(upstreamUrl.href, { headers, protocols });
+    upstream = socket;
+    socket.binaryType = "arraybuffer";
+    const data: BunProxySocketData = {
+      upstream: socket,
+      slot,
+      queued: [],
+      queuedBytes: 0,
+      maxBufferedBytes: input.maxBufferedBytes,
+      closed: false,
+    };
+    socket.addEventListener("message", (event) => {
+      relayToClient(
+        data,
+        typeof event.data === "string"
+          ? event.data
+          : Buffer.from(event.data as ArrayBuffer),
+      );
+    });
+    socket.addEventListener("close", (event) => {
+      shutdownProxySocket(data, event.code, event.reason, "upstream");
+    });
+    socket.addEventListener("error", () => {
+      shutdownProxySocket(data, 1011, "Upstream WebSocket failed", "upstream");
+    });
+    const outcome = await new Promise<"open" | "failed" | "timeout" | "aborted">(
+      (resolveOutcome) => {
+        const finish = (result: "open" | "failed" | "timeout" | "aborted") => {
+          clearTimeout(timer);
+          request.signal.removeEventListener("abort", onAbort);
+          resolveOutcome(result);
+        };
+        const onAbort = () => finish("aborted");
+        const timer = setTimeout(
+          () => finish("timeout"),
+          BUN_UPSTREAM_CONNECT_TIMEOUT_MS,
+        );
+        socket.addEventListener("open", () => finish("open"), { once: true });
+        socket.addEventListener("error", () => finish("failed"), { once: true });
+        socket.addEventListener("close", () => finish("failed"), { once: true });
+        request.signal.addEventListener("abort", onAbort, { once: true });
+      },
+    );
+    if (outcome === "timeout") {
+      return new Response("Upstream WebSocket connection timed out", {
+        status: 504,
+      });
+    }
+    if (outcome === "aborted") return new Response(null, { status: 499 });
+    if (outcome === "failed" || data.closed) {
+      const status = mirroredRejectionStatus(
+        await probeUpstreamStatus(upstreamUrl, { headers, protocols }),
+      );
+      return new Response("WebSocket upstream refused the connection", {
+        status,
+        headers: { "cache-control": "private, no-store" },
+      });
+    }
+    const selected = socket.protocol;
+    const upgraded = input.server.upgrade(request, {
+      data,
+      headers: selected ? { "Sec-WebSocket-Protocol": selected } : undefined,
+    });
+    if (!upgraded) {
+      return new Response("WebSocket upgrade failed", { status: 500 });
+    }
+    handedOff = true;
+    return undefined;
+  } finally {
+    if (!handedOff) {
+      slot.release();
+      if (upstream) closeUpstreamSocket(upstream, 1000, "");
+    }
+  }
 }
 
 async function proxyBunHttpRequest(
   request: Request,
   requestUrl: URL,
   appTarget: URL,
-  forwardedFor?: string,
+  identity: { clientIp: string; trustedPeer: boolean },
 ): Promise<Response> {
-  const upstream = new URL(requestUrl.pathname + requestUrl.search, appTarget);
-  const headers = new Headers(request.headers);
-  headers.delete("connection");
-  headers.delete("upgrade");
-  if (forwardedFor) headers.set("x-forwarded-for", forwardedFor);
-  const hasBody = request.method !== "GET" && request.method !== "HEAD";
-  return fetch(upstream, {
-    method: request.method,
-    headers,
-    body: hasBody ? request.body : undefined,
-    redirect: "manual",
+  const upstream = buildUpstreamUrl(
+    appTarget,
+    requestUrl.pathname,
+    requestUrl.search,
+  );
+  const headers = buildUpstreamRequestHeaders(request.headers, {
+    clientIp: identity.clientIp,
+    trustedPeer: identity.trustedPeer,
+    publicHost: requestUrl.host,
+    publicProtocol: requestUrl.protocol,
   });
-}
-
-function appendForwardedFor(
-  existing: string | null,
-  clientIp: string | undefined,
-): string | undefined {
-  if (!clientIp) return existing?.trim() || undefined;
-  const chain = existing?.trim();
-  return chain ? `${chain}, ${clientIp}` : clientIp;
-}
-
-function normalizeWebSocketCloseCode(code: number): number {
-  const reserved =
-    code === 1004 || code === 1005 || code === 1006 || code === 1015;
-  return code >= 1000 && code <= 4999 && !reserved ? code : 1011;
+  assertSameOrigin(upstream, appTarget);
+  const hasBody = request.method !== "GET" && request.method !== "HEAD";
+  let response: Response;
+  try {
+    response = await fetch(upstream, {
+      method: request.method,
+      headers,
+      body: hasBody ? request.body : undefined,
+      redirect: "manual",
+      // The body is relayed as the app encoded it, so Content-Encoding stays true
+      decompress: false,
+      signal: request.signal,
+    });
+  } catch {
+    return new Response("Bad gateway", { status: 502 });
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: filterUpstreamResponseHeaders(response.headers),
+  });
 }
 
 export function wispRustVite(options: WispRustViteOptions = {}): Plugin {
@@ -848,7 +1115,12 @@ function proxyBunAdapterWebSocketUpgrade(
     return;
   }
 
-  const target = wispWebSocketUrl(new URL(originalRequest.url), context);
+  const originalUrl = new URL(originalRequest.url);
+  if (isAuthorityPath(originalUrl.pathname)) {
+    next();
+    return;
+  }
+  const target = wispWebSocketUrl(originalUrl, context).href;
   const protocols = (originalRequest.headers.get("sec-websocket-protocol") ?? "")
     .split(",")
     .map((protocol) => protocol.trim())
@@ -858,6 +1130,8 @@ function proxyBunAdapterWebSocketUpgrade(
       target,
       originalRequest.headers.get("origin"),
       protocols,
+      canonicalIp(bunServer.requestIP?.(originalRequest)?.address) ?? undefined,
+      context.edgeSecret,
     ),
   });
   if (!upgraded) {
@@ -875,6 +1149,8 @@ function createBunProxySocketData(
   target: string,
   origin: string | null,
   protocols: string[],
+  clientIp: string | undefined,
+  edgeSecret: string | undefined,
 ): BunAdapterProxySocketData {
   let downstream: BunProxySocket | undefined;
   let upstream: WebSocket | undefined;
@@ -886,13 +1162,19 @@ function createBunProxySocketData(
   const closeDownstream = (code: number, reason: string) => {
     if (closed) return;
     closed = true;
-    downstream?.close(normalizeWebSocketCloseCode(code), reason);
+    downstream?.close(forwardableCloseCode(code), truncateCloseReason(reason));
   };
 
   return {
     open(socket) {
       downstream = socket;
-      const headers = origin ? { Origin: origin } : undefined;
+      // Trusted_edge listeners need the front's identity on every upgrade
+      const headers =
+        edgeSecret && clientIp
+          ? buildUpstreamSocketHeaders({ origin, clientIp, edgeSecret })
+          : origin
+            ? { Origin: origin }
+            : undefined;
       upstream = new WebSocket(target, {
         headers,
         protocols,
@@ -911,11 +1193,16 @@ function createBunProxySocketData(
         pendingBytes = 0;
       });
       upstream.addEventListener("message", (event) => {
-        downstream?.send(
+        const result = downstream?.send(
           typeof event.data === "string"
             ? event.data
             : Buffer.from(event.data as ArrayBuffer),
         );
+        // 0 means Bun dropped the frame because the client is not reading
+        if (result === 0) {
+          closeDownstream(1009, "Client is not reading fast enough");
+          upstream?.close();
+        }
       });
       upstream.addEventListener("error", () => {
         clearTimeout(connectTimer);
@@ -930,6 +1217,14 @@ function createBunProxySocketData(
     },
     message(_socket, message) {
       if (upstream?.readyState === WebSocket.OPEN) {
+        if (
+          upstream.bufferedAmount + bunProxyMessageBytes(message) >
+          DEFAULT_MAX_BUFFERED_BYTES
+        ) {
+          closeDownstream(1009, "Wisp upstream is not reading fast enough");
+          upstream.close();
+          return;
+        }
         upstream.send(message);
         return;
       }
@@ -952,7 +1247,11 @@ function createBunProxySocketData(
       pending.length = 0;
       pendingBytes = 0;
       if (upstream && upstream.readyState < WebSocket.CLOSING) {
-        upstream.close(normalizeWebSocketCloseCode(code), reason);
+        closeUpstreamSocket(
+          upstream,
+          forwardableCloseCode(code),
+          truncateCloseReason(reason),
+        );
       }
     },
   };
@@ -1004,9 +1303,18 @@ function proxyBunWebSocketUpgrade(
     for (let index = 0; index < request.rawHeaders.length; index += 2) {
       const name = request.rawHeaders[index];
       const value = request.rawHeaders[index + 1];
-      if (!name || value === undefined || name.toLowerCase() === "host")
-        continue;
+      if (!name || value === undefined) continue;
+      // Identity headers are the front's to write, never the client's
+      if (UPSTREAM_IDENTITY_HEADERS.has(name.toLowerCase())) continue;
       headers.push(`${name}: ${value}`);
+    }
+    const peerIp = canonicalIp(request.socket.remoteAddress);
+    if (context.edgeSecret && peerIp) {
+      headers.push(
+        `X-Forwarded-For: ${peerIp}`,
+        `CF-Connecting-IP: ${peerIp}`,
+        `${EDGE_SECRET_HEADER}: ${context.edgeSecret}`,
+      );
     }
     this.write(`${headers.join("\r\n")}\r\n\r\n`);
     if (head.length > 0) this.write(head);
@@ -1040,6 +1348,17 @@ function proxyBunWebSocketUpgrade(
   socket.once("close", () => upstream.destroy());
   upstream.once("close", () => socket.end());
 }
+
+/** Headers a client must not supply to the native listener, which trusts them in trusted_edge mode */
+const UPSTREAM_IDENTITY_HEADERS = new Set([
+  "host",
+  "x-forwarded-for",
+  "x-real-ip",
+  "forwarded",
+  "true-client-ip",
+  "cf-connecting-ip",
+  EDGE_SECRET_HEADER,
+]);
 
 export const wispRustPlugin = wispRustVite;
 
@@ -1175,22 +1494,37 @@ function buildRuntimeTomlTable(options: WispRustRuntimeOptions): TomlTable {
       ),
     );
   }
-  if (options.trustedBunFront) applyTrustedBunFront(base);
+  if (options.trustedBunFront) {
+    applyTrustedBunFront(base, options.trustedEdgeSecret);
+  }
   return base;
 }
 
-function applyTrustedBunFront(table: TomlTable) {
+function applyTrustedBunFront(table: TomlTable, edgeSecret?: string) {
   const record = table as TomlRecord;
   const ws = isRecord(record.wisp_websocket) ? record.wisp_websocket : {};
   ws.host = "127.0.0.1";
   delete ws.bind_addr;
   ws.ingress_mode = "trusted_edge";
+  // The native listener refuses upgrades that do not carry this in x-wisp-edge-secret
+  if (edgeSecret) ws.trusted_edge_secret = edgeSecret;
   record.wisp_websocket = ws;
 
   const wisp = isRecord(record.wisp) ? record.wisp : {};
   const client = isRecord(wisp.client) ? wisp.client : {};
   client.parse_real_ip = true;
-  client.parse_real_ip_from = ["127.0.0.1", "::1"];
+  // Operator-supplied peers stay trusted, loopback is added to them
+  const configured = client.parse_real_ip_from;
+  const operatorPeers = (
+    Array.isArray(configured)
+      ? configured
+      : typeof configured === "string"
+        ? [configured]
+        : []
+  ).filter((entry): entry is string => typeof entry === "string");
+  client.parse_real_ip_from = [
+    ...new Set([...operatorPeers, "127.0.0.1", "::1"]),
+  ];
   wisp.client = client;
   record.wisp = wisp;
 }
