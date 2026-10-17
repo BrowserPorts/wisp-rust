@@ -33,8 +33,9 @@ resolver_timeout_ms = 1000
 # ============================================================================
 [wisp.destination]
 domain_blacklist    = ["*.internal.example.com"]
-domain_whitelist    = []              # empty = no whitelist (allow-all subject to blacklist)
+# domain_whitelist  = ["*.example.com"]  # omit for no whitelist; a listed set admits only those names
 port_whitelist      = [80, 443]       # restrict outbound ports; HTTP + HTTPS only by default
+udp_port_whitelist  = [443]           # UDP ports; omit to follow port_whitelist
 host_port_whitelist = []
 allow_direct_ip                       = false   # reject `1.2.3.4:443` style hosts; require DNS name
 allow_private_ips                     = false   # block RFC 1918 / fc00::/7
@@ -53,7 +54,7 @@ block_blank_origins  = true
 # ============================================================================
 [wisp.client]
 client_ip_blacklist  = []
-client_ip_whitelist  = []
+# client_ip_whitelist = ["203.0.113.0/24"]  # omit to admit every client
 parse_real_ip        = true                                 # honor X-Forwarded-For / Forwarded
 parse_real_ip_from   = ["127.0.0.1", "10.0.0.0/8"]                                     
 
@@ -83,6 +84,8 @@ max_host_bytes                                   = 253        # RFC 1035 max DNS
 max_pending_packets_per_stream                   = 512
 max_pending_bytes_per_stream                     = 8388608
 max_egress_queue_bytes                           = 33554432
+max_ingress_bytes_per_connection                 = 8388608    # 8 MiB of uploads held per connection
+max_buffered_bytes_total                         = 134217728  # 128 MiB held by the whole process
 max_connection_starts_per_ip_per_minute          = 600
 max_connection_starts_per_minute                 = 60000
 max_tcp_stream_opens_per_connection_per_minute   = 1200
@@ -108,10 +111,12 @@ max_proxy_rule_field_bytes                       = 512
 # [wisp.rate_limit] — distributed limiter backend (memory or Redis)
 # ============================================================================
 [wisp.rate_limit]
-backend                                = "redis"                                 
-redis_url                              = "redis://127.0.0.1:6379/0"
-redis_key_prefix                       = "wispd"
-redis_hash_tag                         = "rate-limit"                                                      
+backend                                = "memory"    # "memory" (default, per process) | "redis" (shared across processes)
+ipv6_prefix                            = 56          # IPv6 bits that count as one client for per-IP limits (16..=64)
+# With backend = "redis" all three of the following apply (redis_url is rejected under "memory"):
+# redis_url                            = "redis://127.0.0.1:6379/0"
+# redis_key_prefix                     = "wispd"
+# redis_hash_tag                       = "rate-limit"
 proxy_control_upstream_ops_per_second  = 10
 proxy_control_upstream_burst           = 20
 proxy_control_mutation_ops_per_second  = 2
@@ -152,13 +157,13 @@ bind_addr             = "0.0.0.0:4242" # explicit bind; overrides host/port if s
 cert_path             = "/etc/wispd/tls/fullchain.pem"
 key_path              = "/etc/wispd/tls/privkey.pem"
 endpoint              = "/wisp/"       # override [wisp.server].endpoint for this transport
-proxy_control_enabled = true                                                    
+proxy_control_enabled = false          # true needs a provider below ([wisp_proxy_mullvad] or [wisp_proxy_resi]) enabled
 ingress_mode          = "direct_tls"                                                                    
 
 # ============================================================================
 # ============================================================================
 [wisp_proxy_control]
-enabled = true
+enabled = false                        # true needs a provider below enabled, and wisp_version = "v2"
 
 # ============================================================================
 # [wisp_wt] — Wisp v2 over WebTransport (HTTP/3 + extended CONNECT via msquic)
