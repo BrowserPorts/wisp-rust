@@ -23,4 +23,4 @@ pub mod listener;
 pub mod service;
 pub mod websocket;
 
-pub use listener::{accept_h2_connection, H2ServeContext};
+pub use listener::{accept_h2_connection, accept_h2_connection_with_preauth, H2ServeContext};

@@ -1,7 +1,7 @@
 //! Per-connection driver: rustls-terminated TCP into hyper http2 server with
 //! extended CONNECT enabled into service dispatch in `service.rs`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hyper::server::conn::http2::Builder as Http2Builder;
 use hyper::service::service_fn;
@@ -14,7 +14,7 @@ use wisp_config::{
     endpoint_matches, endpoint_path_token, WispAuthRegistry, WispAuthTokenPolicy,
     WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
-use wisp_dos::{ConnectionLimiter, DosGuard};
+use wisp_dos::{is_ip_budget_allowed, ConnectionLimiter, DosGuard, MINUTE_MS};
 use wisp_iphash::IpHashBans;
 use wisp_wisp_server::{ProxyControllerTemplate, ServerOptions};
 
@@ -114,7 +114,52 @@ impl H2ServeContext {
         )
     }
 
+    /// Options for a connection that presents no token: the live `__base`
+    /// profile, or the startup options. Checks that do not depend on a token
+    /// (bans, client IP, origin, the token attempt budget) run against these
+    /// before any token is resolved.
+    pub fn base_options(&self) -> Arc<WispServerOptions> {
+        self.auth_registry
+            .profile(WISP_BASE_LIMIT_PROFILE)
+            .map(Arc::new)
+            .unwrap_or_else(|| self.options.clone())
+    }
+
+    /// Spends one token resolution from the client IP's budget, or `true`
+    /// without spending anything when `path` carries no token. Resolving a
+    /// token can call out to the host's handler, so an IP gets
+    /// [`TOKEN_ATTEMPTS_PER_START`] times its connection-start rate in
+    /// attempts and no more.
+    pub fn token_attempt_allowed(
+        &self,
+        client_ip: &str,
+        path: &str,
+        base: &WispServerOptions,
+    ) -> bool {
+        if endpoint_path_token(path, &self.options.endpoint).is_none() {
+            return true;
+        }
+        is_ip_budget_allowed(
+            client_ip,
+            "auth:token_attempt",
+            base.max_connection_starts_per_ip_per_minute
+                .saturating_mul(TOKEN_ATTEMPTS_PER_START),
+            MINUTE_MS,
+            &self.dos,
+        )
+    }
+
     pub async fn context_for_path(&self, path: &str) -> Option<ConnectionView> {
+        self.view_for_path(path, None).await
+    }
+
+    /// [`Self::context_for_path`] reusing `base` (from
+    /// [`Self::base_options`]) for a connection without a token.
+    pub async fn view_for_path(
+        &self,
+        path: &str,
+        base: Option<Arc<WispServerOptions>>,
+    ) -> Option<ConnectionView> {
         let (options, auth_policy) =
             if let Some(token) = endpoint_path_token(path, &self.options.endpoint) {
                 if !self.options.auth.token_path {
@@ -131,11 +176,7 @@ impl H2ServeContext {
                 if self.options.auth.required {
                     return None;
                 }
-                let base = self
-                    .auth_registry
-                    .profile(WISP_BASE_LIMIT_PROFILE)
-                    .map(Arc::new)
-                    .unwrap_or_else(|| self.options.clone());
+                let base = base.unwrap_or_else(|| self.base_options());
                 (base, WispAuthTokenPolicy::default())
             } else {
                 return None;
@@ -161,6 +202,9 @@ impl H2ServeContext {
     }
 }
 
+/// Token resolutions an IP may attempt per connection start it is allowed.
+pub const TOKEN_ATTEMPTS_PER_START: u64 = 4;
+
 #[derive(Clone)]
 pub struct ConnectionView {
     pub options: Arc<WispServerOptions>,
@@ -183,20 +227,71 @@ pub async fn accept_h2_connection<I>(
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    accept_h2_connection_with_preauth(io, client_ip, ctx, None).await
+}
+
+/// Like [`accept_h2_connection`], holding the listener's pre-authentication
+/// slot `preauth` until the first WebSocket upgrade succeeds. A connection
+/// that has not upgraded within the handshake timeout is closed, so idle
+/// TLS connections cannot hold slots.
+pub async fn accept_h2_connection_with_preauth<I>(
+    io: I,
+    client_ip: String,
+    ctx: Arc<H2ServeContext>,
+    preauth: Option<Box<dyn Send + Sync>>,
+) -> Result<(), H2Error>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut builder = Http2Builder::new(TokioExecutor::new());
     builder.enable_connect_protocol();
 
     let shutdown = ctx.shutdown.clone();
+    let upgrade_deadline =
+        std::time::Duration::from_millis(ctx.options.handshake_timeout_ms.unwrap_or(10_000).max(1));
+    let awaiting_upgrade = preauth.is_some();
+    let preauth = Arc::new(Mutex::new(preauth));
+    let svc_preauth = preauth.clone();
     let svc = service_fn(move |req| {
         let ctx = ctx.clone();
         let client_ip = client_ip.clone();
-        async move { handle_request(req, client_ip, ctx).await }
+        let preauth = svc_preauth.clone();
+        async move {
+            let response = handle_request(req, client_ip, ctx).await;
+            if response
+                .as_ref()
+                .is_ok_and(|response| response.status() == hyper::StatusCode::OK)
+            {
+                preauth
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
+            response
+        }
     });
 
     let conn = builder.serve_connection(TokioIo::new(io), svc);
-    let result = tokio::select! {
-        result = conn => result,
-        _ = shutdown.cancelled() => return Ok(()),
+    tokio::pin!(conn);
+    let deadline = tokio::time::sleep(upgrade_deadline);
+    tokio::pin!(deadline);
+    let mut deadline_armed = awaiting_upgrade;
+    let result = loop {
+        tokio::select! {
+            result = &mut conn => break result,
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = &mut deadline, if deadline_armed => {
+                deadline_armed = false;
+                let upgraded = preauth
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_none();
+                if !upgraded {
+                    debug!("h2 connection made no upgrade in time, closing");
+                    return Ok(());
+                }
+            }
+        }
     };
     if let Err(err) = result {
         let msg = err.to_string();
@@ -215,4 +310,46 @@ fn is_clean_disconnect(msg: &str) -> bool {
         || msg.contains("broken pipe")
         || msg.contains("connection closed")
         || msg.contains("NO_ERROR")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Slot(Arc<AtomicBool>);
+
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_without_an_upgrade_is_closed_and_frees_its_slot() {
+        let options = WispServerOptions {
+            handshake_timeout_ms: Some(200),
+            ..WispServerOptions::default()
+        };
+        let ctx = Arc::new(H2ServeContext::with_template_and_auth(
+            Arc::new(options),
+            false,
+            None,
+            WispAuthRegistry::default(),
+            Arc::new(DosGuard::new()),
+            Arc::new(ConnectionLimiter::new()),
+        ));
+        // The peer connects and never speaks.
+        let (_client, server) = tokio::io::duplex(1024);
+        let freed = Arc::new(AtomicBool::new(false));
+        let slot: Box<dyn Send + Sync> = Box::new(Slot(freed.clone()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            accept_h2_connection_with_preauth(server, "127.0.0.1".to_owned(), ctx, Some(slot)),
+        )
+        .await
+        .expect("a connection that never upgraded was kept open")
+        .expect("closed cleanly");
+        assert!(freed.load(Ordering::SeqCst));
+    }
 }

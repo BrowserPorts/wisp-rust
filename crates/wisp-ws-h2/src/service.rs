@@ -12,7 +12,7 @@ use hyper::ext::Protocol;
 use hyper_util::rt::TokioIo;
 use tokio_websockets::{Config, Limits, ServerBuilder};
 use tracing::{debug, warn};
-use wisp_config::is_client_ip_allowed;
+use wisp_config::{is_client_ip_allowed, WispServerOptions};
 use wisp_dos::is_connection_start_allowed;
 use wisp_origin::{is_origin_allowed, origin_from_headers, origin_headers_valid, policy_headers};
 use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
@@ -32,9 +32,9 @@ pub(crate) async fn handle_request(
     ctx: Arc<H2ServeContext>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     let path = req.uri().path().to_owned();
-    let Some(view) = ctx.context_for_path(&path).await else {
+    if !ctx.path_is_endpoint_scope(&path) {
         return Ok(status(StatusCode::NOT_FOUND));
-    };
+    }
 
     if req.method() != Method::CONNECT {
         return Ok(status(StatusCode::METHOD_NOT_ALLOWED));
@@ -47,6 +47,10 @@ pub(crate) async fn handle_request(
         return Ok(status(StatusCode::BAD_REQUEST));
     }
 
+    // Everything that does not depend on a token runs before one is resolved,
+    // so a banned, foreign-origin or flooding client never reaches the token
+    // resolver (which may call out to the host's handler).
+    let base = ctx.base_options();
     if !origin_headers_valid(req.headers()) {
         emit_report(
             ReportErrorType::OriginBlocked,
@@ -63,7 +67,7 @@ pub(crate) async fn handle_request(
         return Ok(status(StatusCode::FORBIDDEN));
     }
     let origin = origin_from_headers(req.headers()).map(|s| s.to_owned());
-    if !is_origin_allowed(origin.as_deref(), &view.options) {
+    if !is_origin_allowed(origin.as_deref(), &base) {
         debug!(?origin, "rejecting websocket: origin policy");
         emit_report(
             ReportErrorType::OriginBlocked,
@@ -79,10 +83,10 @@ pub(crate) async fn handle_request(
                 ..Default::default()
             },
         );
-        return Ok(origin_denied_response(origin.as_deref(), &view));
+        return Ok(origin_denied_response(origin.as_deref(), &base));
     }
 
-    if !is_client_ip_allowed(&client_ip, &view.options) {
+    if !is_client_ip_allowed(&client_ip, &base) {
         debug!(client_ip = %client_ip, "ws-h2: rejecting: client IP policy");
         emit_report(
             ReportErrorType::ClientBlocked,
@@ -99,7 +103,7 @@ pub(crate) async fn handle_request(
         );
         return Ok(status(StatusCode::FORBIDDEN));
     }
-    let client_hash = wisp_iphash::hash_client_ip(Some(&client_ip), None);
+    let client_hash = wisp_iphash::hash_client_ip_keyed(Some(&client_ip));
     if ctx.ip_bans.is_banned(client_hash.as_deref()) {
         debug!(client_ip = %client_ip, "ws-h2: rejecting: banned IP hash");
         emit_report(
@@ -115,6 +119,36 @@ pub(crate) async fn handle_request(
                 ..Default::default()
             },
         );
+        return Ok(status(StatusCode::FORBIDDEN));
+    }
+    if !ctx.token_attempt_allowed(&client_ip, &path, &base) {
+        debug!(client_ip = %client_ip, "ws-h2: rejecting: token attempt rate");
+        emit_report(
+            ReportErrorType::ConnectionRateLimited,
+            ReportInput {
+                context: Some(ConnectionContext {
+                    client_ip: Some(client_ip.clone()),
+                    transport: Some(Transport::Ws),
+                    origin: origin.clone(),
+                    ..Default::default()
+                }),
+                transport_close_code: Some(429),
+                limit_type: Some("token_attempt".to_owned()),
+                ..Default::default()
+            },
+        );
+        return Ok(status(StatusCode::TOO_MANY_REQUESTS));
+    }
+    let Some(view) = ctx.view_for_path(&path, Some(base.clone())).await else {
+        return Ok(status(StatusCode::NOT_FOUND));
+    };
+    // A token's limit profile is a full option set and may carry its own
+    // origin or client lists.
+    if !Arc::ptr_eq(&view.options, &base)
+        && (!is_origin_allowed(origin.as_deref(), &view.options)
+            || !is_client_ip_allowed(&client_ip, &view.options))
+    {
+        debug!(client_ip = %client_ip, "ws-h2: rejecting: token profile origin or client policy");
         return Ok(status(StatusCode::FORBIDDEN));
     }
     let store = ctx.dos.clone();
@@ -246,9 +280,9 @@ fn status(code: StatusCode) -> Response<Body> {
         .expect("static status response")
 }
 
-fn origin_denied_response(origin: Option<&str>, view: &ConnectionView) -> Response<Body> {
+fn origin_denied_response(origin: Option<&str>, options: &WispServerOptions) -> Response<Body> {
     let mut resp = Response::builder().status(StatusCode::FORBIDDEN);
-    let (vary, acao) = policy_headers(origin, &view.options);
+    let (vary, acao) = policy_headers(origin, options);
     resp = resp.header("Vary", HeaderValue::from_static(vary));
     if let Some(value) = acao {
         if let Ok(val) = HeaderValue::from_str(&value) {
@@ -278,7 +312,7 @@ mod tests {
     use hyper_util::rt::TokioExecutor;
     use wisp_config::WispServerOptions;
     use wisp_dos::{ConnectionLimiter, DosGuard};
-    use wisp_iphash::{hash_client_ip, IpHashBans};
+    use wisp_iphash::{hash_client_ip_keyed, IpHashBans};
     use wisp_reports::{set_report_hook, Report};
 
     type Client = hyper::client::conn::http2::SendRequest<Empty<Bytes>>;
@@ -349,7 +383,7 @@ mod tests {
         let mut client = connect(ctx.clone()).await;
         assert_eq!(extended_connect(&mut client).await, StatusCode::OK);
 
-        let banned = hash_client_ip(Some("127.0.0.1"), None).unwrap();
+        let banned = hash_client_ip_keyed(Some("127.0.0.1")).unwrap();
         bans.replace([banned.clone()]);
         let mut client = connect(ctx.clone()).await;
         assert_eq!(extended_connect(&mut client).await, StatusCode::FORBIDDEN);

@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt};
@@ -14,8 +15,18 @@ use tracing::debug;
 use wisp_wisp_server::{serve_connection, ServerContext, ServerError, WispMessage};
 
 const ACTOR_CHANNEL_CAPACITY: usize = 16;
+/// Inbound batches read ahead of the Wisp driver. Kept small and capped by
+/// bytes too, so read-ahead stays within a few frames per connection: the
+/// driver stops reading when its upload budget is full, and the socket must
+/// stop being read soon after.
+const INBOUND_CHANNEL_CAPACITY: usize = 2;
 const INBOUND_BATCH_CAPACITY: usize = 64;
+const INBOUND_BATCH_BYTES: usize = 64 * 1024;
 const OUTBOUND_BATCH_CAPACITY: usize = 64;
+/// `idle_timeout_ms` when it is unset.
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 120_000;
+/// How long a closing connection waits for the actor before aborting it.
+const ACTOR_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 type WriteReply = Result<Vec<WispMessage>, String>;
 
@@ -187,6 +198,13 @@ fn to_websocket_message(message: WispMessage) -> Message {
     }
 }
 
+fn message_len(message: &WispMessage) -> usize {
+    match message {
+        WispMessage::Binary(bytes) => bytes.len(),
+        WispMessage::Text(text) => text.len(),
+    }
+}
+
 fn from_websocket_message(message: Message) -> Option<WispMessage> {
     if message.is_binary() {
         let bytes: Bytes = message.into_payload().into();
@@ -272,14 +290,48 @@ where
     }
 }
 
+/// Liveness of a WebSocket. Any frame from the client, pongs included, counts
+/// as activity. After half the idle limit with nothing heard the server
+/// pings; a client that answers nothing for the whole limit is dropped.
+struct Liveness {
+    idle: Duration,
+    last_heard: tokio::time::Instant,
+}
+
+impl Liveness {
+    fn new(idle: Duration) -> Self {
+        Self {
+            idle,
+            last_heard: tokio::time::Instant::now(),
+        }
+    }
+
+    fn heard(&mut self) {
+        self.last_heard = tokio::time::Instant::now();
+    }
+
+    fn check_every(&self) -> Duration {
+        (self.idle / 4).max(Duration::from_millis(10))
+    }
+
+    fn quiet_for(&self) -> Duration {
+        self.last_heard.elapsed()
+    }
+}
+
 async fn drive_actor<T>(
     mut websocket: WebSocketStream<T>,
     mut commands: mpsc::Receiver<WebSocketCommand>,
     incoming: mpsc::Sender<Vec<WispMessage>>,
+    idle: Duration,
 ) -> Result<(), tokio_websockets::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut liveness = Liveness::new(idle);
+    let mut ticker = tokio::time::interval(liveness.check_every());
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.reset();
     loop {
         tokio::select! {
             biased;
@@ -288,20 +340,36 @@ where
                     return Ok(());
                 }
             }
+            _ = ticker.tick() => {
+                let quiet = liveness.quiet_for();
+                if quiet >= liveness.idle {
+                    debug!("websocket idle past its limit, closing");
+                    let _ = tokio::time::timeout(ACTOR_STOP_TIMEOUT, websocket.close()).await;
+                    return Ok(());
+                }
+                if quiet >= liveness.idle / 2 {
+                    // A peer that stopped reading never lets this through; the
+                    // driver's write timeout then ends the connection.
+                    websocket.send(Message::ping(Bytes::new())).await?;
+                }
+            }
             message = websocket.next() => {
+                liveness.heard();
                 let mut messages = Vec::with_capacity(INBOUND_BATCH_CAPACITY);
+                let mut batch_bytes = 0;
                 let mut terminal = None;
                 match message {
                     Some(Ok(message)) if message.is_close() => return Ok(()),
                     Some(Ok(message)) => {
                         if let Some(message) = from_websocket_message(message) {
+                            batch_bytes += message_len(&message);
                             messages.push(message);
                         }
                     }
                     Some(Err(error)) => return Err(error),
                     None => return Ok(()),
                 }
-                while messages.len() < INBOUND_BATCH_CAPACITY {
+                while messages.len() < INBOUND_BATCH_CAPACITY && batch_bytes < INBOUND_BATCH_BYTES {
                     match websocket.next().now_or_never() {
                         Some(Some(Ok(message))) if message.is_close() => {
                             terminal = Some(Ok(()));
@@ -309,6 +377,7 @@ where
                         }
                         Some(Some(Ok(message))) => {
                             if let Some(message) = from_websocket_message(message) {
+                                batch_bytes += message_len(&message);
                                 messages.push(message);
                             }
                         }
@@ -323,10 +392,13 @@ where
                         None => break,
                     }
                 }
-                if !messages.is_empty()
-                    && !send_incoming_batch(&mut websocket, &mut commands, &incoming, messages).await
-                {
-                    return Ok(());
+                if !messages.is_empty() {
+                    if !send_incoming_batch(&mut websocket, &mut commands, &incoming, messages).await {
+                        return Ok(());
+                    }
+                    // Time spent waiting on the driver is not the client's
+                    // silence.
+                    liveness.heard();
                 }
                 if let Some(result) = terminal {
                     return result;
@@ -343,19 +415,32 @@ pub async fn serve_websocket<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let idle = Duration::from_millis(
+        server_ctx
+            .options
+            .idle_timeout_ms
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS)
+            .max(1),
+    );
     let (command_tx, command_rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let (incoming_tx, incoming_rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = tokio::spawn(drive_actor(websocket, command_rx, incoming_tx));
+    let (incoming_tx, incoming_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
+    let mut actor = tokio::spawn(drive_actor(websocket, command_rx, incoming_tx, idle));
     let result = serve_connection(
         ActorSink::new(command_tx),
         ActorStream::new(incoming_rx),
         server_ctx,
     )
     .await;
-    match actor.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => debug!(%error, "websocket transport actor ended with error"),
-        Err(error) => debug!(%error, "websocket transport actor task failed"),
+    // The actor ends once the driver drops its channels, unless it is stuck
+    // writing to a client that stopped reading.
+    match tokio::time::timeout(ACTOR_STOP_TIMEOUT, &mut actor).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => debug!(%error, "websocket transport actor ended with error"),
+        Ok(Err(error)) => debug!(%error, "websocket transport actor task failed"),
+        Err(_) => {
+            debug!("websocket transport actor did not stop, aborting");
+            actor.abort();
+        }
     }
     result
 }
