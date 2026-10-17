@@ -10,9 +10,11 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-use wisp_iphash::hash_client_ip;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wisp_iphash::hash_client_ip_keyed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -333,25 +335,60 @@ pub struct Report {
     pub occurred_at: i64,
 }
 
+/// Environment variable that turns destination hostnames back on in reports.
+pub const HOSTNAMES_ENV: &str = "WISP_REPORT_HOSTNAMES";
+
+/// Whether reports may carry destination hostnames. Off unless
+/// `WISP_REPORT_HOSTNAMES` is `1` or `true`: a hostname next to an IP hash
+/// links one client to the sites it visited.
+fn hostnames_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(HOSTNAMES_ENV)
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+    })
+}
+
+fn gate_hostname(hostname: Option<String>, enabled: bool) -> Option<String> {
+    hostname.filter(|_| enabled)
+}
+
+/// Longest origin a report carries. An Origin header can be megabytes long
+/// and ends up in logs and in the report consumers.
+pub const MAX_REPORT_ORIGIN_BYTES: usize = 256;
+
+fn truncate_origin(mut origin: String) -> String {
+    if origin.len() > MAX_REPORT_ORIGIN_BYTES {
+        let mut end = MAX_REPORT_ORIGIN_BYTES;
+        while !origin.is_char_boundary(end) {
+            end -= 1;
+        }
+        origin.truncate(end);
+    }
+    origin
+}
+
 pub fn create_report(error_type: ReportErrorType, input: ReportInput) -> Report {
     let def = error_type.definition();
     let ctx = input.context;
     // Most call sites know the client IP but not its hash; derive it so every
-    // report can be matched against the ban list. The transports hash without
-    // a secret, so this agrees with the hash they check bans against.
+    // report can be matched against the ban list. The transports hash with the
+    // same process-wide key, so this agrees with the hash they check bans
+    // against.
     let ip_hash = input
         .ip_hash
         .or_else(|| ctx.as_ref().and_then(|c| c.client_ip_hash.clone()))
         .or_else(|| {
             ctx.as_ref()
-                .and_then(|c| hash_client_ip(c.client_ip.as_deref(), None))
+                .and_then(|c| hash_client_ip_keyed(c.client_ip.as_deref()))
         });
     let transport = input
         .transport
         .or_else(|| ctx.as_ref().and_then(|c| c.transport));
     let origin = input
         .origin
-        .or_else(|| ctx.as_ref().and_then(|c| c.origin.clone()));
+        .or_else(|| ctx.as_ref().and_then(|c| c.origin.clone()))
+        .map(truncate_origin);
     Report {
         error_type,
         report_code: def.report_code,
@@ -364,7 +401,7 @@ pub fn create_report(error_type: ReportErrorType, input: ReportInput) -> Report 
         ip_hash,
         transport,
         origin,
-        hostname: input.hostname,
+        hostname: gate_hostname(input.hostname, hostnames_enabled()),
         port: input.port,
         stream_type: input.stream_type,
         proxy_request_type: input.proxy_request_type,
@@ -379,50 +416,136 @@ pub fn create_report(error_type: ReportErrorType, input: ReportInput) -> Report 
 }
 
 impl Report {
-    /// One-line `key=value` summary of the optional fields this report
-    /// carries, or `None` when it carries none. The order is fixed so the
-    /// output is stable for display and for tests.
-    pub fn detail(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
+    /// The optional fields this report carries as `(name, value)` pairs, in a
+    /// fixed order. Values are raw: this is the structured view, so a consumer
+    /// never has to split [`Report::detail`] and cannot be fooled by a value
+    /// that contains `key=value` text.
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = Vec::new();
         if let Some(transport) = self.transport {
-            parts.push(format!("transport={}", transport.as_str()));
+            fields.push(("transport", transport.as_str().to_owned()));
         }
         if let Some(origin) = &self.origin {
-            parts.push(format!("origin={origin}"));
+            fields.push(("origin", origin.clone()));
         }
         if let Some(hostname) = &self.hostname {
-            parts.push(format!("hostname={hostname}"));
+            fields.push(("hostname", hostname.clone()));
         }
         if let Some(port) = self.port {
-            parts.push(format!("port={port}"));
+            fields.push(("port", port.to_string()));
         }
         if let Some(stream_type) = self.stream_type {
-            parts.push(format!("stream_type={}", stream_type.as_str()));
+            fields.push(("stream_type", stream_type.as_str().to_owned()));
         }
         if let Some(provider) = &self.provider {
-            parts.push(format!("provider={provider}"));
+            fields.push(("provider", provider.clone()));
         }
         if let Some(request) = &self.proxy_request_type {
-            parts.push(format!("proxy_request_type={request}"));
+            fields.push(("proxy_request_type", request.clone()));
         }
         if let Some(limit_type) = &self.limit_type {
-            parts.push(format!("limit_type={limit_type}"));
+            fields.push(("limit_type", limit_type.clone()));
         }
         if let Some(amount) = self.amount {
-            parts.push(format!("amount={amount}"));
+            fields.push(("amount", amount.to_string()));
         }
         if let Some(code) = self.protocol_code.transport_close_code {
-            parts.push(format!("transport_close_code={code}"));
+            fields.push(("transport_close_code", code.to_string()));
         }
         if let Some(code) = self.protocol_code.wisp_close_code {
-            parts.push(format!("wisp_close_code={code}"));
+            fields.push(("wisp_close_code", code.to_string()));
         }
+        fields
+    }
+
+    /// One-line `key=value` summary of the optional fields this report
+    /// carries, or `None` when it carries none. Kept for compatibility with
+    /// consumers that already parse it; new code should read the fields. The
+    /// order is fixed so the output is stable for display and for tests, and
+    /// whitespace and control characters inside a value (an Origin header is
+    /// attacker text) are percent-escaped so a value cannot add fields.
+    pub fn detail(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .fields()
+            .into_iter()
+            .map(|(name, value)| format!("{name}={}", escape_detail_value(&value)))
+            .collect();
         if parts.is_empty() {
             None
         } else {
             Some(parts.join(" "))
         }
     }
+}
+
+fn escape_detail_value(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        if c.is_whitespace() || c.is_control() {
+            let mut buf = [0_u8; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Emission budget per `(ip_hash, error_type)`: a burst of
+/// [`REPORT_BURST`] reports per [`REPORT_WINDOW`], then silence until the
+/// window turns over. A single noisy client therefore cannot flood the log or
+/// the hook (and the panel behind it) while still leaving enough repeats for
+/// a consumer to see that the client is persistent.
+const REPORT_WINDOW: Duration = Duration::from_secs(10);
+const REPORT_BURST: u32 = 20;
+const REPORT_TRACKED_KEYS: usize = 8192;
+
+type ThrottleKey = (String, ReportErrorType);
+
+#[derive(Default)]
+struct ReportThrottle {
+    windows: HashMap<ThrottleKey, (Instant, u32)>,
+}
+
+impl ReportThrottle {
+    fn admit(&mut self, ip_hash: Option<&str>, error_type: ReportErrorType, now: Instant) -> bool {
+        let key = (ip_hash.unwrap_or_default().to_owned(), error_type);
+        if let Some((start, count)) = self.windows.get_mut(&key) {
+            if now.saturating_duration_since(*start) >= REPORT_WINDOW {
+                *start = now;
+                *count = 1;
+                return true;
+            }
+            if *count >= REPORT_BURST {
+                return false;
+            }
+            *count += 1;
+            return true;
+        }
+        if self.windows.len() >= REPORT_TRACKED_KEYS {
+            self.windows
+                .retain(|_, (start, _)| now.saturating_duration_since(*start) < REPORT_WINDOW);
+        }
+        // Still full of live windows (hash churn): let this one through
+        // untracked rather than dropping reports from unseen clients.
+        if self.windows.len() < REPORT_TRACKED_KEYS {
+            self.windows.insert(key, (now, 1));
+        }
+        true
+    }
+}
+
+static THROTTLE: OnceLock<Mutex<ReportThrottle>> = OnceLock::new();
+static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Reports dropped by the per-hash emission budget since process start.
+pub fn suppressed_report_count() -> u64 {
+    SUPPRESSED.load(Ordering::Relaxed)
 }
 
 /// Receives every report [`emit_report`] produces. Runs inline on the
@@ -439,11 +562,22 @@ pub fn set_report_hook(hook: Option<Arc<ReportHook>>) {
 }
 
 /// Build a report and emit it on the `wisp_reports` tracing target as JSON,
-/// then pass it to the hook from [`set_report_hook`].
+/// then pass it to the hook from [`set_report_hook`]. Reports beyond the
+/// per-`(ip_hash, error_type)` budget are counted and dropped, see
+/// [`suppressed_report_count`].
 /// Call this from admit/reject/close paths so aggregators can scrape stable
 /// `report_code` values without parsing free-form log lines.
 pub fn emit_report(error_type: ReportErrorType, input: ReportInput) {
     let report = create_report(error_type, input);
+    let admitted = THROTTLE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .admit(report.ip_hash.as_deref(), error_type, Instant::now());
+    if !admitted {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     match serde_json::to_string(&report) {
         Ok(json) => {
             tracing::info!(
@@ -500,6 +634,29 @@ mod tests {
             ReportErrorType::InvalidPacket.definition().category,
             ReportCategory::Protocol
         ));
+    }
+
+    #[test]
+    fn report_origin_is_truncated_on_a_char_boundary() {
+        let long = format!("https://{}", "\u{e9}".repeat(10_000));
+        let r = create_report(
+            ReportErrorType::OriginBlocked,
+            ReportInput {
+                origin: Some(long.clone()),
+                ..Default::default()
+            },
+        );
+        let origin = r.origin.expect("origin kept");
+        assert!(origin.len() <= MAX_REPORT_ORIGIN_BYTES);
+        assert!(long.starts_with(&origin));
+        let short = create_report(
+            ReportErrorType::OriginBlocked,
+            ReportInput {
+                origin: Some("https://example.com".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(short.origin.as_deref(), Some("https://example.com"));
     }
 
     #[test]
@@ -593,9 +750,19 @@ mod tests {
         );
         assert_eq!(
             r.ip_hash,
-            hash_client_ip(Some("203.0.113.5"), None),
+            hash_client_ip_keyed(Some("203.0.113.5")),
             "derived hash must match the one the transports ban on"
         );
+    }
+
+    #[test]
+    fn hostname_is_dropped_unless_enabled() {
+        assert_eq!(gate_hostname(Some("example.com".to_owned()), false), None);
+        assert_eq!(
+            gate_hostname(Some("example.com".to_owned()), true).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(gate_hostname(None, true), None);
     }
 
     #[test]
@@ -664,5 +831,91 @@ mod tests {
                 .is_err(),
             "a removed hook must not be called"
         );
+    }
+
+    #[test]
+    fn detail_escapes_values_that_could_forge_fields() {
+        let r = create_report(
+            ReportErrorType::OriginBlocked,
+            ReportInput {
+                origin: Some("https://a.test hostname=evil.test\nport=22".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            r.detail().as_deref(),
+            Some("origin=https://a.test%20hostname=evil.test%0Aport=22")
+        );
+        // The structured view keeps the raw value.
+        assert_eq!(
+            r.fields(),
+            vec![(
+                "origin",
+                "https://a.test hostname=evil.test\nport=22".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn fields_match_detail_for_plain_values() {
+        let r = create_report(
+            ReportErrorType::TcpByteRateLimited,
+            ReportInput {
+                transport: Some(Transport::Wt),
+                port: Some(443),
+                stream_type: Some(StreamType::Tcp),
+                amount: Some(7),
+                wisp_close_code: Some(0x48),
+                ..Default::default()
+            },
+        );
+        let joined = r
+            .fields()
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(r.detail().as_deref(), Some(joined.as_str()));
+        assert!(joined.starts_with("transport=wt port=443"));
+    }
+
+    #[test]
+    fn throttle_caps_a_hash_per_window_and_refreshes() {
+        let mut throttle = ReportThrottle::default();
+        let start = Instant::now();
+        for _ in 0..REPORT_BURST {
+            assert!(throttle.admit(Some("h1"), ReportErrorType::OriginBlocked, start));
+        }
+        assert!(!throttle.admit(Some("h1"), ReportErrorType::OriginBlocked, start));
+        // Other hashes and other kinds are separate budgets.
+        assert!(throttle.admit(Some("h2"), ReportErrorType::OriginBlocked, start));
+        assert!(throttle.admit(Some("h1"), ReportErrorType::ClientBlocked, start));
+        assert!(throttle.admit(
+            Some("h1"),
+            ReportErrorType::OriginBlocked,
+            start + REPORT_WINDOW
+        ));
+    }
+
+    #[test]
+    fn throttle_stays_bounded_and_never_blocks_new_hashes() {
+        let mut throttle = ReportThrottle::default();
+        let now = Instant::now();
+        for index in 0..REPORT_TRACKED_KEYS + 100 {
+            assert!(throttle.admit(
+                Some(&format!("hash-{index}")),
+                ReportErrorType::ClientBlocked,
+                now
+            ));
+        }
+        assert!(throttle.windows.len() <= REPORT_TRACKED_KEYS);
+        assert!(throttle.admit(Some("late"), ReportErrorType::ClientBlocked, now));
+        // Once the windows expire the map drains on the next insert.
+        assert!(throttle.admit(
+            Some("later"),
+            ReportErrorType::ClientBlocked,
+            now + REPORT_WINDOW
+        ));
+        assert!(throttle.windows.len() < 10);
     }
 }
