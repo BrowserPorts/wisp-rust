@@ -8,7 +8,26 @@ resolver_timeout_ms = 1000
 
 [wisp.destination]
 port_whitelist    = [80, 443]
+# Needs the policy change that adds this key; an older wispd refuses the file while it is here
+udp_port_whitelist = [443]
 host_port_whitelist = [{ host = "highschool-game1.g123-puyo.com", port = 13002 }]
+# The origin host's own public addresses, so a Wisp client cannot dial back into it, and the
+# Eaglercraft backend the front reaches over a separate route
+ip_blacklist = ["5.188.124.21/32", "5.188.124.72/32"]
+
+# Only Stellite's own sites may open the endpoint from a visitor's browser. Contributed (managed)
+# domains open it from their own origin, so each of them has to be added here too, through the
+# link panel, or it stops working once this list is live.
+[wisp.origin]
+origin_whitelist = [
+  "https://stellite.games",
+  "https://*.stellite.games",
+  "https://stellitegames.com",
+  "https://*.stellitegames.com",
+  "https://stelight.games",
+  "https://*.stelight.games",
+  "https://staging.stellite.game",
+]
 
 [wisp.rate_limit]
 backend = "memory"
