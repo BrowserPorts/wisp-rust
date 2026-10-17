@@ -3083,6 +3083,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "sha2",
+ "tracing",
 ]
 
 [[package]]
