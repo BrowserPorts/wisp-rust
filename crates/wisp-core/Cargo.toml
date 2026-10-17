@@ -24,6 +24,7 @@ ws = [
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 wisp-config = { path = "../wisp-config" }

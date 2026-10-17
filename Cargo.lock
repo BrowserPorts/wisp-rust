@@ -3042,6 +3042,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "wisp-config",
  "wisp-dos",
  "wisp-iphash",

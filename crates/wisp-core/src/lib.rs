@@ -23,16 +23,20 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::warn;
 use wisp_config::{
-    build_wisp_wt_options, load_toml, IngressMode, ReloadingTokenResolver, WispAuthRegistry,
-    WispAuthResolver, WispServerOptions, WispWtServerOptions,
+    build_wisp_wt_options, load_toml, ReloadingTokenResolver, WispAuthRegistry, WispAuthResolver,
+    WispServerOptions, WispWtServerOptions,
 };
 use wisp_dos::{ConnectionLimiter, DosGuard};
 use wisp_iphash::IpHashBans;
 
 #[cfg(feature = "ws")]
 use tokio::task::JoinHandle;
+#[cfg(feature = "ws")]
+use tracing::info;
+#[cfg(feature = "ws")]
+use wisp_config::IngressMode;
 #[cfg(feature = "ws")]
 use wisp_proxy_base::SharedProvider;
 #[cfg(feature = "ws")]
@@ -41,8 +45,9 @@ use wisp_proxy_mullvad::{MullvadProxyConfig, MullvadProxyProvider};
 use wisp_proxy_resi::{ResidentialProxyConfig, ResidentialProxyProvider};
 #[cfg(feature = "ws")]
 use wisp_router::{
-    serve_ws_h2_listener, serve_ws_plain_listener, WsH2ListenerConfig, WsH2ListenerError,
-    WsPlainListenerConfig, WsPlainListenerError,
+    bind_ws_h2_listener, bind_ws_plain_listener, serve_bound_ws_h2_listener,
+    serve_bound_ws_plain_listener, WsH2ListenerConfig, WsH2ListenerError, WsPlainListenerConfig,
+    WsPlainListenerError,
 };
 #[cfg(feature = "ws")]
 use wisp_wisp_server::{ProxyControllerTemplate, ProxyRuntimePolicy};
@@ -53,6 +58,7 @@ use wisp_ws_h2::H2ServeContext;
 use wisp_server::H3WsContext;
 #[cfg(feature = "quic")]
 pub use wisp_server::ServeHandle;
+#[cfg(feature = "quic")]
 use wisp_server::{serve as serve_listener, ServeError, ServeExtras};
 
 #[derive(Debug, Error)]
@@ -61,6 +67,8 @@ pub enum CoreError {
     Config(#[from] wisp_config::ConfigError),
     #[error("rate-limit backend: {0}")]
     Dos(#[from] wisp_dos::DosError),
+    #[error("ip hash key: {0}")]
+    IpHashKey(#[from] wisp_iphash::KeyError),
     #[error("wisp_wt.enabled is false; not binding listener")]
     ListenerDisabled,
     #[cfg(feature = "quic")]
@@ -101,6 +109,21 @@ impl RuntimeConfig {
         self.log_level = level.into();
         self
     }
+
+    /// Install a global `fmt` subscriber filtered by [`RuntimeConfig::log_level`]
+    /// (any `EnvFilter` directive string, e.g. `info` or `wisp_server=debug`).
+    /// For embedders that have no subscriber of their own, such as the napi
+    /// addon. `Ok(true)` means this call installed it, `Ok(false)` that a
+    /// subscriber already existed and was left alone, and an invalid level is
+    /// an error rather than a silent fallback.
+    pub fn init_tracing(&self) -> Result<bool, String> {
+        let filter = tracing_subscriber::EnvFilter::try_new(&self.log_level)
+            .map_err(|error| format!("invalid log level {:?}: {error}", self.log_level))?;
+        Ok(tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .try_init()
+            .is_ok())
+    }
 }
 
 /// Live runtime handle. Drop to stop accepting new sessions and let in-flight
@@ -121,7 +144,12 @@ impl Runtime {
     /// Build the runtime state. Does **not** start a listener — call
     /// [`Runtime::bind`] for that.
     pub fn start(cfg: RuntimeConfig) -> Result<Self, CoreError> {
+        // Read WISP_IP_HASH_KEY now so a malformed key stops the start, and an
+        // unset one is warned about once at startup.
+        wisp_iphash::init_process_key()?;
         let dos = Arc::new(DosGuard::from_options(&cfg.options.base)?);
+        #[cfg(feature = "ws")]
+        wisp_wisp_server::set_max_buffered_bytes_total(cfg.options.base.max_buffered_bytes_total);
         #[cfg(feature = "ws")]
         let proxy_template = build_proxy_template(&cfg.options);
         if !cfg.options.enabled {
@@ -201,6 +229,12 @@ impl Runtime {
     }
 
     pub fn register_limit_profile(&self, name: String, options: WispServerOptions) -> bool {
+        // The process byte budget follows the base limits only; a named
+        // profile cannot raise it for everyone.
+        #[cfg(feature = "ws")]
+        if name == wisp_config::WISP_BASE_LIMIT_PROFILE {
+            wisp_wisp_server::set_max_buffered_bytes_total(options.max_buffered_bytes_total);
+        }
         self.auth.register_profile(name, options)
     }
 
@@ -291,7 +325,8 @@ impl Runtime {
 
     /// Bind the WS-over-H2 listener if `[wisp_websocket].enabled = true`.
     /// Returns `Ok(None)` when the section is absent or disabled so callers
-    /// can run the WT side alone. The returned `JoinHandle` resolves when
+    /// can run the WT side alone. The socket is bound (and the TLS identity
+    /// loaded) before this returns, so those errors come back as `Err`. The returned `JoinHandle` resolves when
     /// the accept loop exits (typically: process shutdown). The cancellation
     /// token from this runtime is honored — `Runtime::shutdown` will drop
     /// the listener.
@@ -323,10 +358,12 @@ impl Runtime {
                 return Ok(None);
             };
             let bind_addr = cfg.bind_addr;
+            // Bound here, not in the task, so a bind error fails the start.
+            let listener = bind_ws_plain_listener(&cfg)?;
             info!(addr = %bind_addr, "wispd: launching ws-plain listener");
             let handle = tokio::spawn(async move {
                 tokio::select! {
-                    res = serve_ws_plain_listener(cfg, ctx) => {
+                    res = serve_bound_ws_plain_listener(listener, cfg, ctx) => {
                         if let Err(e) = res {
                             warn!(addr = %bind_addr, error = %e, "ws-plain listener exited");
                         }
@@ -343,10 +380,11 @@ impl Runtime {
             return Ok(None);
         };
         let bind_addr = cfg.bind_addr;
+        let (listener, acceptor) = bind_ws_h2_listener(&cfg)?;
         info!(addr = %bind_addr, "wispd: launching ws-h2 listener");
         let handle = tokio::spawn(async move {
             tokio::select! {
-                res = serve_ws_h2_listener(cfg, ctx) => {
+                res = serve_bound_ws_h2_listener(listener, acceptor, cfg, ctx) => {
                     if let Err(e) = res {
                         warn!(addr = %bind_addr, error = %e, "ws-h2 listener exited");
                     }
@@ -443,6 +481,26 @@ mod tests {
         assert!(!tok.is_cancelled());
         rt.shutdown().await;
         assert!(tok.is_cancelled());
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn bind_ws_returns_the_bind_error() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let port = taken.local_addr().expect("reserved address").port();
+        let mut opts = WispWtServerOptions::default();
+        opts.websocket.enabled = true;
+        opts.websocket.ingress_mode = IngressMode::DirectPlain;
+        opts.websocket.host = "127.0.0.1".to_owned();
+        opts.websocket.port = port;
+        let rt = Runtime::start(RuntimeConfig::from_options(opts).expect("options validate"))
+            .expect("runtime start");
+        let err = rt.bind_ws().expect_err("the port is taken");
+        assert!(
+            matches!(err, CoreError::WsPlain(WsPlainListenerError::Bind { .. })),
+            "got {err:?}"
+        );
+        drop(taken);
     }
 
     #[test]
