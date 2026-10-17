@@ -3102,6 +3102,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "hickory-resolver",
+ "libc",
  "socket2 0.5.10",
  "thiserror 1.0.69",
  "tokio",

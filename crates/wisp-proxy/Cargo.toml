@@ -17,3 +17,6 @@ url = { workspace = true }
 wisp-config = { path = "../wisp-config" }
 wisp-wire = { path = "../wisp-wire" }
 wisp-reports = { path = "../wisp-reports" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
