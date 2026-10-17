@@ -6,14 +6,17 @@
 //!
 //! Sentinel: a limit of [`UNLIMITED`] (`u64::MAX`, produced from the `-1` TOML
 //! convention) means "no cap". The helpers treat it as unbounded and avoid
-//! overflow.
+//! overflow. A finite limit of `0` is the opposite extreme: it denies every
+//! request (`WispServerOptions::validate` rejects it so a typo cannot silently
+//! close a gate). The one exception is the concurrent-connection pair handled
+//! by [`ConnectionLimiter`], where `0` means "no cap" for that dimension.
 
 #![forbid(unsafe_code)]
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -25,8 +28,31 @@ pub const UNLIMITED: u64 = u64::MAX;
 
 /// Upper bound on live entries in each bucket map. Bounds attacker-driven key
 /// churn (e.g. IP rotation) so the maps can't grow without limit between the
-/// coarse time-based sweeps. When exceeded, the oldest entries are evicted.
+/// coarse time-based sweeps. When exceeded, the least recently used idle
+/// entries are evicted in a batch of `MAX_BUCKETS / EVICT_DIVISOR`. A bucket
+/// that a live connection still holds is never evicted, and if every entry is
+/// held the new key gets a detached bucket that is not stored: a full map
+/// never denies a new client, it only costs that client its remembered state.
 const MAX_BUCKETS: usize = 65_536;
+const EVICT_DIVISOR: usize = 16;
+
+/// IPv6 per-IP keys are aggregated to this many leading bits (the /56 a
+/// residential ISP typically delegates), so one subscriber cannot mint a
+/// fresh bucket per /64. Set from `rate_limit_ipv6_prefix` by
+/// [`DosGuard::from_options`]; the helpers and [`ConnectionLimiter`] read it
+/// when they build a key. It is process-wide because those helpers have no
+/// handle to the options.
+pub const DEFAULT_IPV6_PREFIX: u8 = 56;
+static IPV6_PREFIX: AtomicU8 = AtomicU8::new(DEFAULT_IPV6_PREFIX);
+
+/// Redis leases cover one twentieth of the limit (at most 1 MiB worth), but
+/// never less than the single request being admitted.
+const REDIS_LEASE_DIVISOR: u64 = 20;
+/// Connect and per-command deadlines for the Redis backend. The limiter has a
+/// single worker thread, so a stalled server would otherwise wedge every
+/// limiter until the OS gave up on the socket.
+const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_000);
+const REDIS_IO_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Shared bucket key for clients whose IP could not be parsed. All
 /// unidentifiable clients collapse into this single key so they share one
@@ -133,7 +159,15 @@ impl RedisPool {
             }
             state.total += 1;
         }
-        match self.inner.client.get_connection() {
+        match self
+            .inner
+            .client
+            .get_connection_with_timeout(REDIS_CONNECT_TIMEOUT)
+            .and_then(|connection| {
+                connection.set_read_timeout(Some(REDIS_IO_TIMEOUT))?;
+                connection.set_write_timeout(Some(REDIS_IO_TIMEOUT))?;
+                Ok(connection)
+            }) {
             Ok(connection) => Some(RedisLease {
                 connection: Some(connection),
                 pool: self.clone(),
@@ -282,6 +316,11 @@ enum RedisWork {
         requests: Vec<ConsumeRequest>,
         grants: Vec<(Arc<Mutex<Bucket>>, u64, u64)>,
     },
+    /// Account for tokens a fresh local bucket was seeded with before Redis
+    /// was asked. A denial (or a dead Redis) takes the seed back.
+    Debit {
+        seeds: Vec<(Arc<Mutex<Bucket>>, ConsumeRequest)>,
+    },
     Unique {
         key: String,
         value: String,
@@ -328,8 +367,16 @@ fn redis_worker(guard: RedisGuard, receiver: mpsc::Receiver<RedisWork>) {
                     bucket.lease_pending = false;
                     if allowed {
                         bucket.tokens = bucket.tokens.saturating_add(amount).min(bucket.capacity);
-                        bucket.lease_expires =
-                            Some(now + Duration::from_millis(window_ms.saturating_div(20).max(1)));
+                        bucket.lease_expires = Some(now + redis_lease_ttl(window_ms));
+                    }
+                }
+            }
+            RedisWork::Debit { seeds } => {
+                for (bucket, request) in seeds {
+                    let allowed = normalize_batch(std::slice::from_ref(&request))
+                        .is_some_and(|batch| guard.consume(&batch, DosGuard::now_ms()));
+                    if !allowed {
+                        revoke_seed(&bucket, request.amount);
                     }
                 }
             }
@@ -346,37 +393,78 @@ fn redis_worker(guard: RedisGuard, receiver: mpsc::Receiver<RedisWork>) {
                 bucket.pending.remove(&value);
                 if allowed {
                     bucket.values.insert(value);
+                } else {
+                    // Admitted optimistically but refused by Redis (or Redis
+                    // was unreachable): remember the refusal so repeats are
+                    // denied and the slot stays counted.
+                    bucket.denied.insert(value);
                 }
             }
         }
     }
 }
 
+/// Local lease for one Redis refill: a twentieth of the limit (at most 1 MiB
+/// worth), raised to the request being admitted so a single chunk always fits,
+/// and capped at the limit.
+fn redis_lease(limit: u64, amount: u64) -> u64 {
+    let base = limit
+        .saturating_div(REDIS_LEASE_DIVISOR)
+        .clamp(1, 1024 * 1024);
+    base.max(amount).min(limit)
+}
+
+/// How long unspent leased tokens stay usable locally. Never shorter than a
+/// second: a per-second byte bucket would otherwise expire its lease after
+/// 50 ms and throttle a steady stream that Redis would have admitted.
+fn redis_lease_ttl(window_ms: u64) -> Duration {
+    Duration::from_millis(window_ms.saturating_div(20).max(SECOND_MS))
+}
+
+fn revoke_seed(bucket: &Mutex<Bucket>, amount: u64) {
+    let mut bucket = bucket.lock();
+    bucket.tokens = bucket.tokens.saturating_sub(amount);
+}
+
+/// Set the IPv6 aggregation prefix used by per-IP keys. Clamped to 16..=64:
+/// normalization already masks to /64, so a longer prefix adds nothing.
+pub fn set_ipv6_prefix(bits: u8) {
+    IPV6_PREFIX.store(bits.clamp(16, 64), Ordering::Relaxed);
+}
+
 /// Normalize a client IP for use as a per-IP rate-limit key. IPv6 is masked to
-/// its /64, so an attacker holding a routed /64 can't mint unlimited distinct
-/// keys by rotating the low 64 bits. IPv4 passes through unchanged. Input that
+/// the configured prefix (default /56, see [`DEFAULT_IPV6_PREFIX`]), so an
+/// attacker holding a routed /56 can't mint unlimited distinct keys by
+/// rotating the low bits. IPv4 passes through unchanged. Input that
 /// does not parse as an IP is unidentifiable and collapses to a single shared
 /// [`UNIDENTIFIED_KEY`] bucket, so malformed header text can never be treated as
 /// a distinct per-IP identity and instead shares the strictest limit.
 fn dos_ip_key(client_ip: &str) -> String {
-    match wisp_iphash::normalize_client_ip(client_ip) {
-        Some(key) if is_identifiable(&key) => key,
-        _ => UNIDENTIFIED_KEY.to_owned(),
-    }
+    let prefix = IPV6_PREFIX.load(Ordering::Relaxed);
+    wisp_iphash::normalize_client_ip(client_ip)
+        .and_then(|key| aggregate_ip_key(&key, prefix))
+        .unwrap_or_else(|| UNIDENTIFIED_KEY.to_owned())
 }
 
-/// A normalized key is a real identity only if it is an IPv4 literal or a masked
-/// IPv6 /64. Anything else is treated as unidentifiable so it cannot mint a
-/// distinct per-IP bucket.
-fn is_identifiable(key: &str) -> bool {
+/// A normalized key is a real identity only if it is an IPv4 literal or a
+/// masked IPv6 /64 (re-masked here to `prefix`). Anything else is treated as
+/// unidentifiable so it cannot mint a distinct per-IP bucket.
+fn aggregate_ip_key(key: &str, prefix: u8) -> Option<String> {
     if key.parse::<std::net::Ipv4Addr>().is_ok() {
-        return true;
+        return Some(key.to_owned());
     }
-    key.strip_suffix("/64")
-        .and_then(|net| net.parse::<std::net::Ipv6Addr>().ok())
-        .is_some()
+    let net = key
+        .strip_suffix("/64")?
+        .parse::<std::net::Ipv6Addr>()
+        .ok()?;
+    let prefix = prefix.clamp(16, 64);
+    let masked = u128::from(net) & (u128::MAX << (128 - u32::from(prefix)));
+    Some(format!("{}/{prefix}", std::net::Ipv6Addr::from(masked)))
 }
 
+/// One token-bucket charge. `limit` is the bucket capacity per `window_ms`
+/// (0 is a valid "deny everything" bucket, [`UNLIMITED`] skips the bucket) and
+/// `amount` the tokens to take.
 #[derive(Debug, Clone)]
 pub struct ConsumeRequest {
     pub key: String,
@@ -441,9 +529,136 @@ struct Bucket {
     remainder: u128,
     last_refill: Instant,
     window_ms: u64,
-    last_seen: u64,
+    /// Last time any request touched this bucket, admitted or not. Drives the
+    /// idle sweep and LRU eviction.
+    last_seen: Instant,
     lease_pending: bool,
     lease_expires: Option<Instant>,
+    /// Redis only: whether the local lease cache has been seeded yet.
+    seeded: bool,
+}
+
+impl Bucket {
+    fn new(limit: u64, window_ms: u64, now: Instant) -> Self {
+        Self {
+            // The memory backend starts full. A Redis bucket is seeded from
+            // the first request that touches it (see `seeded`).
+            tokens: limit,
+            capacity: limit,
+            remainder: 0,
+            last_refill: now,
+            window_ms,
+            last_seen: now,
+            lease_pending: false,
+            lease_expires: None,
+            seeded: false,
+        }
+    }
+
+    /// Credit the tokens earned since the last refill at this bucket's own
+    /// rate.
+    fn refill(&mut self, now: Instant) {
+        let elapsed_ns = now.saturating_duration_since(self.last_refill).as_nanos();
+        let denominator = u128::from(self.window_ms).saturating_mul(1_000_000);
+        let numerator = elapsed_ns
+            .saturating_mul(u128::from(self.capacity))
+            .saturating_add(self.remainder);
+        let refill = numerator / denominator;
+        self.remainder = numerator % denominator;
+        self.tokens = self
+            .tokens
+            .saturating_add(refill.min(u128::from(u64::MAX)) as u64)
+            .min(self.capacity);
+        self.last_refill = now;
+    }
+
+    /// Adopt a new limit or window for a shared key. The tokens already held
+    /// are kept and clamped to the new capacity: resetting to full would let
+    /// two profiles with different limits refill each other's bucket on every
+    /// alternating request. `local_refill` is false for Redis leases, which
+    /// only grow through grants.
+    fn retune(&mut self, limit: u64, window_ms: u64, now: Instant, local_refill: bool) {
+        if self.capacity == limit && self.window_ms == window_ms {
+            return;
+        }
+        if local_refill {
+            self.refill(now);
+        }
+        self.capacity = limit;
+        self.window_ms = window_ms;
+        self.remainder = 0;
+        self.last_refill = now;
+        self.tokens = self.tokens.min(limit);
+    }
+}
+
+/// Entries the eviction pass can rank by recency.
+trait Idle {
+    fn last_seen(&self) -> Instant;
+}
+
+impl Idle for Bucket {
+    fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
+}
+
+/// Look up `key`, creating it when absent. At [`MAX_BUCKETS`] the least
+/// recently used idle entries are evicted first; if the map is still full the
+/// caller gets a detached entry that is simply not stored. Either way a new
+/// key is never refused. Insertion is serialized by `admission`, which is
+/// never taken while an entry's own mutex is held.
+fn get_or_insert<T: Idle>(
+    map: &DashMap<String, Arc<Mutex<T>>>,
+    admission: &Mutex<()>,
+    key: &str,
+    make: impl FnOnce() -> T,
+) -> Arc<Mutex<T>> {
+    if let Some(entry) = map.get(key) {
+        return entry.value().clone();
+    }
+    let _admission = admission.lock();
+    if let Some(entry) = map.get(key) {
+        return entry.value().clone();
+    }
+    if map.len() >= MAX_BUCKETS {
+        evict_idle(map);
+    }
+    let handle = Arc::new(Mutex::new(make()));
+    if map.len() < MAX_BUCKETS {
+        map.insert(key.to_owned(), handle.clone());
+    }
+    handle
+}
+
+/// Drop the oldest `MAX_BUCKETS / EVICT_DIVISOR` entries by last use. Entries
+/// something else still holds (a live connection's prepared bucket) are
+/// skipped, and the holder check runs under the shard lock, so a handle cannot
+/// be cloned out of the map between the check and the removal.
+fn evict_idle<T: Idle>(map: &DashMap<String, Arc<Mutex<T>>>) {
+    let target = MAX_BUCKETS / EVICT_DIVISOR;
+    let mut seen: Vec<Instant> = map
+        .iter()
+        .filter(|entry| Arc::strong_count(entry.value()) == 1)
+        .map(|entry| entry.value().lock().last_seen())
+        .collect();
+    if seen.is_empty() {
+        return;
+    }
+    let rank = target.min(seen.len()) - 1;
+    let (_, cutoff, _) = seen.select_nth_unstable(rank);
+    let cutoff = *cutoff;
+    let mut removed = 0;
+    map.retain(|_, entry| {
+        if removed >= target || Arc::strong_count(entry) > 1 {
+            return true;
+        }
+        if entry.lock().last_seen() <= cutoff {
+            removed += 1;
+            return false;
+        }
+        true
+    });
 }
 
 struct PreparedBucket {
@@ -458,29 +673,11 @@ impl PreparedBucket {
     fn consume(&self, amount: u64) -> bool {
         let now = Instant::now();
         let mut bucket = self.bucket.lock();
-        if bucket.capacity != self.limit || bucket.window_ms != self.window_ms {
-            bucket.capacity = self.limit;
-            bucket.window_ms = self.window_ms;
-            bucket.remainder = 0;
-            bucket.last_refill = now;
-            bucket.lease_pending = false;
-            bucket.lease_expires = None;
-            bucket.tokens = if self.redis.is_some() { 0 } else { self.limit };
-        }
+        bucket.last_seen = now;
+        bucket.retune(self.limit, self.window_ms, now, self.redis.is_none());
 
         let Some(redis) = self.redis.as_ref() else {
-            let elapsed_ns = now.duration_since(bucket.last_refill).as_nanos();
-            let denominator = u128::from(self.window_ms).saturating_mul(1_000_000);
-            let numerator = elapsed_ns
-                .saturating_mul(u128::from(self.limit))
-                .saturating_add(bucket.remainder);
-            let refill = numerator / denominator;
-            bucket.remainder = numerator % denominator;
-            bucket.tokens = bucket
-                .tokens
-                .saturating_add(refill.min(u128::from(u64::MAX)) as u64)
-                .min(self.limit);
-            bucket.last_refill = now;
+            bucket.refill(now);
             if amount > bucket.tokens {
                 return false;
             }
@@ -492,12 +689,24 @@ impl PreparedBucket {
             bucket.tokens = 0;
             bucket.lease_expires = None;
         }
+        let lease = redis_lease(self.limit, amount);
+        let mut seed = None;
+        if !bucket.seeded {
+            // A new bucket starts full like the shared one in Redis does,
+            // instead of denying its first request while a lease is fetched.
+            // The seed is debited from Redis right after and taken back if
+            // that fails.
+            bucket.seeded = true;
+            if amount <= self.limit {
+                bucket.tokens = lease;
+                bucket.lease_expires = Some(now + redis_lease_ttl(self.window_ms));
+                seed = Some(lease);
+            }
+        }
         let admitted = amount <= bucket.tokens;
         if admitted {
             bucket.tokens -= amount;
         }
-        let base = self.limit.saturating_div(20).clamp(1, 1024 * 1024);
-        let lease = base.max(amount).min(self.limit);
         if !bucket.lease_pending && bucket.tokens <= lease.saturating_div(4) {
             bucket.lease_pending = true;
             drop(bucket);
@@ -514,8 +723,31 @@ impl PreparedBucket {
                     bucket.lock().lease_pending = false;
                 }
             }
+        } else {
+            drop(bucket);
+        }
+        if let Some(seed) = seed {
+            submit_debits(
+                redis,
+                vec![(
+                    self.bucket.clone(),
+                    ConsumeRequest::new(self.key.as_ref(), self.limit, self.window_ms)
+                        .with_amount(seed),
+                )],
+            );
         }
         admitted
+    }
+}
+
+fn submit_debits(redis: &RedisLeaseClient, seeds: Vec<(Arc<Mutex<Bucket>>, ConsumeRequest)>) {
+    if redis.submit(RedisWork::Debit {
+        seeds: seeds.clone(),
+    }) {
+        return;
+    }
+    for (bucket, request) in seeds {
+        revoke_seed(&bucket, request.amount);
     }
 }
 
@@ -524,7 +756,6 @@ impl PreparedBucket {
 pub struct TcpByteLimiter {
     connection: Option<PreparedBucket>,
     client: Option<PreparedBucket>,
-    rejected: bool,
 }
 
 impl TcpByteLimiter {
@@ -534,8 +765,11 @@ impl TcpByteLimiter {
         options: &WispServerOptions,
         store: &DosGuard,
     ) -> Self {
+        // A full store no longer fails a limiter: `prepare_bucket` evicts or
+        // hands back a detached bucket, so a new stream is never throttled
+        // just because the map is busy.
         let connection = if options.max_tcp_bytes_per_connection_per_second == UNLIMITED {
-            Ok(None)
+            None
         } else {
             connection.guard.prepare_bucket(
                 "tcp:bytes:connection".to_owned(),
@@ -544,7 +778,7 @@ impl TcpByteLimiter {
             )
         };
         let client = if options.max_tcp_bytes_per_ip_per_second == UNLIMITED {
-            Ok(None)
+            None
         } else {
             store.prepare_bucket(
                 format!("tcp:bytes:ip:{}", dos_ip_key(client_ip)),
@@ -552,24 +786,16 @@ impl TcpByteLimiter {
                 SECOND_MS,
             )
         };
-        let rejected = connection.is_err() || client.is_err();
-        Self {
-            connection: connection.ok().flatten(),
-            client: client.ok().flatten(),
-            rejected,
-        }
+        Self { connection, client }
     }
 
     #[inline]
     pub fn is_active(&self) -> bool {
-        self.rejected || self.connection.is_some() || self.client.is_some()
+        self.connection.is_some() || self.client.is_some()
     }
 
     #[inline]
     pub fn is_allowed(&self, bytes: u64) -> bool {
-        if self.rejected {
-            return false;
-        }
         if self
             .connection
             .as_ref()
@@ -586,10 +812,19 @@ impl TcpByteLimiter {
 #[derive(Debug)]
 struct UniqueBucket {
     values: HashSet<String>,
+    /// Redis only: values admitted locally whose Redis check is in flight.
     pending: HashSet<String>,
+    /// Redis only: values Redis refused, or could not be asked about.
+    denied: HashSet<String>,
     window_start: u64,
     window_ms: u64,
-    last_seen: u64,
+    last_seen: Instant,
+}
+
+impl Idle for UniqueBucket {
+    fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
 }
 
 /// In-memory token buckets. `consume` reserves all-or-nothing across every
@@ -636,6 +871,7 @@ impl DosGuard {
 
     pub fn from_options(options: &WispServerOptions) -> Result<Self, DosError> {
         options.validate()?;
+        set_ipv6_prefix(options.rate_limit_ipv6_prefix);
         match options.rate_limit_backend {
             RateLimitBackend::Memory => Ok(Self::new()),
             RateLimitBackend::Redis => Ok(Self {
@@ -649,50 +885,24 @@ impl DosGuard {
         }
     }
 
-    fn prepare_bucket(
-        &self,
-        key: String,
-        limit: u64,
-        window_ms: u64,
-    ) -> Result<Option<PreparedBucket>, ()> {
+    /// Bucket handle for one limit, or `None` when the limit is [`UNLIMITED`].
+    fn prepare_bucket(&self, key: String, limit: u64, window_ms: u64) -> Option<PreparedBucket> {
         if limit == UNLIMITED {
-            return Ok(None);
+            return None;
         }
-        let now = Self::now_ms();
-        self.maybe_cleanup(now);
+        self.maybe_cleanup();
         let monotonic_now = Instant::now();
         let window_ms = window_ms.max(1);
-        let bucket = if let Some(entry) = self.buckets.get(key.as_str()) {
-            entry.value().clone()
-        } else {
-            let _admission = self.bucket_admission.lock();
-            if let Some(entry) = self.buckets.get(key.as_str()) {
-                entry.value().clone()
-            } else {
-                if self.buckets.len() >= MAX_BUCKETS {
-                    return Err(());
-                }
-                let bucket = Arc::new(Mutex::new(Bucket {
-                    tokens: if self.redis.is_some() { 0 } else { limit },
-                    capacity: limit,
-                    remainder: 0,
-                    last_refill: monotonic_now,
-                    window_ms,
-                    last_seen: now,
-                    lease_pending: false,
-                    lease_expires: None,
-                }));
-                self.buckets.insert(key.clone(), bucket.clone());
-                bucket
-            }
-        };
-        Ok(Some(PreparedBucket {
+        let bucket = get_or_insert(&self.buckets, &self.bucket_admission, &key, || {
+            Bucket::new(limit, window_ms, monotonic_now)
+        });
+        Some(PreparedBucket {
             key: Arc::from(key),
             limit,
             window_ms,
             bucket,
             redis: self.redis.clone(),
-        }))
+        })
     }
 
     fn now_ms() -> u64 {
@@ -709,78 +919,35 @@ impl DosGuard {
         if batch.is_empty() {
             return true;
         }
-        let now = Self::now_ms();
         let monotonic_now = Instant::now();
         if let Some(redis) = &self.redis {
-            return self.consume_redis(redis, &batch, now, monotonic_now);
+            return self.consume_redis(redis, &batch, monotonic_now);
         }
-        self.maybe_cleanup(now);
-        let mut handles = Vec::with_capacity(batch.len());
-        for request in &batch {
-            let window_ms = request.window_ms.max(1);
-            let handle = if let Some(entry) = self.buckets.get(request.key) {
-                entry.value().clone()
-            } else {
-                let _admission = self.bucket_admission.lock();
-                if let Some(entry) = self.buckets.get(request.key) {
-                    entry.value().clone()
-                } else {
-                    if self.buckets.len() >= MAX_BUCKETS {
-                        return false;
-                    }
-                    let handle = Arc::new(Mutex::new(Bucket {
-                        tokens: request.limit,
-                        capacity: request.limit,
-                        remainder: 0,
-                        last_refill: monotonic_now,
-                        window_ms,
-                        last_seen: now,
-                        lease_pending: false,
-                        lease_expires: None,
-                    }));
-                    self.buckets.insert(request.key.to_owned(), handle.clone());
-                    handle
-                }
-            };
-            handles.push(handle);
-        }
+        self.maybe_cleanup();
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|request| {
+                get_or_insert(&self.buckets, &self.bucket_admission, request.key, || {
+                    Bucket::new(request.limit, request.window_ms.max(1), monotonic_now)
+                })
+            })
+            .collect();
         let mut buckets: Vec<_> = handles.iter().map(|bucket| bucket.lock()).collect();
-        let mut commits = Vec::with_capacity(batch.len());
-        for (request, bucket) in batch.iter().zip(buckets.iter()) {
-            let window_ms = request.window_ms;
-            let (tokens, remainder) =
-                if bucket.window_ms == window_ms && bucket.capacity == request.limit {
-                    let elapsed_ns = monotonic_now.duration_since(bucket.last_refill).as_nanos();
-                    let denominator = u128::from(window_ms).saturating_mul(1_000_000);
-                    let numerator = elapsed_ns
-                        .saturating_mul(u128::from(request.limit))
-                        .saturating_add(bucket.remainder);
-                    let refill = numerator / denominator;
-                    let remainder = numerator % denominator;
-                    (
-                        bucket
-                            .tokens
-                            .saturating_add(refill.min(u128::from(u64::MAX)) as u64)
-                            .min(request.limit),
-                        remainder,
-                    )
-                } else {
-                    (request.limit, 0)
-                };
-            if request.amount > tokens {
-                return false;
+        let mut admitted = true;
+        for (request, bucket) in batch.iter().zip(buckets.iter_mut()) {
+            bucket.last_seen = monotonic_now;
+            bucket.retune(request.limit, request.window_ms, monotonic_now, true);
+            bucket.refill(monotonic_now);
+            if request.amount > bucket.tokens {
+                admitted = false;
             }
-            commits.push((tokens - request.amount, request.limit, remainder, window_ms));
         }
-        for (bucket, (tokens, capacity, remainder, window_ms)) in buckets.iter_mut().zip(commits) {
-            bucket.tokens = tokens;
-            bucket.capacity = capacity;
-            bucket.remainder = remainder;
-            bucket.last_refill = monotonic_now;
-            bucket.window_ms = window_ms;
-            bucket.last_seen = now;
+        if admitted {
+            for (request, bucket) in batch.iter().zip(buckets.iter_mut()) {
+                bucket.tokens -= request.amount;
+            }
         }
-        true
+        admitted
     }
 
     pub fn consume_unique(&self, key: &str, val: &str, limit: u64, window_ms: u64) -> bool {
@@ -788,49 +955,43 @@ impl DosGuard {
             return true;
         }
         let now = Self::now_ms();
-        self.maybe_cleanup(now);
+        let seen = Instant::now();
+        self.maybe_cleanup();
         let window_ms = window_ms.max(1);
         let start = (now / window_ms) * window_ms;
-        let bucket = if let Some(entry) = self.unique.get(key) {
-            entry.value().clone()
-        } else {
-            let _admission = self.unique_admission.lock();
-            if let Some(entry) = self.unique.get(key) {
-                entry.value().clone()
-            } else {
-                if self.unique.len() >= MAX_BUCKETS {
-                    return false;
-                }
-                let handle = Arc::new(Mutex::new(UniqueBucket {
-                    values: HashSet::new(),
-                    pending: HashSet::new(),
-                    window_start: start,
-                    window_ms,
-                    last_seen: now,
-                }));
-                self.unique.insert(key.to_owned(), handle.clone());
-                handle
-            }
-        };
+        let bucket = get_or_insert(&self.unique, &self.unique_admission, key, || UniqueBucket {
+            values: HashSet::new(),
+            pending: HashSet::new(),
+            denied: HashSet::new(),
+            window_start: start,
+            window_ms,
+            last_seen: seen,
+        });
         let mut b = bucket.lock();
+        b.last_seen = seen;
         if b.window_start != start || b.window_ms != window_ms {
             b.values.clear();
             b.pending.clear();
+            b.denied.clear();
             b.window_start = start;
             b.window_ms = window_ms;
         }
         if let Some(redis) = &self.redis {
-            if b.values.contains(val) {
-                b.last_seen = now;
+            // A first sighting is admitted while there is room locally and
+            // checked against Redis in the background, instead of being
+            // denied until a later request finds it confirmed.
+            if b.values.contains(val) || b.pending.contains(val) {
                 return true;
             }
-            if b.pending.contains(val)
-                || b.values.len().saturating_add(b.pending.len()) as u64 >= limit
-            {
+            let known = b
+                .values
+                .len()
+                .saturating_add(b.pending.len())
+                .saturating_add(b.denied.len());
+            if b.denied.contains(val) || known as u64 >= limit {
                 return false;
             }
             b.pending.insert(val.to_owned());
-            b.last_seen = now;
             drop(b);
             let submitted = redis.submit(RedisWork::Unique {
                 key: key.to_owned(),
@@ -842,14 +1003,13 @@ impl DosGuard {
             if !submitted {
                 bucket.lock().pending.remove(val);
             }
-            return false;
+            return submitted;
         }
         if !b.values.contains(val) && b.values.len() as u64 >= limit {
             return false;
         }
         b.values.insert(val.to_owned());
         b.window_ms = window_ms;
-        b.last_seen = now;
         (b.values.len() as u64) <= limit
     }
 
@@ -858,21 +1018,26 @@ impl DosGuard {
         self.unique.clear();
     }
 
-    fn maybe_cleanup(&self, now: u64) {
+    fn maybe_cleanup(&self) {
         let ops = self.ops.fetch_add(1, Ordering::Relaxed);
         if !ops.is_multiple_of(4096) {
             return;
         }
+        let now = Instant::now();
+        let retained = |last_seen: Instant, window_ms: u64| {
+            now.saturating_duration_since(last_seen)
+                <= Duration::from_millis(window_ms.saturating_mul(2).max(MINUTE_MS))
+        };
         self.buckets.retain(|_, bucket| {
             Arc::strong_count(bucket) > 1 || {
                 let bucket = bucket.lock();
-                bucket.last_seen + bucket.window_ms.saturating_mul(2).max(MINUTE_MS) >= now
+                retained(bucket.last_seen, bucket.window_ms)
             }
         });
         self.unique.retain(|_, bucket| {
             Arc::strong_count(bucket) > 1 || {
                 let bucket = bucket.lock();
-                bucket.last_seen + bucket.window_ms.saturating_mul(2).max(MINUTE_MS) >= now
+                retained(bucket.last_seen, bucket.window_ms)
             }
         });
     }
@@ -881,57 +1046,45 @@ impl DosGuard {
         &self,
         redis: &RedisLeaseClient,
         batch: &[NormalizedConsume<'_>],
-        now: u64,
         monotonic_now: Instant,
     ) -> bool {
-        self.maybe_cleanup(now);
-        let mut handles = Vec::with_capacity(batch.len());
-        for request in batch {
-            if request.amount > request.limit {
-                return false;
-            }
-            let handle = if let Some(entry) = self.buckets.get(request.key) {
-                entry.value().clone()
-            } else {
-                let _admission = self.bucket_admission.lock();
-                if let Some(entry) = self.buckets.get(request.key) {
-                    entry.value().clone()
-                } else {
-                    if self.buckets.len() >= MAX_BUCKETS {
-                        return false;
-                    }
-                    let handle = Arc::new(Mutex::new(Bucket {
-                        tokens: 0,
-                        capacity: request.limit,
-                        remainder: 0,
-                        last_refill: monotonic_now,
-                        window_ms: request.window_ms,
-                        last_seen: now,
-                        lease_pending: false,
-                        lease_expires: None,
-                    }));
-                    self.buckets.insert(request.key.to_owned(), handle.clone());
-                    handle
-                }
-            };
-            handles.push(handle);
+        self.maybe_cleanup();
+        if batch.iter().any(|request| request.amount > request.limit) {
+            return false;
         }
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|request| {
+                get_or_insert(&self.buckets, &self.bucket_admission, request.key, || {
+                    Bucket::new(request.limit, request.window_ms, monotonic_now)
+                })
+            })
+            .collect();
         let mut buckets: Vec<_> = handles.iter().map(|bucket| bucket.lock()).collect();
         let mut admitted = true;
-        for (request, bucket) in batch.iter().zip(buckets.iter_mut()) {
-            if bucket.capacity != request.limit || bucket.window_ms != request.window_ms {
-                bucket.tokens = 0;
-                bucket.capacity = request.limit;
-                bucket.window_ms = request.window_ms;
-                bucket.lease_pending = false;
-                bucket.lease_expires = None;
-            }
+        let mut seeds = Vec::new();
+        for ((request, bucket), handle) in batch.iter().zip(buckets.iter_mut()).zip(&handles) {
+            bucket.last_seen = monotonic_now;
+            bucket.retune(request.limit, request.window_ms, monotonic_now, false);
             if bucket
                 .lease_expires
                 .is_some_and(|expires| expires <= monotonic_now)
             {
                 bucket.tokens = 0;
                 bucket.lease_expires = None;
+            }
+            if !bucket.seeded {
+                // See `PreparedBucket::consume`: seed a new bucket full and
+                // debit Redis afterwards instead of denying the first request.
+                bucket.seeded = true;
+                let lease = redis_lease(request.limit, request.amount);
+                bucket.tokens = lease;
+                bucket.lease_expires = Some(monotonic_now + redis_lease_ttl(request.window_ms));
+                seeds.push((
+                    handle.clone(),
+                    ConsumeRequest::new(request.key, request.limit, request.window_ms)
+                        .with_amount(lease),
+                ));
             }
             if bucket.tokens < request.amount {
                 admitted = false;
@@ -940,15 +1093,13 @@ impl DosGuard {
         if admitted {
             for (request, bucket) in batch.iter().zip(buckets.iter_mut()) {
                 bucket.tokens -= request.amount;
-                bucket.last_seen = now;
             }
         }
 
         let mut requests = Vec::new();
         let mut grants = Vec::new();
         for ((request, bucket), handle) in batch.iter().zip(buckets.iter_mut()).zip(&handles) {
-            let base = request.limit.saturating_div(20).clamp(1, 1024 * 1024);
-            let lease = base.max(request.amount).min(request.limit);
+            let lease = redis_lease(request.limit, request.amount);
             if !bucket.lease_pending && bucket.tokens <= lease.saturating_div(4) {
                 bucket.lease_pending = true;
                 requests.push(
@@ -968,6 +1119,9 @@ impl DosGuard {
             for (bucket, _, _) in grants {
                 bucket.lock().lease_pending = false;
             }
+        }
+        if !seeds.is_empty() {
+            submit_debits(redis, seeds);
         }
         admitted
     }
@@ -1065,7 +1219,8 @@ impl ConnectionLimiter {
     }
 
     /// Try to admit one connection from `client_ip`. `max_total` / `max_per_ip`
-    /// of 0 mean "unlimited" for that dimension. Returns `None` (rejected) if
+    /// of 0 mean "unlimited" for that dimension (the opposite of the rate
+    /// limiters, where a limit of 0 denies everything). Returns `None` (rejected) if
     /// either cap is already reached. The per-IP shard entry is held across the
     /// global check so two concurrent acquires for the same IP can't both slip
     /// past the per-IP cap.
@@ -1088,26 +1243,37 @@ impl ConnectionLimiter {
         }
         let ip = dos_ip_key(client_ip);
         let mut entry = self.per_ip.entry(ip.clone()).or_insert(0);
-        if max_per_ip != 0 && *entry >= max_per_ip {
+        let admitted = if max_per_ip != 0 && *entry >= max_per_ip {
+            false
+        } else {
+            loop {
+                let current = self.global.load(Ordering::Acquire);
+                if max_total != 0 && current >= max_total {
+                    break false;
+                }
+                if self
+                    .global
+                    .compare_exchange_weak(
+                        current,
+                        current.saturating_add(1),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break true;
+                }
+            }
+        };
+        if !admitted {
+            // `or_insert(0)` may have just created this entry. Drop it again
+            // so rejected connections from many addresses cannot grow the map.
+            let empty = *entry == 0;
+            drop(entry);
+            if empty {
+                self.per_ip.remove_if(&ip, |_, count| *count == 0);
+            }
             return None;
-        }
-        loop {
-            let current = self.global.load(Ordering::Acquire);
-            if max_total != 0 && current >= max_total {
-                return None;
-            }
-            if self
-                .global
-                .compare_exchange_weak(
-                    current,
-                    current.saturating_add(1),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                break;
-            }
         }
         *entry += 1;
         Some(ConnectionGuard {
@@ -1216,6 +1382,26 @@ pub fn is_control_message_allowed(
         format!("control:ip:{}", dos_ip_key(client_ip)),
         ip_limit,
         MINUTE_MS,
+    )])
+}
+
+/// Spends one operation from the client IP's shared budget for `class`: at
+/// most `limit` operations, refilled evenly over `window_ms`. Per-connection
+/// limiters multiply by the number of connections an IP opens; this does not.
+pub fn is_ip_budget_allowed(
+    client_ip: &str,
+    class: &str,
+    limit: u64,
+    window_ms: u64,
+    store: &DosGuard,
+) -> bool {
+    if limit == UNLIMITED {
+        return true;
+    }
+    store.consume(&[ConsumeRequest::new(
+        format!("{class}:ip:{}", dos_ip_key(client_ip)),
+        limit,
+        window_ms,
     )])
 }
 
@@ -1446,11 +1632,34 @@ mod tests {
     }
 
     #[test]
-    fn redis_connection_failure_denies_batch() {
+    fn redis_connection_failure_denies_after_the_seed() {
         let guard = DosGuard::from_options(&redis_options("redis://127.0.0.1:0/"))
             .expect("valid Redis options");
+        // A new key is seeded with one lease so its first request is not
+        // denied while Redis is consulted; with Redis down nothing refills it.
+        assert!(guard.consume(&[ConsumeRequest::new("global", 10, MINUTE_MS)]));
         assert!(!guard.consume(&[ConsumeRequest::new("global", 10, MINUTE_MS)]));
-        assert!(!guard.consume_unique("hosts", "example.com", 10, MINUTE_MS));
+        // Same for a first-seen value, which is then remembered as refused
+        // once the failed Redis check lands.
+        assert!(guard.consume_unique("hosts", "example.com", 10, MINUTE_MS));
+        for _ in 0..200 {
+            if !guard.consume_unique("hosts", "example.com", 10, MINUTE_MS) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("failed Redis check was never recorded as a refusal");
+    }
+
+    #[test]
+    fn redis_lease_covers_one_chunk_and_outlives_a_second() {
+        // A 64 KiB chunk against a 1 MiB/s limit: the 5% lease alone (51 KiB)
+        // would never admit it.
+        assert!(redis_lease(1024 * 1024, 64 * 1024) >= 64 * 1024);
+        assert_eq!(redis_lease(100, 1), 5);
+        assert_eq!(redis_lease(10, 1), 1);
+        assert!(redis_lease_ttl(SECOND_MS) >= Duration::from_secs(1));
+        assert_eq!(redis_lease_ttl(MINUTE_MS), Duration::from_secs(3));
     }
 
     #[test]
@@ -1756,5 +1965,179 @@ mod tests {
             &opts,
             &store
         ));
+    }
+
+    #[test]
+    fn ip_budget_is_shared_per_class_and_ip() {
+        let store = DosGuard::new();
+        let spend = |ip: &str, class: &str| is_ip_budget_allowed(ip, class, 2, 60_000, &store);
+        assert!(spend("203.0.113.9", "demo"));
+        assert!(spend("203.0.113.9", "demo"));
+        assert!(!spend("203.0.113.9", "demo"));
+        assert!(spend("203.0.113.10", "demo"));
+        assert!(spend("203.0.113.9", "other"));
+        for _ in 0..10 {
+            assert!(is_ip_budget_allowed(
+                "203.0.113.9",
+                "free",
+                UNLIMITED,
+                60_000,
+                &store
+            ));
+        }
+    }
+
+    fn fill(guard: &DosGuard, count: usize) {
+        for index in 0..count {
+            assert!(guard.consume(&[ConsumeRequest::new(format!("fill:{index}"), 5, MINUTE_MS)]));
+        }
+    }
+
+    #[test]
+    fn full_map_evicts_the_oldest_instead_of_denying() {
+        let guard = DosGuard::new();
+        fill(&guard, MAX_BUCKETS);
+        assert_eq!(guard.buckets.len(), MAX_BUCKETS);
+        assert!(guard.consume(&[ConsumeRequest::new("new-client", 5, MINUTE_MS)]));
+        assert!(guard.buckets.len() <= MAX_BUCKETS);
+        assert!(guard.buckets.contains_key("new-client"));
+        assert!(!guard.buckets.contains_key("fill:0"));
+        assert!(guard
+            .buckets
+            .contains_key(format!("fill:{}", MAX_BUCKETS - 1).as_str()));
+    }
+
+    #[test]
+    fn recently_used_buckets_survive_eviction() {
+        let guard = DosGuard::new();
+        fill(&guard, MAX_BUCKETS);
+        // Touch the oldest key, denied or not, so it is no longer the oldest.
+        for _ in 0..6 {
+            guard.consume(&[ConsumeRequest::new("fill:0", 5, MINUTE_MS)]);
+        }
+        assert!(guard.consume(&[ConsumeRequest::new("new-client", 5, MINUTE_MS)]));
+        assert!(guard.buckets.contains_key("fill:0"));
+        assert!(!guard.buckets.contains_key("fill:1"));
+    }
+
+    #[test]
+    fn saturated_store_does_not_throttle_new_tcp_streams() {
+        let store = DosGuard::new();
+        let conn = ConnectionDosGuard::new();
+        let options = WispServerOptions {
+            max_tcp_bytes_per_connection_per_second: UNLIMITED,
+            max_tcp_bytes_per_ip_per_second: 1_000_000,
+            ..WispServerOptions::default()
+        };
+        fill(&store, MAX_BUCKETS);
+        let limiter = TcpByteLimiter::new("203.0.113.9", &conn, &options, &store);
+        assert!(limiter.is_allowed(1024));
+        assert!(store.buckets.len() <= MAX_BUCKETS);
+    }
+
+    #[test]
+    fn held_buckets_are_never_evicted_and_new_keys_get_a_detached_bucket() {
+        let store = DosGuard::new();
+        let held: Vec<_> = (0..MAX_BUCKETS)
+            .map(|index| {
+                store
+                    .prepare_bucket(format!("held:{index}"), 1000, SECOND_MS)
+                    .expect("finite limit")
+            })
+            .collect();
+        assert_eq!(store.buckets.len(), MAX_BUCKETS);
+        let fresh = store
+            .prepare_bucket("fresh".to_owned(), 1000, SECOND_MS)
+            .expect("finite limit");
+        assert!(fresh.consume(1000));
+        assert!(!fresh.consume(1000));
+        assert_eq!(store.buckets.len(), MAX_BUCKETS);
+        assert!(!store.buckets.contains_key("fresh"));
+        assert!(held[0].consume(1));
+    }
+
+    #[test]
+    fn eviction_applies_to_unique_buckets_too() {
+        let guard = DosGuard::new();
+        for index in 0..MAX_BUCKETS {
+            assert!(guard.consume_unique(&format!("u:{index}"), "a", 2, MINUTE_MS));
+        }
+        assert!(guard.consume_unique("u:new", "a", 2, MINUTE_MS));
+        assert!(guard.unique.len() <= MAX_BUCKETS);
+        assert!(guard.unique.contains_key("u:new"));
+    }
+
+    #[test]
+    fn rejected_connections_leave_no_zero_entries() {
+        let limiter = Arc::new(ConnectionLimiter::new());
+        let held = limiter.try_acquire("198.51.100.1", 1, 0).unwrap();
+        for index in 0..1000 {
+            assert!(limiter
+                .try_acquire(&format!("203.0.113.{}", index % 250), 1, 4)
+                .is_none());
+        }
+        assert_eq!(limiter.per_ip.len(), 1);
+        let per_ip = Arc::new(ConnectionLimiter::new());
+        let first = per_ip.try_acquire("192.0.2.1", 0, 1).unwrap();
+        assert!(per_ip.try_acquire("192.0.2.1", 0, 1).is_none());
+        assert_eq!(per_ip.per_ip.len(), 1);
+        drop(first);
+        assert!(per_ip.per_ip.is_empty());
+        drop(held);
+        assert!(limiter.per_ip.is_empty());
+    }
+
+    #[test]
+    fn changing_a_shared_key_limit_clamps_instead_of_refilling() {
+        let guard = DosGuard::new();
+        assert!(guard.consume(&[ConsumeRequest::new("shared", 10, MINUTE_MS).with_amount(10)]));
+        // A different limit on the same key must not hand back a full bucket.
+        assert!(!guard.consume(&[ConsumeRequest::new("shared", 1000, MINUTE_MS)]));
+        assert!(!guard.consume(&[ConsumeRequest::new("shared", 10, MINUTE_MS)]));
+        // Lowering the limit clamps what is held.
+        let other = DosGuard::new();
+        assert!(other.consume(&[ConsumeRequest::new("k", 100, MINUTE_MS)]));
+        assert!(other.consume(&[ConsumeRequest::new("k", 2, MINUTE_MS).with_amount(2)]));
+        assert!(!other.consume(&[ConsumeRequest::new("k", 2, MINUTE_MS)]));
+    }
+
+    #[test]
+    fn prepared_bucket_clamps_on_retune() {
+        let store = DosGuard::new();
+        let wide = store
+            .prepare_bucket("tcp:bytes:ip:x".to_owned(), 100, SECOND_MS)
+            .unwrap();
+        assert!(wide.consume(100));
+        let narrow = store
+            .prepare_bucket("tcp:bytes:ip:x".to_owned(), 200, SECOND_MS)
+            .unwrap();
+        assert!(!narrow.consume(150));
+    }
+
+    #[test]
+    fn ipv6_keys_aggregate_to_the_configured_prefix() {
+        let a = aggregate_ip_key("2001:0db8:1234:5600:0000:0000:0000:0000/64", 56).unwrap();
+        let b = aggregate_ip_key("2001:0db8:1234:56ff:0000:0000:0000:0000/64", 56).unwrap();
+        let c = aggregate_ip_key("2001:0db8:1234:5700:0000:0000:0000:0000/64", 56).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, "2001:db8:1234:5600::/56");
+        let narrow = aggregate_ip_key("2001:0db8:1234:56ff:0000:0000:0000:0000/64", 64).unwrap();
+        assert_ne!(narrow, a);
+        let wide = aggregate_ip_key("2001:0db8:1234:5700:0000:0000:0000:0000/64", 48).unwrap();
+        assert_eq!(
+            wide,
+            aggregate_ip_key("2001:0db8:1234:9900:0000:0000:0000:0000/64", 48).unwrap()
+        );
+        assert_eq!(
+            aggregate_ip_key("203.0.113.5", 56).as_deref(),
+            Some("203.0.113.5")
+        );
+        assert!(aggregate_ip_key("garbage", 56).is_none());
+        // Default prefix: addresses in one /56 share a key.
+        assert_eq!(
+            dos_ip_key("2001:db8:1234:5600::1"),
+            dos_ip_key("2001:db8:1234:56ab::2")
+        );
     }
 }
