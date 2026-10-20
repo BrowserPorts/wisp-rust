@@ -1,0 +1,50 @@
+# cargo-deny policy for the workspace: `cargo deny check` from the repository
+# root. Advisories come from the RustSec database; any advisory that affects a
+# locked crate fails the check, as does a yanked version.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Each entry needs the advisory id and the reason it does not apply here.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only, which is everything the locked tree uses today.
+# A dependency under any other license fails the check until it is reviewed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path without a version.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # h3, h3-webtransport, h3-datagram and h3-quinn, pinned by revision in
+    # Cargo.toml's [patch.crates-io].
+    "https://github.com/hyperium/h3",
+    # The proxy providers, patched to a sibling checkout in Cargo.toml.
+    "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git",
+]
