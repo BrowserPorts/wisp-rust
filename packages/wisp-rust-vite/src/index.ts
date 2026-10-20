@@ -1808,6 +1808,9 @@ function rewriteMountPath(path: string, from: string, to: string): string {
   if (suffix.startsWith("?") || suffix.startsWith("#")) {
     return `${normalizedTo}${suffix}`;
   }
+  if (normalizedTo === "/") {
+    return suffix.startsWith("/") ? suffix : `/${suffix}`;
+  }
   return `${normalizedTo}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
 }
 
