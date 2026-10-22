@@ -546,6 +546,8 @@ pub(crate) struct TcpStreamSlot {
     /// later stream or hold a connection open after CLOSE.
     dial: Option<AbortHandle>,
     gate: Option<UpstreamGate>,
+    /// Admitted only by a host and port rule, so its bytes are not inspected.
+    uninspected: bool,
     activity: Arc<Activity>,
     /// Upload credit and held bytes, made with the first payload.
     flow: Option<Arc<StreamFlow>>,
@@ -572,6 +574,7 @@ impl TcpStreamSlot {
             host: host.map(str::to_owned),
             dial: None,
             gate: None,
+            uninspected: false,
             activity: Activity::new(),
             flow: None,
             client_fin: false,
@@ -583,6 +586,17 @@ impl TcpStreamSlot {
     /// Both directions are finished and the stream can be released.
     pub(crate) fn finished(&self) -> bool {
         self.write_shut && self.upstream_eof
+    }
+
+    /// Leaves the stream out of protocol inspection (see
+    /// `HostPolicy::admitted_only_by_host_rule`).
+    pub(crate) fn skip_inspection(&mut self) {
+        self.uninspected = true;
+    }
+
+    /// Whether the client's first bytes are inspected before upstream is read.
+    pub(crate) fn inspected(&self, ctx: &ServerContext) -> bool {
+        ctx.options.protocol_inspection && !self.uninspected
     }
 
     pub(crate) fn set_dial(&mut self, dial: AbortHandle) {
@@ -1242,7 +1256,7 @@ pub(crate) async fn activate_writer(
     slot.state = TcpStreamState::Live {
         write: Some(write),
         queued: None,
-        inspection: ctx.options.protocol_inspection.then(|| InspectionState {
+        inspection: slot.inspected(ctx).then(|| InspectionState {
             buf: BytesMut::new(),
             inspector: Inspector::new(slot.host.as_deref()),
             timer: Some(spawn_inspection_timer(

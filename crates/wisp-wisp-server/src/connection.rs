@@ -793,7 +793,8 @@ where
                 match ev {
                     Some(TcpEvent::Ready { stream_id, generation, write, reader, gate }) => {
                         if let Some(slot) = streams.get_gen_mut(stream_id, generation) {
-                            slot.set_gate(gate, ctx.options.protocol_inspection);
+                            let inspecting = slot.inspected(&ctx);
+                            slot.set_gate(gate, inspecting);
                             if let WriteOutcome::DropStream(reason) = activate_writer(
                                     slot,
                                     write,
@@ -1712,6 +1713,11 @@ async fn handle_packet(
                         }
                     };
                     let mut slot = TcpStreamSlot::connecting_for(generation, Some(&conn.hostname));
+                    if let Ok(host) = &checked {
+                        if ctx.policy.admitted_only_by_host_rule(host, conn.port) {
+                            slot.skip_inspection();
+                        }
+                    }
                     slot.set_dial(spawn_tcp_connect(
                         conn.stream_id,
                         generation,
@@ -3003,6 +3009,41 @@ mod serve_connection_tests {
         expect_data(&mut out_rx, 1, b"SSH-2.0-banner\r\n").await;
         assert_eq!(upstream.await.unwrap(), request);
 
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn host_rule_destination_speaks_first_through_inspection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"VT01-challenge").await.unwrap();
+            let mut reply = vec![0u8; 64];
+            let n = sock.read(&mut reply).await.unwrap();
+            reply.truncate(n);
+            reply
+        });
+        // Inspection is on and the port is outside port_whitelist; only an
+        // address-range rule admits it, so it carries any protocol.
+        let mut options = (*inspecting_options(port, 5_000)).clone();
+        options.allow_direct_ip = false;
+        options.port_whitelist = Some(vec![80, 443]);
+        options.host_port_whitelist = Some(vec![wisp_config::HostPortRule {
+            host: "127.0.0.0/8".to_owned(),
+            port,
+        }]);
+        let ctx = test_ctx(Arc::new(options), false);
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        send_packet(&mut in_tx, tcp_connect(1, "127.0.0.1", port)).await;
+        expect_data(&mut out_rx, 1, b"VT01-challenge").await;
+        send_packet(&mut in_tx, encode_data(1, b"\x00\x01binary")).await;
+        assert_eq!(upstream.await.unwrap(), b"\x00\x01binary");
         drop(in_tx);
         let _ = timeout(Duration::from_secs(2), handle).await;
     }

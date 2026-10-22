@@ -196,14 +196,7 @@ impl HostPolicy {
         let udp_ports = self.udp_port_whitelist.as_ref().filter(|_| udp);
         // Host and port exceptions widen port_whitelist, for TCP and for UDP
         // that follows it, never an explicit UDP list.
-        let key = normalized.to_string();
-        let scoped = udp_ports.is_none()
-            && self
-                .host_port_whitelist
-                .iter()
-                .any(|(allowed_host, allowed_port)| {
-                    *allowed_port == port && host_rule_matches(allowed_host, &normalized, &key)
-                });
+        let scoped = udp_ports.is_none() && self.host_rule_admits(&normalized, port);
         if let Some(allowed) = udp_ports.or(self.port_whitelist.as_ref()) {
             if !allowed.contains(&port) && !scoped {
                 return Err(ProxyError::PortBlocked(port));
@@ -231,6 +224,27 @@ impl HostPolicy {
             }
         }
         Ok(normalized)
+    }
+
+    fn host_rule_admits(&self, host: &NormalizedHost, port: u16) -> bool {
+        let key = host.to_string();
+        self.host_port_whitelist
+            .iter()
+            .any(|(allowed_host, allowed_port)| {
+                *allowed_port == port && host_rule_matches(allowed_host, host, &key)
+            })
+    }
+
+    /// Whether a TCP destination that passed [`Self::check_host`] is there
+    /// only because a host and port rule names it: port_whitelist is set and
+    /// leaves the port out. The operator chose that exact destination and
+    /// port, so what it speaks is theirs to decide and protocol inspection,
+    /// which holds web ports to web protocols, does not apply to it.
+    pub fn admitted_only_by_host_rule(&self, host: &NormalizedHost, port: u16) -> bool {
+        self.port_whitelist
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&port))
+            && self.host_rule_admits(host, port)
     }
 
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), ProxyError> {
@@ -1176,6 +1190,8 @@ mod tests {
             p.check_host("162.254.193.47", 443),
             Err(ProxyError::HostBlocked(_))
         ));
+        let cm: NormalizedHost = p.check_host("162.254.193.47", 27017).unwrap();
+        assert!(p.admitted_only_by_host_rule(&cm, 27017));
         // A range holds addresses only, never a name that resolves into it
         assert!(matches!(
             p.check_host("cm.example", 27017),
