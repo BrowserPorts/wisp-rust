@@ -194,24 +194,27 @@ impl HostPolicy {
             return Err(ProxyError::PortBlocked(port));
         }
         let udp_ports = self.udp_port_whitelist.as_ref().filter(|_| udp);
+        // Host and port exceptions widen port_whitelist, for TCP and for UDP
+        // that follows it, never an explicit UDP list.
+        let key = normalized.to_string();
+        let scoped = udp_ports.is_none()
+            && self
+                .host_port_whitelist
+                .iter()
+                .any(|(allowed_host, allowed_port)| {
+                    *allowed_port == port && host_rule_matches(allowed_host, &normalized, &key)
+                });
         if let Some(allowed) = udp_ports.or(self.port_whitelist.as_ref()) {
-            // Host and port exceptions widen port_whitelist, for TCP and for
-            // UDP that follows it, never an explicit UDP list.
-            let key = normalized.to_string();
-            let scoped_port_allowed = udp_ports.is_none()
-                && self
-                    .host_port_whitelist
-                    .iter()
-                    .any(|(allowed_host, allowed_port)| {
-                        allowed_host == &key && *allowed_port == port
-                    });
-            if !allowed.contains(&port) && !scoped_port_allowed {
+            if !allowed.contains(&port) && !scoped {
                 return Err(ProxyError::PortBlocked(port));
             }
         }
         match &normalized {
             NormalizedHost::Ip(ip) => {
-                if !self.allow_direct_ip {
+                // An address a host and port rule names is one the operator
+                // chose to reach directly, so the rule stands in for
+                // allow_direct_ip; the address gates below still apply.
+                if !self.allow_direct_ip && !scoped {
                     return Err(ProxyError::HostBlocked(ip.to_string()));
                 }
                 self.check_ip(*ip)?;
@@ -353,6 +356,20 @@ impl IpPattern {
             _ => false,
         }
     }
+}
+
+/// A `host_port_whitelist` host against a destination: an address range
+/// (`a.b.c.d/N`) holds every IP inside it, anything else is the exact host.
+fn host_rule_matches(rule: &str, host: &NormalizedHost, key: &str) -> bool {
+    if rule.contains('/') {
+        return match host {
+            NormalizedHost::Ip(ip) => {
+                IpPattern::parse(rule).is_some_and(|range| range.contains(*ip))
+            }
+            NormalizedHost::Name(_) => false,
+        };
+    }
+    rule == key
 }
 
 fn patterns_from_options(values: Option<&[String]>) -> Vec<IpPattern> {
@@ -1132,6 +1149,49 @@ mod tests {
         assert!(p.check_udp_host("a.example", 80).is_ok());
         assert!(p.check_udp_host("game.example.", 13002).is_ok());
         assert!(p.check_udp_host("a.example", 53).is_err());
+    }
+
+    #[test]
+    fn host_port_ranges_cover_every_address_inside() {
+        let p = policy_from(|o| {
+            o.port_whitelist = Some(vec![80, 443]);
+            o.host_port_whitelist = Some(vec![wisp_config::HostPortRule {
+                host: "162.254.192.0/21".to_owned(),
+                port: 27017,
+            }]);
+        });
+        assert!(p.check_host("162.254.193.47", 27017).is_ok());
+        assert!(p.check_host("162.254.199.255", 27017).is_ok());
+        assert!(p.check_host("::ffff:162.254.193.47", 27017).is_ok());
+        assert!(matches!(
+            p.check_host("162.254.200.1", 27017),
+            Err(ProxyError::PortBlocked(27017))
+        ));
+        assert!(matches!(
+            p.check_host("162.254.193.47", 27018),
+            Err(ProxyError::PortBlocked(27018))
+        ));
+        // The rule lets its addresses in without allow_direct_ip, only on its port
+        assert!(matches!(
+            p.check_host("162.254.193.47", 443),
+            Err(ProxyError::HostBlocked(_))
+        ));
+        // A range holds addresses only, never a name that resolves into it
+        assert!(matches!(
+            p.check_host("cm.example", 27017),
+            Err(ProxyError::PortBlocked(27017))
+        ));
+        // And the address gates still apply inside it
+        let p = policy_from(|o| {
+            o.host_port_whitelist = Some(vec![wisp_config::HostPortRule {
+                host: "10.0.0.0/8".to_owned(),
+                port: 27017,
+            }]);
+        });
+        assert!(matches!(
+            p.check_host("10.1.2.3", 27017),
+            Err(ProxyError::PrivateBlocked(_))
+        ));
     }
 
     #[test]

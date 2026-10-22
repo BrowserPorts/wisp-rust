@@ -144,10 +144,15 @@ pub struct HostPortRule {
 }
 
 impl HostPortRule {
+    /// The rule's host as matched: a hostname or an IP literal, or an address
+    /// range (`a.b.c.d/N`, IPv6 too) that every IP inside matches.
     pub fn normalized_host(&self) -> Option<String> {
         let host = self.host.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() || host.len() > 253 || self.port == 0 {
             return None;
+        }
+        if host.contains('/') {
+            return parse_cidr(&host).ok().map(|_| host);
         }
         if host.split('.').any(|label| {
             label.is_empty()
@@ -3404,6 +3409,21 @@ mod tests {
             );
             std::fs::remove_file(path).expect("remove token file");
         }
+    }
+
+    #[test]
+    fn host_port_rule_takes_address_ranges() {
+        let rule = |host: &str| HostPortRule {
+            host: host.to_owned(),
+            port: 27017,
+        };
+        assert_eq!(
+            rule("162.254.192.0/21").normalized_host().as_deref(),
+            Some("162.254.192.0/21")
+        );
+        assert!(rule("2a01:4f8::/32").normalized_host().is_some());
+        assert!(rule("162.254.192.0/33").normalized_host().is_none());
+        assert!(rule("cm.example/21").normalized_host().is_none());
     }
 
     #[test]
