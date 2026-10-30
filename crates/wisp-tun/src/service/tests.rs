@@ -446,8 +446,41 @@ async fn closed_tunnel_cannot_be_resumed() {
     net.torn_down().await;
     let mut req = request(&svc, want::IPV4);
     req.resume = Some(token);
-    assert!(!svc.open(req).await.unwrap().resumed);
+    let fresh = svc.open(req).await.unwrap();
+    assert!(!fresh.resumed);
     assert_eq!(svc.store.len(), 1, "only the new tunnel's token");
+}
+
+#[tokio::test]
+async fn a_dropped_tunnel_leaves_no_resume_token() {
+    let (svc, _b, mut nets) = service(|_| {});
+    let opened = svc.open(request(&svc, want::IPV4)).await.unwrap();
+    let token = token_of(&opened.confirmation);
+    let net = nets.recv().await.unwrap();
+    assert_eq!(svc.store.len(), 1);
+    drop(opened);
+    net.torn_down().await;
+    assert_eq!(svc.store.len(), 0);
+    let mut req = request(&svc, want::IPV4);
+    req.resume = Some(token);
+    let fresh = timeout(Duration::from_millis(500), svc.open(req))
+        .await
+        .expect("no wait for a holder that is gone")
+        .unwrap();
+    assert!(!fresh.resumed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_parked_tunnel_drops_cleanly() {
+    let (svc, _b, mut nets) = service(|o| o.resume_grace_s = 1);
+    let opened = svc.open(request(&svc, want::IPV4)).await.unwrap();
+    let net = nets.recv().await.unwrap();
+    opened.tunnel.detach();
+    assert_eq!(svc.store.len(), 1);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    net.torn_down().await;
+    assert_eq!(svc.store.len(), 0);
+    assert_eq!(svc.live_tunnels(), 0);
 }
 
 #[tokio::test]

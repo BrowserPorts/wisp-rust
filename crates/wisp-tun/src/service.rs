@@ -410,6 +410,17 @@ pub struct Tunnel {
     steal: CancellationToken,
 }
 
+/// A tunnel dropped without [`Tunnel::close`] or [`Tunnel::detach`] (its
+/// holder went away mid-open, say) gives up its resume token too, so the
+/// store keeps no entry for a tunnel that cannot come back.
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        if let Some(token) = self.shared.token.lock().take() {
+            self.shared.store.forget(&token);
+        }
+    }
+}
+
 /// The client-to-network side of a tunnel, cheap to clone.
 #[derive(Clone)]
 pub struct TunnelHandle(Arc<Shared>);

@@ -48,13 +48,15 @@ impl ResumeStore {
         principal: Option<String>,
         steal: CancellationToken,
     ) {
-        self.entries.lock().insert(
+        // Whatever the insert displaces is dropped after the lock is released.
+        let displaced = self.entries.lock().insert(
             token,
             Entry {
                 principal,
                 slot: Slot::Attached(steal),
             },
         );
+        drop(displaced);
     }
 
     /// Parks `tunnel` under `token` for `grace`, after which it is dropped
@@ -113,7 +115,9 @@ impl ResumeStore {
         }
     }
 
-    /// Forgets `token`, ending any tunnel parked under it.
+    /// Forgets `token`, ending any tunnel parked under it. The tunnel is
+    /// dropped after the lock is released, since dropping one forgets its
+    /// token in turn.
     pub(crate) fn forget(&self, token: &ResumeToken) {
         let removed = self.entries.lock().remove(token);
         drop(removed);
