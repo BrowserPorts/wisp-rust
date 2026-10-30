@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 wisp-wisp = { path = "../wisp-wisp" }
+wisp-ip = { path = "../wisp-ip" }
+wisp-tun = { path = "../wisp-tun" }
 wisp-config = { path = "../wisp-config" }
 wisp-inspect = { path = "../wisp-inspect" }
 wisp-origin = { path = "../wisp-origin" }

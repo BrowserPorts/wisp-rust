@@ -3344,11 +3344,13 @@ dependencies = [
  "wisp-config",
  "wisp-dos",
  "wisp-inspect",
+ "wisp-ip",
  "wisp-iphash",
  "wisp-origin",
  "wisp-proxy",
  "wisp-proxy-base",
  "wisp-reports",
+ "wisp-tun",
  "wisp-wisp",
 ]
 

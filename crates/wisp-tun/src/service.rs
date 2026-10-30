@@ -476,9 +476,10 @@ impl Tunnel {
     }
 
     /// Resolves when another connection resumes this tunnel. The holder then
-    /// stops delivering it and calls [`Tunnel::detach`].
-    pub async fn stolen(&self) {
-        self.steal.cancelled().await
+    /// stops delivering it and calls [`Tunnel::detach`]. The future does not
+    /// borrow the tunnel, so it can wait beside [`Tunnel::recv`].
+    pub fn stolen(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.steal.clone().cancelled_owned()
     }
 
     /// Ends the tunnel now: a CLOSE from either side.
