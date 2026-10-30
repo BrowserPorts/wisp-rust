@@ -33,3 +33,6 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 socket2 = { workspace = true }
 governor = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

@@ -3335,6 +3335,7 @@ dependencies = [
  "governor",
  "hickory-resolver",
  "http",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
