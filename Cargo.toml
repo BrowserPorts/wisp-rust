@@ -15,6 +15,7 @@ members = [
     "crates/wisp-quic-msquic",
     "crates/wisp-wisp",
     "crates/wisp-wisp-server",
+    "crates/wisp-ip",
     "crates/wisp-ws-h2",
     "crates/wisp-ws-h3",
     "crates/wisp-router",

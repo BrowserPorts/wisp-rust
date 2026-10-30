@@ -1865,6 +1865,11 @@ async fn handle_packet(
             }
             return release_finished(fin.stream_id, streams, caps, egress).await;
         }
+        WispPacket::Tunnel(_) => {
+            return Err(ServerError::ProtocolViolation(
+                "TUNNEL without negotiated IP_TUNNEL",
+            ));
+        }
     }
     Ok(())
 }
