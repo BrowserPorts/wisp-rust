@@ -304,6 +304,7 @@ impl Runtime {
         let extras = ServeExtras {
             proxy_template: self.proxy_template.clone(),
             ip_bans: self.ip_bans.clone(),
+            tunnels: None,
         };
         #[cfg(not(feature = "ws"))]
         let extras = ServeExtras {

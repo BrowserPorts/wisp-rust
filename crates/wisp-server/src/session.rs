@@ -17,9 +17,15 @@ pub struct SessionContext {
     pub dos: Arc<DosGuard>,
     pub conn_dos: Arc<ConnectionDosGuard>,
     /// Set of extension IDs advertised by both peers (0x01 UDP, 0x02
-    /// WEBTRANSPORT_PROXY, 0x03 WISP_PROXY_CONTROL). All other
-    /// features are baked-in and are not represented here.
+    /// WEBTRANSPORT_PROXY, 0x03 WISP_PROXY_CONTROL, 0xF3 IP_TUNNEL). All
+    /// other features are baked-in and are not represented here.
     pub negotiated: HashSet<u8>,
+    /// What IP_TUNNEL was negotiated with: set exactly when 0xF3 is in
+    /// `negotiated`, after the magic and version check.
+    pub ip_tunnel: Option<wisp_ip::Negotiated>,
+    /// Who the session authenticated as (a digest of its token), to bind
+    /// tunnel resume tokens to.
+    pub principal: Option<String>,
 }
 
 impl SessionContext {
@@ -31,7 +37,14 @@ impl SessionContext {
             dos,
             conn_dos: Arc::new(ConnectionDosGuard::new()),
             negotiated: HashSet::new(),
+            ip_tunnel: None,
+            principal: None,
         }
+    }
+
+    pub fn with_principal(mut self, principal: Option<String>) -> Self {
+        self.principal = principal;
+        self
     }
 
     pub fn with_client_hash(mut self, hash: Option<String>) -> Self {

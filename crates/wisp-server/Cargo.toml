@@ -26,6 +26,8 @@ rustls-native-certs = { workspace = true }
 rustls = { workspace = true }
 msquic = { workspace = true }
 wisp-wire = { path = "../wisp-wire" }
+wisp-ip = { path = "../wisp-ip" }
+wisp-tun = { path = "../wisp-tun" }
 wisp-config = { path = "../wisp-config" }
 wisp-origin = { path = "../wisp-origin" }
 wisp-iphash = { path = "../wisp-iphash" }

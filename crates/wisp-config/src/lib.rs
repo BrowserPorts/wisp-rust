@@ -1028,6 +1028,13 @@ pub fn endpoint_path_token<'a>(pathname: &'a str, endpoint: &str) -> Option<&'a 
 
 pub const MAX_ENDPOINT_PATH_TOKEN_BYTES: usize = 1024;
 
+/// The identity a connection presenting `token` is known by where the token
+/// itself must not be kept, such as an IP tunnel's resume binding: the
+/// SHA-256 of the token in hex, the form token files store.
+pub fn token_principal(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WispServerToml {
