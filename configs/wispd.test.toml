@@ -49,3 +49,14 @@ enabled      = true
 ingress_mode = "direct_plain"
 host         = "127.0.0.1"
 port         = 6001
+
+# IP tunnels (extension 0xF3) for the benchmark's IP-level variant. Linux
+# with CAP_NET_ADMIN and CAP_SYS_ADMIN only; off so the file starts anywhere.
+[ip_tunnel]
+enabled        = false
+resume_grace_s = 0
+reject_with    = "drop"
+max_packets_per_tunnel_per_second = -1
+max_bytes_per_tunnel_per_second   = -1
+max_packets_per_ip_per_second     = -1
+max_bytes_per_ip_per_second       = -1

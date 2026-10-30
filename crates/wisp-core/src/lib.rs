@@ -30,6 +30,7 @@ use wisp_config::{
 };
 use wisp_dos::{ConnectionLimiter, DosGuard};
 use wisp_iphash::IpHashBans;
+use wisp_tun::{TunnelConfig, TunnelService};
 
 #[cfg(feature = "ws")]
 use tokio::task::JoinHandle;
@@ -71,6 +72,8 @@ pub enum CoreError {
     IpHashKey(#[from] wisp_iphash::KeyError),
     #[error("wisp_wt.enabled is false; not binding listener")]
     ListenerDisabled,
+    #[error("ip_tunnel: {0}")]
+    Tunnels(String),
     #[cfg(feature = "quic")]
     #[error("serve: {0}")]
     Serve(#[from] ServeError),
@@ -138,6 +141,7 @@ pub struct Runtime {
     file_auth: Option<Arc<ReloadingTokenResolver>>,
     #[cfg(feature = "ws")]
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    tunnels: Option<Arc<TunnelService>>,
 }
 
 impl Runtime {
@@ -178,7 +182,54 @@ impl Runtime {
             file_auth,
             #[cfg(feature = "ws")]
             proxy_template,
+            tunnels: None,
         })
+    }
+
+    /// Starts the IP tunnel engine when `[ip_tunnel]` is enabled: on Linux
+    /// one network namespace per tunnel, which needs `CAP_NET_ADMIN` and
+    /// `CAP_SYS_ADMIN`; without them, or on another system, the start fails
+    /// instead of offering tunnels it cannot build. Call before binding
+    /// listeners; a no-op when the table is off.
+    pub async fn start_tunnels(&mut self) -> Result<(), CoreError> {
+        let opts = &self.cfg.options;
+        if !opts.ip_tunnel.enabled {
+            return Ok(());
+        }
+        let cfg = TunnelConfig::from_options(&opts.ip_tunnel, &opts.base)?;
+        #[cfg(target_os = "linux")]
+        {
+            let backend = wisp_tun::netns::NetnsBackend::start(Arc::new(cfg.clone()))
+                .await
+                .map_err(|e| CoreError::Tunnels(e.to_string()))?;
+            self.tunnels = Some(TunnelService::new(cfg, backend, self.dos.clone()));
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cfg;
+            Err(CoreError::Tunnels(
+                wisp_tun::privileges::check().unwrap_err(),
+            ))
+        }
+    }
+
+    /// Uses a tunnel engine the caller built, for embedders and tests that
+    /// bring their own backend. Call before binding listeners.
+    pub fn with_tunnels(mut self, tunnels: Arc<TunnelService>) -> Self {
+        self.tunnels = Some(tunnels);
+        self
+    }
+
+    /// The IP tunnel engine, when one is running.
+    pub fn tunnels(&self) -> Option<Arc<TunnelService>> {
+        self.tunnels.clone()
+    }
+
+    fn warn_if_tunnels_missing(&self) {
+        if self.cfg.options.ip_tunnel.enabled && self.tunnels.is_none() {
+            warn!("ip_tunnel.enabled is set but the tunnel engine was not started; tunnels are not offered");
+        }
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
@@ -280,6 +331,7 @@ impl Runtime {
             warn!("wispd: wisp_wt.enabled = false — refusing to bind listener");
             return Err(CoreError::ListenerDisabled);
         }
+        self.warn_if_tunnels_missing();
         #[cfg(feature = "ws")]
         let ws_ctx = if self.cfg.options.websocket.enabled {
             let template = self.proxy_template.clone();
@@ -292,7 +344,8 @@ impl Runtime {
                     self.connection_limiter.clone(),
                 )
                 .with_ip_bans(self.ip_bans.clone())
-                .with_shutdown_token(self.cancel.clone()),
+                .with_shutdown_token(self.cancel.clone())
+                .with_tunnels(self.tunnels.clone()),
             ))
         } else {
             None
@@ -304,11 +357,12 @@ impl Runtime {
         let extras = ServeExtras {
             proxy_template: self.proxy_template.clone(),
             ip_bans: self.ip_bans.clone(),
-            tunnels: None,
+            tunnels: self.tunnels.clone(),
         };
         #[cfg(not(feature = "ws"))]
         let extras = ServeExtras {
             ip_bans: self.ip_bans.clone(),
+            tunnels: self.tunnels.clone(),
             ..ServeExtras::default()
         };
         let handle = serve_listener(
@@ -337,6 +391,7 @@ impl Runtime {
         if !opts.websocket.enabled {
             return Ok(None);
         }
+        self.warn_if_tunnels_missing();
         let template = self.proxy_template.clone();
         let ctx = Arc::new(
             H2ServeContext::from_wisp_wt_with_template_and_auth(
@@ -347,7 +402,8 @@ impl Runtime {
                 self.connection_limiter.clone(),
             )
             .with_ip_bans(self.ip_bans.clone())
-            .with_shutdown_token(self.cancel.clone()),
+            .with_shutdown_token(self.cancel.clone())
+            .with_tunnels(self.tunnels.clone()),
         );
         let cancel = self.cancel.clone();
 
@@ -528,6 +584,29 @@ mod tests {
         owned.replace(["def"]);
         assert!(rt.ip_bans().is_banned(Some("def")));
         assert!(!rt.ip_bans().is_banned(Some("abc")));
+    }
+
+    #[tokio::test]
+    async fn tunnels_stay_off_unless_enabled() {
+        let mut rt =
+            Runtime::start(RuntimeConfig::from_options(WispWtServerOptions::default()).unwrap())
+                .unwrap();
+        rt.start_tunnels()
+            .await
+            .expect("a disabled table starts nothing");
+        assert!(rt.tunnels().is_none());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn tunnels_are_refused_off_linux() {
+        let mut opts = WispWtServerOptions::default();
+        opts.ip_tunnel.enabled = true;
+        let mut rt = Runtime::start(RuntimeConfig::from_options(opts).unwrap()).unwrap();
+        assert!(matches!(
+            rt.start_tunnels().await,
+            Err(CoreError::Tunnels(_))
+        ));
     }
 
     #[test]

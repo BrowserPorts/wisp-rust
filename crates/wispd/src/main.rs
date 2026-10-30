@@ -95,7 +95,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         "wispd: starting"
     );
 
-    let runtime = Runtime::start(cfg).context("runtime start")?;
+    let mut runtime = Runtime::start(cfg).context("runtime start")?;
+    runtime
+        .start_tunnels()
+        .await
+        .context("start the IP tunnel engine")?;
+    if runtime.tunnels().is_some() {
+        info!("wispd: IP tunnels offered (extension 0xF3)");
+    }
 
     #[cfg(feature = "ws")]
     let ws_handle = runtime.bind_ws().context("bind ws-h2 listener")?;

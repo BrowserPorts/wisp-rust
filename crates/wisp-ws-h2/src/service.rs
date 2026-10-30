@@ -271,6 +271,8 @@ fn build_server_ctx(
         ctx.dos.clone(),
     )
     .with_cancel(ctx.shutdown.child_token())
+    .with_tunnels(ctx.tunnels.clone())
+    .with_principal(view.principal.clone())
 }
 
 fn status(code: StatusCode) -> Response<Body> {

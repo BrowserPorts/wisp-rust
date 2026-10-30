@@ -200,3 +200,40 @@ bearer_token  = "REPLACE_ME"
 cookie        = ""
 country       = "US"
 ip_type       = "residential"
+
+# ============================================================================
+# [ip_tunnel] — IP packets over Wisp (extension 0xF3, IP_TUNNEL)
+# A client with its own network stack sends whole IPv4/IPv6 packets; the
+# relay routes them with NAT, like a home router. Linux only: each tunnel
+# gets a network namespace (TUN, veth, nftables), which needs CAP_NET_ADMIN
+# and CAP_SYS_ADMIN and the `ip` and `nft` programs. wispd refuses to start
+# with enabled = true when it cannot build them. Destinations follow the
+# [wisp.destination] address and port rules per flow; allow_direct_ip and
+# domain lists do not apply (a credential with a domain_whitelist cannot
+# open tunnels). force_proxy cannot be combined with tunnels.
+# ============================================================================
+[ip_tunnel]
+enabled                    = false
+ipv4_lan                   = "192.168.1.0/24"   # what every tunnel sees
+ipv4_gateway               = "192.168.1.1"
+ipv4_client                = "192.168.1.100"
+# ipv6_prefix              = "2001:db8:42::/48" # a routed prefix the relay owns; omit for IPv4 only
+ipv6_tunnel_prefix_len     = 64
+transit_prefix             = "10.231.0.0/16"    # per-tunnel veth /30s
+netns_prefix               = "wtun"             # namespaces wtun-<id>; stale ones are removed at start
+# egress_interface         = "eth0"             # default: masquerade on any non-tunnel interface
+link_mtu                   = 1500
+max_packet                 = 1500
+max_tunnels_per_connection = 1
+max_tunnels_total          = 256
+resume_grace_s             = 30                 # 0 turns resume off
+reject_with                = "icmp"             # icmp | reset | drop
+icmp_echo                  = true
+dns_servers                = ["1.1.1.1", "8.8.8.8"]
+dns_search                 = []
+max_flows_per_tunnel       = 4096
+max_new_flows_per_tunnel_per_minute = 1200
+max_packets_per_tunnel_per_second   = 20000
+max_bytes_per_tunnel_per_second     = 26214400
+max_packets_per_ip_per_second       = 40000
+max_bytes_per_ip_per_second         = 67108864

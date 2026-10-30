@@ -27,3 +27,4 @@ pub use proxy_control::{
     ProxyRouteConfig, ProxyRouteSnapshot, ProxyRuntimePolicy,
 };
 pub use stream::ConnectError;
+pub use wisp_tun::TunnelService;

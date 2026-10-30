@@ -11,12 +11,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use wisp_config::{
-    endpoint_matches, endpoint_path_token, WispAuthRegistry, WispAuthTokenPolicy,
+    endpoint_matches, endpoint_path_token, token_principal, WispAuthRegistry, WispAuthTokenPolicy,
     WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
 use wisp_dos::{is_ip_budget_allowed, ConnectionLimiter, DosGuard, MINUTE_MS};
 use wisp_iphash::IpHashBans;
-use wisp_wisp_server::{ProxyControllerTemplate, ServerOptions};
+use wisp_wisp_server::{ProxyControllerTemplate, ServerOptions, TunnelService};
 
 use crate::service::handle_request;
 
@@ -50,6 +50,8 @@ pub struct H2ServeContext {
     /// [`H2ServeContext::with_ip_bans`].
     pub ip_bans: Arc<IpHashBans>,
     pub shutdown: CancellationToken,
+    /// The IP tunnel engine, when `[ip_tunnel]` is enabled.
+    pub tunnels: Option<Arc<TunnelService>>,
 }
 
 impl H2ServeContext {
@@ -72,7 +74,14 @@ impl H2ServeContext {
             connection_limiter,
             ip_bans: Arc::new(IpHashBans::new()),
             shutdown: CancellationToken::new(),
+            tunnels: None,
         }
+    }
+
+    /// Offers IP tunnels through `tunnels` on this listener's connections.
+    pub fn with_tunnels(mut self, tunnels: Option<Arc<TunnelService>>) -> Self {
+        self.tunnels = tunnels;
+        self
     }
 
     pub fn with_ip_bans(mut self, ip_bans: Arc<IpHashBans>) -> Self {
@@ -160,6 +169,7 @@ impl H2ServeContext {
         path: &str,
         base: Option<Arc<WispServerOptions>>,
     ) -> Option<ConnectionView> {
+        let principal = endpoint_path_token(path, &self.options.endpoint).map(token_principal);
         let (options, auth_policy) =
             if let Some(token) = endpoint_path_token(path, &self.options.endpoint) {
                 if !self.options.auth.token_path {
@@ -193,6 +203,7 @@ impl H2ServeContext {
             options,
             server_options,
             auth_policy,
+            principal,
         })
     }
 
@@ -210,6 +221,9 @@ pub struct ConnectionView {
     pub options: Arc<WispServerOptions>,
     pub server_options: Arc<ServerOptions>,
     pub auth_policy: WispAuthTokenPolicy,
+    /// A digest of the connection's token, which IP tunnel resume tokens are
+    /// bound to. `None` without a token.
+    pub principal: Option<String>,
 }
 
 /// Drive one accepted connection. The caller is responsible for the TCP

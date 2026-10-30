@@ -3052,6 +3052,7 @@ dependencies = [
  "wisp-proxy-resi",
  "wisp-router",
  "wisp-server",
+ "wisp-tun",
  "wisp-wisp-server",
  "wisp-ws-h2",
 ]
