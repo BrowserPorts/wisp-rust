@@ -1535,6 +1535,88 @@ pub fn datagram_limit_decision(
     }
 }
 
+/// Limits of the IP_TUNNEL extension, from `[ip_tunnel]`. A tunnel carries
+/// a whole network stack's traffic, so it is metered by packets and bytes
+/// rather than by streams, and a packet over a limit is dropped as a
+/// congested router would drop it: the client's own TCP backs off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelLimits {
+    pub packets_per_tunnel_per_second: u64,
+    pub bytes_per_tunnel_per_second: u64,
+    pub packets_per_ip_per_second: u64,
+    pub bytes_per_ip_per_second: u64,
+    pub new_flows_per_tunnel_per_minute: u64,
+}
+
+impl TunnelLimits {
+    pub const UNLIMITED: Self = Self {
+        packets_per_tunnel_per_second: UNLIMITED,
+        bytes_per_tunnel_per_second: UNLIMITED,
+        packets_per_ip_per_second: UNLIMITED,
+        bytes_per_ip_per_second: UNLIMITED,
+        new_flows_per_tunnel_per_minute: UNLIMITED,
+    };
+}
+
+/// Charges one tunnel packet of `bytes` to its tunnel (`tunnel`, one guard
+/// per tunnel) and to the client address the tunnel's connection came
+/// from. `false` means drop it.
+pub fn is_tunnel_packet_allowed(
+    client_ip: &str,
+    tunnel: &ConnectionDosGuard,
+    limits: &TunnelLimits,
+    bytes: u64,
+    store: &DosGuard,
+) -> bool {
+    let tunnel_ok = (limits.packets_per_tunnel_per_second == UNLIMITED
+        && limits.bytes_per_tunnel_per_second == UNLIMITED)
+        || tunnel.consume(&[
+            ConsumeRequest::new(
+                "tunnel:packets:tunnel",
+                limits.packets_per_tunnel_per_second,
+                SECOND_MS,
+            ),
+            ConsumeRequest::new(
+                "tunnel:bytes:tunnel",
+                limits.bytes_per_tunnel_per_second,
+                SECOND_MS,
+            )
+            .with_amount(bytes),
+        ]);
+    if !tunnel_ok {
+        return false;
+    }
+    if limits.packets_per_ip_per_second == UNLIMITED && limits.bytes_per_ip_per_second == UNLIMITED
+    {
+        return true;
+    }
+    let ip = dos_ip_key(client_ip);
+    store.consume(&[
+        ConsumeRequest::new(
+            format!("tunnel:packets:ip:{ip}"),
+            limits.packets_per_ip_per_second,
+            SECOND_MS,
+        ),
+        ConsumeRequest::new(
+            format!("tunnel:bytes:ip:{ip}"),
+            limits.bytes_per_ip_per_second,
+            SECOND_MS,
+        )
+        .with_amount(bytes),
+    ])
+}
+
+/// Charges the start of one new flow (a first packet of a 5-tuple the tunnel
+/// has not seen) to its tunnel.
+pub fn is_tunnel_flow_open_allowed(tunnel: &ConnectionDosGuard, limits: &TunnelLimits) -> bool {
+    limits.new_flows_per_tunnel_per_minute == UNLIMITED
+        || tunnel.consume(&[ConsumeRequest::new(
+            "tunnel:flows:tunnel",
+            limits.new_flows_per_tunnel_per_minute,
+            MINUTE_MS,
+        )])
+}
+
 pub fn is_dns_resolution_allowed(
     client_ip: &str,
     hostname: &str,
@@ -2139,5 +2221,92 @@ mod tests {
             dos_ip_key("2001:db8:1234:5600::1"),
             dos_ip_key("2001:db8:1234:56ab::2")
         );
+    }
+}
+
+#[cfg(test)]
+mod tunnel_limit_tests {
+    use super::*;
+
+    fn limits() -> TunnelLimits {
+        TunnelLimits {
+            packets_per_tunnel_per_second: 3,
+            bytes_per_tunnel_per_second: 10_000,
+            packets_per_ip_per_second: 5,
+            bytes_per_ip_per_second: UNLIMITED,
+            new_flows_per_tunnel_per_minute: 2,
+        }
+    }
+
+    #[test]
+    fn tunnel_packets_are_bounded_per_tunnel_and_per_address() {
+        let store = DosGuard::new();
+        let a = ConnectionDosGuard::new();
+        let b = ConnectionDosGuard::new();
+        for _ in 0..3 {
+            assert!(is_tunnel_packet_allowed(
+                "1.2.3.4",
+                &a,
+                &limits(),
+                100,
+                &store
+            ));
+        }
+        assert!(!is_tunnel_packet_allowed(
+            "1.2.3.4",
+            &a,
+            &limits(),
+            100,
+            &store
+        ));
+        // Another tunnel from the same address shares the address budget.
+        assert!(is_tunnel_packet_allowed(
+            "1.2.3.4",
+            &b,
+            &limits(),
+            100,
+            &store
+        ));
+        assert!(is_tunnel_packet_allowed(
+            "1.2.3.4",
+            &b,
+            &limits(),
+            100,
+            &store
+        ));
+        assert!(!is_tunnel_packet_allowed(
+            "1.2.3.4",
+            &b,
+            &limits(),
+            100,
+            &store
+        ));
+        let big = ConnectionDosGuard::new();
+        assert!(!is_tunnel_packet_allowed(
+            "5.6.7.8",
+            &big,
+            &limits(),
+            20_000,
+            &store
+        ));
+    }
+
+    #[test]
+    fn tunnel_flow_opens_are_bounded() {
+        let t = ConnectionDosGuard::new();
+        assert!(is_tunnel_flow_open_allowed(&t, &limits()));
+        assert!(is_tunnel_flow_open_allowed(&t, &limits()));
+        assert!(!is_tunnel_flow_open_allowed(&t, &limits()));
+        assert!(is_tunnel_flow_open_allowed(&t, &TunnelLimits::UNLIMITED));
+        let store = DosGuard::new();
+        for _ in 0..100 {
+            assert!(is_tunnel_packet_allowed(
+                "1.2.3.4",
+                &t,
+                &TunnelLimits::UNLIMITED,
+                1500,
+                &store
+            ));
+        }
     }
 }
