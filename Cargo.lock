@@ -3083,6 +3083,22 @@ name = "wisp-ip"
 version = "0.1.0"
 
 [[package]]
+name = "wisp-ip-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "tokio",
+ "wisp-config",
+ "wisp-dos",
+ "wisp-ip",
+ "wisp-tun",
+ "wisp-wire",
+ "wisp-wisp",
+ "wisp-wisp-server",
+]
+
+[[package]]
 name = "wisp-iphash"
 version = "0.1.0"
 dependencies = [
