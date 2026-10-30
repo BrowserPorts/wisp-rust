@@ -3284,6 +3284,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-tun"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "parking_lot",
+ "rand 0.8.6",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wisp-config",
+ "wisp-dos",
+ "wisp-ip",
+ "wisp-proxy",
+]
+
+[[package]]
 name = "wisp-wire"
 version = "0.1.0"
 dependencies = [
