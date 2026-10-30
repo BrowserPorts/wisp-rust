@@ -17,9 +17,14 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
+mod ip_tunnel;
 mod narrow;
 mod origin_pattern;
 
+pub use ip_tunnel::{
+    IpTunnelOptions, IpTunnelToml, ResolvedIpTunnel, TunnelReject, MAX_DNS_SEARCH_BYTES,
+    MAX_DNS_SERVERS,
+};
 pub use narrow::{normalize_domain_pattern, normalize_hostname};
 pub use origin_pattern::{parse_origin_pattern, serialize_origin, OriginPattern};
 
@@ -201,6 +206,10 @@ pub struct WispServerOptions {
     pub stream_limit_total: u64,
     pub allow_udp_streams: bool,
     pub allow_tcp_streams: bool,
+    /// Whether a connection with these options may open IP tunnels when the
+    /// server offers them (`[ip_tunnel]`). A token policy can turn it off.
+    #[serde(default = "default_allow_ip_tunnel")]
+    pub allow_ip_tunnel: bool,
     pub dns_ttl: u64,
     pub dns_method: DnsMethod,
     pub dns_servers: Option<Vec<String>>,
@@ -283,6 +292,10 @@ pub struct WispServerOptions {
     pub auth: WispAuthOptions,
 }
 
+fn default_allow_ip_tunnel() -> bool {
+    true
+}
+
 fn default_max_ingress_bytes_per_connection() -> u64 {
     8 * 1024 * 1024
 }
@@ -323,6 +336,7 @@ impl Default for WispServerOptions {
             stream_limit_total: 64,
             allow_udp_streams: true,
             allow_tcp_streams: true,
+            allow_ip_tunnel: default_allow_ip_tunnel(),
             dns_ttl: 120,
             dns_method: DnsMethod::Lookup,
             dns_servers: None,
@@ -466,6 +480,8 @@ pub struct WispAuthTokenPolicy {
     pub allow_private_ips: Option<bool>,
     #[serde(alias = "allow_loopback_ips")]
     pub allow_loopback_ips: Option<bool>,
+    #[serde(alias = "allow_ip_tunnel")]
+    pub allow_ip_tunnel: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +544,9 @@ impl WispAuthTokenPolicy {
         }
         if let Some(v) = self.allow_loopback_ips {
             out.allow_loopback_ips = base.allow_loopback_ips && v;
+        }
+        if let Some(v) = self.allow_ip_tunnel {
+            out.allow_ip_tunnel = base.allow_ip_tunnel && v;
         }
         out
     }
@@ -835,6 +854,9 @@ pub struct WispWtServerOptions {
     pub mullvad: Option<MullvadProviderConfig>,
     /// Residential provider config (None when section absent or disabled).
     pub resi: Option<ResiProviderConfig>,
+    /// `[ip_tunnel]`: whether and how IP tunnels (extension 0xF3) are
+    /// offered on both transports.
+    pub ip_tunnel: IpTunnelOptions,
 }
 
 /// Resolved Mullvad config — the validated subset of [`WispMullvadToml`]
@@ -954,6 +976,7 @@ impl Default for WispWtServerOptions {
             proxy_control_enabled: false,
             mullvad: None,
             resi: None,
+            ip_tunnel: IpTunnelOptions::default(),
         }
     }
 }
@@ -1241,6 +1264,8 @@ pub struct WispWtConfigToml {
     pub wisp_proxy_mullvad: Option<WispMullvadToml>,
     /// `[wisp_proxy_resi]` — provider config for residential / partner proxies.
     pub wisp_proxy_resi: Option<WispResiToml>,
+    /// `[ip_tunnel]` — the IP_TUNNEL extension (0xF3).
+    pub ip_tunnel: Option<IpTunnelToml>,
 }
 
 pub fn parse_toml(raw: &str, source: &str) -> Result<WispWtConfigToml> {
@@ -1605,6 +1630,9 @@ pub fn build_wisp_wt_options(toml_cfg: &WispWtConfigToml) -> WispWtServerOptions
             });
         }
     }
+    if let Some(it) = &toml_cfg.ip_tunnel {
+        it.merge_into(&mut out.ip_tunnel);
+    }
     if let Some(re) = &toml_cfg.wisp_proxy_resi {
         if re.enabled.unwrap_or(false) {
             out.resi = Some(ResiProviderConfig {
@@ -1760,6 +1788,9 @@ impl WispWtServerOptions {
                     "Mysterium requires exactly one of bearer_token or wireproxy_socks5".into(),
                 ));
             }
+        }
+        if self.ip_tunnel.enabled {
+            self.ip_tunnel.resolve(&self.base)?;
         }
         validate_wisp_version_with_proxy_control(
             self.base.wisp_version,
