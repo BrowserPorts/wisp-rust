@@ -3290,6 +3290,7 @@ dependencies = [
  "wisp-dos",
  "wisp-inspect",
  "wisp-ip",
+ "wisp-ip-client",
  "wisp-iphash",
  "wisp-origin",
  "wisp-proxy",

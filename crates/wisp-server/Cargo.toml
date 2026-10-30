@@ -46,3 +46,4 @@ rcgen = "0.13"
 tempfile = "3"
 tracing-subscriber = { workspace = true }
 wisp-wisp = { path = "../wisp-wisp" }
+wisp-ip-client = { path = "../wisp-ip-client" }
