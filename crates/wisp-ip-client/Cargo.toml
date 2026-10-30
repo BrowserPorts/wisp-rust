@@ -30,3 +30,9 @@ wisp-tun = { path = "../wisp-tun" }
 wisp-config = { path = "../wisp-config" }
 wisp-dos = { path = "../wisp-dos" }
 
+
+# The end-to-end test against a real wispd and Linux network namespaces.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "fastrand", "sha1_smol"] }
+http = { workspace = true }

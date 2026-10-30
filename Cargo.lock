@@ -3088,7 +3088,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "http",
+ "libc",
  "tokio",
+ "tokio-websockets",
  "wisp-config",
  "wisp-dos",
  "wisp-ip",
