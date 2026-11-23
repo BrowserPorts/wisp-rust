@@ -1,5 +1,17 @@
+# wispd benchmark config (wispmark `wisp-rust-ws` row, bench/ab.sh).
 #
+# Purpose: measure the raw mux/relay path on equal footing with the other
 # benchmarked servers (mrrowisp, epoxy), which disable their equivalents. Every
+# rate/DoS limiter is set to -1 ("unlimited"), which maps to the u64::MAX
+# sentinel and takes a zero-cost fast path in wisp-dos (no bucket lookup, no
+# per-IP key allocation on the per-chunk / per-datagram hot path). A large
+# *finite* value would still pay that cost on every relayed chunk. TOML integers
+# are i64, so u64::MAX can't be written directly — -1 is the disable knob. NOT
+# for production use.
+#
+# The wispmark harness (server.xsh) and bench/ab.sh point wispd at this file:
+# a plain ws:// listener on 127.0.0.1:6001, relaying to the echo server on
+# 127.0.0.1:6002.
 
 [wisp.server]
 endpoint = "/"

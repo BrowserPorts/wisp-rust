@@ -22,6 +22,7 @@ members = [
     "crates/wisp-ws-h3",
     "crates/wisp-router",
     "crates/wisp-rust-napi",
+    "bench/loadgen",
 ]
 
 [workspace.package]
