@@ -5,7 +5,17 @@ fn main() {
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         give_addon_a_loader_relative_rpath();
+        let_unit_tests_link_without_node();
     }
+}
+
+/// The `napi_*` functions live in the Node process that loads the addon.
+/// napi-build lets the cdylib leave them undefined, but the unit-test binary
+/// links them too, and Apple's linker refuses an executable with undefined
+/// symbols even when nothing calls them (GNU ld drops the unused references).
+/// The tests never reach N-API, so the symbols are left to bind lazily.
+fn let_unit_tests_link_without_node() {
+    println!("cargo:rustc-link-arg=-Wl,-undefined,dynamic_lookup");
 }
 
 /// msquic builds as a dylib whose install name is `@rpath/libmsquic.2.dylib`, and a Node addon is
