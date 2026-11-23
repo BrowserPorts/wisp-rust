@@ -157,6 +157,7 @@ impl Harness {
             ServeExtras {
                 proxy_template: None,
                 ip_bans: bans.clone(),
+                tunnels: None,
             },
         )
         .await

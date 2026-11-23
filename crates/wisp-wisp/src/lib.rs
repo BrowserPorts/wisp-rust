@@ -4,9 +4,10 @@
 //! integers are little-endian.
 //!
 //! Packet types: CONNECT (0x01), DATA (0x02), CONTINUE (0x03), CLOSE (0x04),
-//! INFO (0x05), and FIN (0xF2) from the TCP Half-Close extension. Stream
-//! types: TCP (0x01), UDP (0x02). Extensions are `[id:u8][len:u32 LE][payload]`
-//! and live inside INFO payloads.
+//! INFO (0x05), FIN (0xF2) from the TCP Half-Close extension, and TUNNEL
+//! (0xF3) from the IP_TUNNEL extension. Stream types: TCP (0x01), UDP (0x02).
+//! Extensions are `[id:u8][len:u32 LE][payload]` and live inside INFO
+//! payloads.
 
 #![forbid(unsafe_code)]
 
@@ -62,6 +63,9 @@ pub mod packet_type {
     pub const INFO: u8 = 0x05;
     /// Valid only when [`extension_id::TCP_HALF_CLOSE`] is negotiated.
     pub const FIN: u8 = 0xf2;
+    /// Tunnel control capsules. Valid only when [`extension_id::IP_TUNNEL`]
+    /// is negotiated.
+    pub const TUNNEL: u8 = 0xf3;
 }
 
 /// Wisp stream type bytes inside a CONNECT payload.
@@ -99,12 +103,16 @@ pub mod close_reason {
 /// connect before treating a stream as open: when negotiated, the server
 /// sends a per-stream CONTINUE as soon as the TCP connect succeeds.
 /// TCP_HALF_CLOSE carries a per-direction FIN in packet type 0xF2 so one side
-/// can finish writing while the other keeps sending.
+/// can finish writing while the other keeps sending. IP_TUNNEL carries whole
+/// IP packets: a TUNNEL packet (0xF3) with an OPEN capsule opens a tunnel on a
+/// fresh stream id, and each DATA on that stream is then one IP packet. Its
+/// INFO payload starts with the magic `WIPT` (see the `wisp-ip` crate).
 pub mod extension_id {
     pub const UDP: u8 = 0x01;
     pub const WISP_PROXY_CONTROL: u8 = 0x03;
     pub const STREAM_OPEN_CONFIRMATION: u8 = 0x05;
     pub const TCP_HALF_CLOSE: u8 = 0xf2;
+    pub const IP_TUNNEL: u8 = 0xf3;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +154,13 @@ pub struct FinPacket {
     pub stream_id: u32,
 }
 
+/// Tunnel control on `stream_id`: a sequence of capsules, left encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelPacket {
+    pub stream_id: u32,
+    pub capsules: Bytes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WispPacket {
     Connect(ConnectPacket),
@@ -154,6 +169,7 @@ pub enum WispPacket {
     Close(ClosePacket),
     Info(InfoPacket),
     Fin(FinPacket),
+    Tunnel(TunnelPacket),
 }
 
 impl WispPacket {
@@ -165,6 +181,7 @@ impl WispPacket {
             WispPacket::Close(p) => p.stream_id,
             WispPacket::Info(p) => p.stream_id,
             WispPacket::Fin(p) => p.stream_id,
+            WispPacket::Tunnel(p) => p.stream_id,
         }
     }
 }
@@ -185,6 +202,10 @@ pub fn parse_packet(buf: Bytes) -> Result<WispPacket> {
         packet_type::INFO => parse_info(stream_id, payload).map(WispPacket::Info),
         packet_type::FIN if payload.is_empty() => Ok(WispPacket::Fin(FinPacket { stream_id })),
         packet_type::FIN => Err(WispError::FinPayloadNotEmpty),
+        packet_type::TUNNEL => Ok(WispPacket::Tunnel(TunnelPacket {
+            stream_id,
+            capsules: payload,
+        })),
         other => Err(WispError::UnknownPacketType(other)),
     }
 }
@@ -313,6 +334,14 @@ pub fn encode_fin(stream_id: u32) -> Bytes {
     let mut buf = BytesMut::with_capacity(PACKET_HEADER_LEN);
     buf.put_u8(packet_type::FIN);
     buf.put_u32_le(stream_id);
+    buf.freeze()
+}
+
+pub fn encode_tunnel(stream_id: u32, capsules: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(PACKET_HEADER_LEN + capsules.len());
+    buf.put_u8(packet_type::TUNNEL);
+    buf.put_u32_le(stream_id);
+    buf.extend_from_slice(capsules);
     buf.freeze()
 }
 
@@ -471,6 +500,29 @@ mod tests {
         assert_eq!(
             parse_packet(buf.freeze()).unwrap_err(),
             WispError::FinPayloadNotEmpty,
+        );
+    }
+
+    #[test]
+    fn roundtrip_tunnel() {
+        // EXTENSION.md 6.1: open on stream 7 asking for IPv4 and IPv6.
+        let capsules = [0x01, 0x00, 0x02, 0x00, 0x03, 0x00];
+        let bytes = encode_tunnel(7, &capsules);
+        assert_eq!(
+            &bytes[..],
+            &[0xf3, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00]
+        );
+        assert_eq!(
+            parse_packet(bytes).unwrap(),
+            WispPacket::Tunnel(TunnelPacket {
+                stream_id: 7,
+                capsules: Bytes::copy_from_slice(&capsules),
+            }),
+        );
+        assert_eq!(
+            parse_packet(encode_tunnel(3, &[])).unwrap().stream_id(),
+            3,
+            "an empty capsule list still parses; the tunnel layer judges it"
         );
     }
 

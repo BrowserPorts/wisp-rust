@@ -12,6 +12,22 @@ fn example_wispd_toml_parses() {
     let wt = parsed.wisp_wt.expect("wisp_wt present");
     assert_eq!(ws.port, Some(4242));
     assert_eq!(wt.port, Some(4243));
+    let tunnel = parsed.ip_tunnel.expect("ip_tunnel present");
+    assert_eq!(tunnel.enabled, Some(false));
+}
+
+// The [ip_tunnel] example, switched on, is a valid tunnel configuration.
+#[test]
+fn example_ip_tunnel_validates_when_enabled() {
+    let raw = std::fs::read_to_string(EXAMPLE).expect("read example");
+    let parsed = wisp_config::parse_toml(&raw, EXAMPLE).expect("example must parse");
+    let mut options = wisp_config::build_wisp_wt_options(&parsed);
+    options.ip_tunnel.enabled = true;
+    options
+        .validate()
+        .expect("enabled example must pass validate()");
+    assert_eq!(options.ip_tunnel.dns_servers.len(), 2);
+    assert_eq!(options.ip_tunnel.max_flows_per_tunnel, 4096);
 }
 
 // The reference config is what operators copy, so it has to pass the same

@@ -14,6 +14,7 @@ mod budget;
 mod connection;
 mod proxy_control;
 mod stream;
+mod tunnel;
 mod udp;
 
 pub use budget::{buffered_bytes_total, set_max_buffered_bytes_total};
@@ -26,3 +27,4 @@ pub use proxy_control::{
     ProxyRouteConfig, ProxyRouteSnapshot, ProxyRuntimePolicy,
 };
 pub use stream::ConnectError;
+pub use wisp_tun::TunnelService;

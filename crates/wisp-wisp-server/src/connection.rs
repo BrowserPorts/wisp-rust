@@ -29,6 +29,11 @@
 //!
 //! The TCP stream-open path classifies the client's first bytes with a
 //! [`wisp_inspect::Inspector`] before any upstream bytes flow back.
+//!
+//! When the server runs a tunnel engine and the client offers
+//! [`extension_id::IP_TUNNEL`] with the right magic and a version in range,
+//! TUNNEL packets open IP tunnels on stream ids of their own (see the
+//! `tunnel` module); streams and tunnels share the connection.
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -49,7 +54,9 @@ use wisp_dos::{
     is_control_message_allowed, is_dns_resolution_allowed, is_tcp_stream_open_allowed,
     ConnectionDosGuard, DosGuard, TcpByteLimiter,
 };
+use wisp_ip::{Negotiated, ServerInfo};
 use wisp_proxy::{HostPolicy, NormalizedHost};
+use wisp_tun::{Binding, TunnelService};
 use wisp_wisp::{
     close_reason, encode_close, encode_continue, encode_fin, encode_info, extension_id,
     packet_type, parse_extensions_capped, parse_packet, stream_type, ExtensionEntry, WispError,
@@ -74,6 +81,7 @@ use crate::stream::{
     activate_writer, drop_slot, shutdown_upstream_write, spawn_tcp_connect, write_upstream,
     StreamTable, TcpEvent, TcpStreamSlot, TcpStreamState, WriteOutcome,
 };
+use crate::tunnel::{TunnelEvent, Tunnels};
 
 /// The connection's idle limit, `idle_timeout_ms`. Also bounds how long one
 /// write to the client may take.
@@ -234,17 +242,24 @@ impl EgressSender {
             .map_err(|_| ())
     }
 
-    #[cfg(test)]
-    fn try_send(&self, message: WispMessage) -> Result<(), ()> {
+    /// Queues `message` only if the queue and the process budget have room
+    /// now. IP tunnel packets go this way: one that does not fit is dropped,
+    /// as a congested link drops it, and never holds up the tunnel.
+    pub(crate) fn try_send(&self, message: WispMessage) -> Result<(), ()> {
         let permits = Self::message_cost(&message).ok_or(())?.min(self.max_bytes);
         let queue = self
             .budget
             .clone()
             .try_acquire_many_owned(permits)
             .map_err(|_| ())?;
+        let process = match Self::process_cost(&message) {
+            Some(bytes) if self.process.has_room() => Some(self.process.charge(bytes)),
+            Some(_) => return Err(()),
+            None => None,
+        };
         let permit = EgressPermit {
             _queue: queue,
-            _process: Self::process_cost(&message).map(|bytes| self.process.charge(bytes)),
+            _process: process,
         };
         self.channel(&message)
             .try_send(BudgetedMessage { message, permit })
@@ -439,6 +454,12 @@ pub struct ServerContext {
     /// Upload bytes held for this connection's streams, against its own
     /// `max_ingress_bytes_per_connection` and the process budget.
     pub(crate) ingress: Budgets,
+    /// The process's IP tunnel engine, when `[ip_tunnel]` is enabled. The
+    /// extension is advertised only when this is set.
+    pub tunnels: Option<Arc<TunnelService>>,
+    /// Who the connection authenticated as (a digest of its token), to bind
+    /// tunnel resume tokens to. `None` for a connection without a token.
+    pub principal: Option<String>,
 }
 
 impl ServerContext {
@@ -479,11 +500,24 @@ impl ServerContext {
             cancel: CancellationToken::new(),
             reject_log: Arc::new(LogThrottle::default()),
             ingress,
+            tunnels: None,
+            principal: None,
         }
     }
 
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Offers IP tunnels through `tunnels` on this connection.
+    pub fn with_tunnels(mut self, tunnels: Option<Arc<TunnelService>>) -> Self {
+        self.tunnels = tunnels;
+        self
+    }
+
+    pub fn with_principal(mut self, principal: Option<String>) -> Self {
+        self.principal = principal;
         self
     }
 }
@@ -644,9 +678,17 @@ where
     let resolved_version =
         resolve_wisp_version(ctx.server_options.wisp_version, ctx.client_advertises_v2);
 
+    let tunnel_info = ctx
+        .tunnels
+        .as_ref()
+        .map(|service| service.config().server_info(Binding::WebSocket));
     let negotiated = match resolved_version {
         ResolvedVersion::V2 => {
-            let server_info = build_server_info(&ctx.server_options, proxy_control_active);
+            let server_info = build_server_info(
+                &ctx.server_options,
+                proxy_control_active,
+                tunnel_info.as_ref(),
+            );
             if egress_tx
                 .send(WispMessage::Binary(server_info))
                 .await
@@ -678,6 +720,7 @@ where
                     intersect_extensions(
                         &ctx.server_options,
                         proxy_control_active,
+                        tunnel_info.as_ref(),
                         parse_extensions_capped(info.extensions, DEFAULT_MAX_EXTENSION_ENTRIES)?,
                     )
                 }
@@ -733,6 +776,8 @@ where
     let mut caps = StreamCaps::new(&ctx.server_options);
     let (stream_done_tx, mut stream_done_rx) = mpsc::channel::<(u32, u64)>(256);
     let (tcp_events_tx, mut tcp_events_rx) = mpsc::channel::<TcpEvent>(256);
+    let (tunnel_events_tx, mut tunnel_events_rx) = mpsc::channel::<TunnelEvent>(64);
+    let mut tunnels = Tunnels::new(ctx.tunnels.clone(), negotiated.ip_tunnel, tunnel_events_tx);
     // Proxy control limits and rate budgets are shared across this client's
     // connections through the process-wide limiter, keyed by client IP.
     if let Some(controller) = ctx.proxy_controller.as_ref() {
@@ -776,7 +821,11 @@ where
                     break;
                 }
                 let quiet_until = last_inbound + idle;
-                if now >= quiet_until && streams.is_empty() && udp_streams.is_empty() {
+                if now >= quiet_until
+                    && streams.is_empty()
+                    && udp_streams.is_empty()
+                    && tunnels.is_empty()
+                {
                     tracing::debug!(client_ip = %ctx.client_ip, "wisp: closing idle connection");
                     break;
                 }
@@ -913,6 +962,13 @@ where
                 }
                 continue;
             }
+            Some(ev) = tunnel_events_rx.recv() => {
+                if tunnels.on_event(ev, &egress_tx).await.is_err() {
+                    serve_err = Some(ServerError::ClientClosed);
+                    break;
+                }
+                continue;
+            }
             done = stream_done_rx.recv() => {
                 if let Some((stream_id, generation)) = done {
                     // A flow that ended after its ID was reused must not
@@ -983,6 +1039,7 @@ where
                         frame.slice(5..),
                         &mut streams,
                         &mut udp_streams,
+                        &tunnels,
                         &mut caps,
                         &ctx,
                         &egress_tx,
@@ -1012,6 +1069,7 @@ where
                     packet,
                     &mut streams,
                     &mut udp_streams,
+                    &mut tunnels,
                     &mut caps,
                     &ctx,
                     &negotiated,
@@ -1104,6 +1162,7 @@ where
     }
     drop(stream_done_tx);
     drop(tcp_events_tx);
+    tunnels.detach_all();
     for (_, slot) in streams.drain() {
         drop_slot(slot);
     }
@@ -1157,8 +1216,12 @@ fn resolve_wisp_version(configured: WispVersion, client_advertises_v2: bool) -> 
 /// flag from `serve_connection` — it reflects "controller is wired AND
 /// deployer opted in" so the advertised set never overstates what the
 /// server can actually execute.
-fn build_server_info(opts: &ServerOptions, proxy_control_active: bool) -> Bytes {
-    let mut exts = Vec::with_capacity(4);
+fn build_server_info(
+    opts: &ServerOptions,
+    proxy_control_active: bool,
+    tunnel_info: Option<&ServerInfo>,
+) -> Bytes {
+    let mut exts = Vec::with_capacity(5);
     exts.push(ExtensionEntry {
         id: extension_id::STREAM_OPEN_CONFIRMATION,
         payload: Bytes::new(),
@@ -1179,6 +1242,12 @@ fn build_server_info(opts: &ServerOptions, proxy_control_active: bool) -> Bytes 
             payload: Bytes::from_static(PROXY_CONTROL_PAYLOAD),
         });
     }
+    if let Some(info) = tunnel_info {
+        exts.push(ExtensionEntry {
+            id: extension_id::IP_TUNNEL,
+            payload: Bytes::from(info.encode()),
+        });
+    }
     encode_info(2, 0, &exts)
 }
 
@@ -1195,11 +1264,15 @@ pub(crate) struct NegotiatedExtensions {
     pub proxy_control: bool,
     pub stream_open_confirmation: bool,
     pub tcp_half_close: bool,
+    /// Set when both INFO packets carry an IP_TUNNEL entry with the magic
+    /// and the client's version lies in the server's range.
+    pub ip_tunnel: Option<Negotiated>,
 }
 
 fn intersect_extensions(
     opts: &ServerOptions,
     proxy_control_active: bool,
+    tunnel_info: Option<&ServerInfo>,
     client_exts: Vec<ExtensionEntry>,
 ) -> NegotiatedExtensions {
     let mut neg = NegotiatedExtensions::default();
@@ -1216,6 +1289,9 @@ fn intersect_extensions(
                     ) =>
             {
                 neg.proxy_control = true;
+            }
+            extension_id::IP_TUNNEL => {
+                neg.ip_tunnel = tunnel_info.and_then(|info| wisp_ip::negotiate(info, &ext.payload));
             }
             _ => {}
         }
@@ -1546,6 +1622,7 @@ async fn handle_data(
     payload: Bytes,
     streams: &mut StreamTable,
     udp_streams: &mut UdpStreams,
+    tunnels: &Tunnels,
     caps: &mut StreamCaps,
     ctx: &ServerContext,
     egress: &EgressSender,
@@ -1555,6 +1632,12 @@ async fn handle_data(
         return Err(ServerError::ProtocolViolation(
             "stream_id 0 reserved for control channel",
         ));
+    }
+    if tunnels.contains(stream_id) {
+        // No credit is spent or granted: a tunnel packet is forwarded or
+        // dropped at once.
+        tunnels.data(stream_id, payload);
+        return Ok(());
     }
     if let Some(slot) = streams.get_mut(stream_id) {
         let outcome = if slot.client_fin {
@@ -1608,6 +1691,7 @@ async fn handle_packet(
     packet: WispPacket,
     streams: &mut StreamTable,
     udp_streams: &mut UdpStreams,
+    tunnels: &mut Tunnels,
     caps: &mut StreamCaps,
     ctx: &ServerContext,
     negotiated: &NegotiatedExtensions,
@@ -1622,7 +1706,7 @@ async fn handle_packet(
                     "stream_id 0 reserved for control channel",
                 ));
             }
-            if streams.contains(conn.stream_id) {
+            if streams.contains(conn.stream_id) || tunnels.contains(conn.stream_id) {
                 return Err(ServerError::StreamCollision(conn.stream_id));
             }
             if let Some(existing) = udp_streams.get(&conn.stream_id) {
@@ -1807,6 +1891,7 @@ async fn handle_packet(
                 data.payload,
                 streams,
                 udp_streams,
+                tunnels,
                 caps,
                 ctx,
                 egress,
@@ -1821,7 +1906,9 @@ async fn handle_packet(
                     "stream_id 0 reserved for control channel",
                 ));
             }
-            if let Some(slot) = streams.remove(close.stream_id) {
+            if tunnels.contains(close.stream_id) {
+                tunnels.on_close(close.stream_id);
+            } else if let Some(slot) = streams.remove(close.stream_id) {
                 drop_slot(slot);
                 caps.release(close.stream_id);
             } else if let Some(udp) = udp_streams.remove(&close.stream_id) {
@@ -1851,6 +1938,9 @@ async fn handle_packet(
             if udp_streams.contains_key(&fin.stream_id) {
                 return Err(ServerError::ProtocolViolation("FIN on a UDP stream"));
             }
+            if tunnels.contains(fin.stream_id) {
+                return Err(ServerError::ProtocolViolation("FIN on an IP tunnel"));
+            }
             let Some(slot) = streams.get_mut(fin.stream_id) else {
                 return Ok(());
             };
@@ -1864,6 +1954,13 @@ async fn handle_packet(
                 return close_tcp_stream(fin.stream_id, reason, streams, caps, egress).await;
             }
             return release_finished(fin.stream_id, streams, caps, egress).await;
+        }
+        WispPacket::Tunnel(tunnel) => {
+            let taken =
+                streams.contains(tunnel.stream_id) || udp_streams.contains_key(&tunnel.stream_id);
+            return tunnels
+                .on_tunnel(tunnel.stream_id, tunnel.capsules, taken, ctx, egress)
+                .await;
         }
     }
     Ok(())
@@ -2435,7 +2532,7 @@ mod serve_connection_tests {
     #[test]
     fn half_close_negotiates_only_with_empty_payload() {
         let opts = ServerOptions::from_wisp(&WispServerOptions::default(), false);
-        let info = parse_packet(build_server_info(&opts, false)).unwrap();
+        let info = parse_packet(build_server_info(&opts, false, None)).unwrap();
         let WispPacket::Info(info) = info else {
             panic!("server INFO must be INFO");
         };
@@ -2452,9 +2549,9 @@ mod serve_connection_tests {
                 payload: Bytes::from_static(payload),
             }]
         };
-        assert!(intersect_extensions(&opts, false, offer(b"")).tcp_half_close);
-        assert!(!intersect_extensions(&opts, false, offer(b"\0")).tcp_half_close);
-        assert!(!intersect_extensions(&opts, false, Vec::new()).tcp_half_close);
+        assert!(intersect_extensions(&opts, false, None, offer(b"")).tcp_half_close);
+        assert!(!intersect_extensions(&opts, false, None, offer(b"\0")).tcp_half_close);
+        assert!(!intersect_extensions(&opts, false, None, Vec::new()).tcp_half_close);
     }
 
     #[tokio::test]
@@ -3488,5 +3585,423 @@ mod serve_connection_tests {
         assert!(matches!(err, ConnectError::NoAddresses(_)));
         let policy = HostPolicy::from_options(&WispServerOptions::default());
         let _ = policy;
+    }
+
+    // IP tunnels (extension 0xF3), in the style of the half-close tests.
+
+    use std::net::IpAddr;
+    use wisp_config::IpTunnelOptions;
+    use wisp_ip::capsule::{error_code, want};
+    use wisp_ip::{encode_capsules, parse_capsules, Capsule};
+    use wisp_tun::icmp::build_udp;
+    use wisp_tun::memory::{MemoryBackend, MemoryNetwork};
+    use wisp_tun::TunnelConfig;
+    use wisp_wisp::encode_tunnel;
+
+    const CLIENT: &str = "192.168.1.100";
+    const PUBLIC: &str = "93.184.216.34";
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn tunnel_service(
+        edit: impl FnOnce(&mut IpTunnelOptions),
+    ) -> (
+        Arc<TunnelService>,
+        tokio::sync::mpsc::UnboundedReceiver<MemoryNetwork>,
+    ) {
+        let mut o = IpTunnelOptions {
+            enabled: true,
+            ..IpTunnelOptions::default()
+        };
+        edit(&mut o);
+        let cfg = TunnelConfig::from_options(&o, &WispServerOptions::default()).unwrap();
+        let (backend, nets) = MemoryBackend::new();
+        (
+            TunnelService::new(cfg, backend, Arc::new(DosGuard::new())),
+            nets,
+        )
+    }
+
+    /// Options whose destination policy is the default one, with `port`.
+    fn public_options(port: u16) -> Arc<WispServerOptions> {
+        let mut o = (*loopback_test_options(port)).clone();
+        o.allow_private_ips = false;
+        o.allow_loopback_ips = false;
+        Arc::new(o)
+    }
+
+    fn tunnel_entry(version: u8, magic: &[u8; 4]) -> ExtensionEntry {
+        let mut payload = magic.to_vec();
+        payload.push(version);
+        payload.extend_from_slice(&0x3fu16.to_le_bytes());
+        ExtensionEntry {
+            id: extension_id::IP_TUNNEL,
+            payload: Bytes::from(payload),
+        }
+    }
+
+    /// Runs the v2 handshake offering `ids` with empty payloads plus the
+    /// tunnel entry, and returns the server's extensions.
+    async fn v2_handshake_tunnel(
+        in_tx: &mut fmpsc::UnboundedSender<Result<WispMessage, std::io::Error>>,
+        out_rx: &mut fmpsc::UnboundedReceiver<WispMessage>,
+        ids: &[u8],
+    ) -> Vec<ExtensionEntry> {
+        let server = match next_packet(out_rx).await {
+            WispPacket::Info(info) => parse_extensions(info.extensions).unwrap(),
+            other => panic!("v2 must start with INFO, got {other:?}"),
+        };
+        let mut offered: Vec<ExtensionEntry> = ids
+            .iter()
+            .map(|&id| ExtensionEntry {
+                id,
+                payload: Bytes::new(),
+            })
+            .collect();
+        offered.push(tunnel_entry(1, b"WIPT"));
+        send_packet(in_tx, encode_info(2, 0, &offered)).await;
+        match next_packet(out_rx).await {
+            WispPacket::Continue(c) if c.stream_id == 0 => {}
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        server
+    }
+
+    fn tunnel_open(stream_id: u32, wanted: u16) -> Bytes {
+        encode_tunnel(
+            stream_id,
+            &encode_capsules(&[Capsule::Open { want: wanted }]),
+        )
+    }
+
+    async fn expect_tunnel(
+        out_rx: &mut fmpsc::UnboundedReceiver<WispMessage>,
+        stream_id: u32,
+    ) -> Vec<Capsule> {
+        match next_packet(out_rx).await {
+            WispPacket::Tunnel(t) if t.stream_id == stream_id => {
+                parse_capsules(&t.capsules).unwrap()
+            }
+            other => panic!("expected TUNNEL on {stream_id}, got {other:?}"),
+        }
+    }
+
+    fn resume_token(capsules: &[Capsule]) -> wisp_ip::ResumeToken {
+        capsules
+            .iter()
+            .find_map(|c| match c {
+                Capsule::ResumeToken { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("a resume token")
+    }
+
+    #[test]
+    fn ip_tunnel_negotiates_only_with_the_magic_and_a_version_in_range() {
+        let opts = ServerOptions::from_wisp(&WispServerOptions::default(), false);
+        let info = ServerInfo::v1(0x33, 1, 1500, 1500);
+        let WispPacket::Info(pkt) =
+            parse_packet(build_server_info(&opts, false, Some(&info))).unwrap()
+        else {
+            panic!("server INFO must be INFO");
+        };
+        let entry = parse_extensions(pkt.extensions)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == extension_id::IP_TUNNEL)
+            .expect("advertised");
+        assert_eq!(&entry.payload[..4], b"WIPT");
+        assert_eq!(ServerInfo::parse(&entry.payload).unwrap(), info);
+        let WispPacket::Info(pkt) = parse_packet(build_server_info(&opts, false, None)).unwrap()
+        else {
+            panic!("server INFO must be INFO");
+        };
+        assert!(
+            !parse_extensions(pkt.extensions)
+                .unwrap()
+                .iter()
+                .any(|e| e.id == extension_id::IP_TUNNEL),
+            "not advertised without a tunnel engine"
+        );
+
+        let neg = |entries| intersect_extensions(&opts, false, Some(&info), entries).ip_tunnel;
+        assert_eq!(neg(vec![tunnel_entry(1, b"WIPT")]).unwrap().flags, 0x33);
+        assert!(neg(vec![tunnel_entry(1, b"WIPX")]).is_none(), "wrong magic");
+        assert!(
+            neg(vec![tunnel_entry(2, b"WIPT")]).is_none(),
+            "version out of range"
+        );
+        assert!(
+            neg(vec![tunnel_entry(0, b"WIPT")]).is_none(),
+            "version out of range"
+        );
+        assert!(neg(Vec::new()).is_none(), "client without the extension");
+        assert!(
+            intersect_extensions(&opts, false, None, vec![tunnel_entry(1, b"WIPT")])
+                .ip_tunnel
+                .is_none(),
+            "server without the extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_before_negotiation_is_a_protocol_error() {
+        let (svc, _nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        let server = v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        assert!(server.iter().any(|e| e.id == extension_id::IP_TUNNEL));
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        expect_protocol_violation(out_rx, handle, 5).await;
+    }
+
+    #[tokio::test]
+    async fn tunnel_on_a_v1_connection_is_a_protocol_error() {
+        let (svc, _nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(public_options(443), false).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        match next_packet(&mut out_rx).await {
+            WispPacket::Continue(c) => assert_eq!(c.stream_id, 0),
+            other => panic!("expected handshake CONTINUE, got {other:?}"),
+        }
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        expect_protocol_violation(out_rx, handle, 5).await;
+    }
+
+    #[tokio::test]
+    async fn tunnel_data_takes_no_credit_and_draws_no_continue() {
+        let (svc, mut nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, &[]).await;
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        let confirmation = expect_tunnel(&mut out_rx, 5).await;
+        assert!(matches!(
+            &confirmation[0],
+            Capsule::AddressAssign(a) if a[0].prefix.addr() == ip(CLIENT) && a[0].prefix.len() == 24
+        ));
+        assert!(confirmation.iter().any(
+            |c| matches!(c, Capsule::Link(l) if l.link_mtu == 1500 && l.max_datagram_payload == 0)
+        ));
+        let mut net = nets.recv().await.unwrap();
+
+        // Far more packets than the connection's CONTINUE window.
+        let packet = build_udp(ip(CLIENT), 4000, ip(PUBLIC), 443, b"x");
+        for _ in 0..300 {
+            send_packet(&mut in_tx, encode_data(5, &packet)).await;
+        }
+        for _ in 0..300 {
+            let got = timeout(Duration::from_secs(2), net.from_tunnel.recv())
+                .await
+                .expect("packet timed out")
+                .unwrap();
+            assert_eq!(&got[..], &packet[..]);
+        }
+        expect_quiet(&mut out_rx).await;
+
+        let reply = build_udp(ip(PUBLIC), 443, ip(CLIENT), 4000, b"y");
+        net.to_tunnel
+            .send(Bytes::from(reply.clone()))
+            .await
+            .unwrap();
+        match next_packet(&mut out_rx).await {
+            WispPacket::Data(d) => {
+                assert_eq!(d.stream_id, 5);
+                assert_eq!(&d.payload[..], &reply[..]);
+            }
+            other => panic!("expected the reply as DATA, got {other:?}"),
+        }
+        expect_quiet(&mut out_rx).await;
+        assert!(!handle.is_finished());
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn fin_on_a_tunnel_is_a_protocol_error() {
+        let (svc, _nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        expect_tunnel(&mut out_rx, 5).await;
+        send_packet(&mut in_tx, encode_fin(5)).await;
+        expect_protocol_violation(out_rx, handle, 5).await;
+    }
+
+    #[tokio::test]
+    async fn streams_beside_a_tunnel_behave_as_before() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (svc, _nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(loopback_test_options(port), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        send_packet(&mut in_tx, tunnel_open(3, want::IPV4)).await;
+        expect_tunnel(&mut out_rx, 3).await;
+
+        let mut upstream = open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await;
+        send_packet(&mut in_tx, encode_data(1, b"request")).await;
+        send_packet(&mut in_tx, encode_fin(1)).await;
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), upstream.read_to_end(&mut received))
+            .await
+            .expect("upstream never saw the FIN")
+            .unwrap();
+        assert_eq!(received, b"request");
+        upstream.write_all(b"response").await.unwrap();
+        upstream.shutdown().await.unwrap();
+        expect_data(&mut out_rx, 1, b"response").await;
+        assert_eq!(next_packet(&mut out_rx).await, fin(1));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(1, close_reason::VOLUNTARY)
+        );
+
+        // A CONNECT on the tunnel's stream id collides.
+        send_packet(&mut in_tx, tcp_connect(3, "127.0.0.1", port)).await;
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("connection must end")
+            .unwrap();
+        assert!(matches!(result, Err(ServerError::StreamCollision(3))));
+    }
+
+    #[tokio::test]
+    async fn close_ends_a_tunnel_and_bad_capsules_close_with_invalid_info() {
+        let (svc, mut nets) = tunnel_service(|o| o.max_tunnels_per_connection = 4);
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, &[]).await;
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        expect_tunnel(&mut out_rx, 5).await;
+        let net = nets.recv().await.unwrap();
+        send_packet(&mut in_tx, encode_close(5, close_reason::VOLUNTARY)).await;
+        timeout(Duration::from_secs(2), net.torn_down())
+            .await
+            .expect("CLOSE tears the tunnel's network down");
+
+        // The first capsule is not OPEN.
+        send_packet(
+            &mut in_tx,
+            encode_tunnel(7, &encode_capsules(&[Capsule::Resume { token: [1; 32] }])),
+        )
+        .await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(7, close_reason::INVALID_INFO)
+        );
+        // An unknown capsule type with bit 15 clear.
+        let mut bad = encode_capsules(&[Capsule::Open { want: want::IPV4 }]);
+        bad.extend_from_slice(&[0x23, 0x01, 0x00, 0x00]);
+        send_packet(&mut in_tx, encode_tunnel(9, &bad)).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(9, close_reason::INVALID_INFO)
+        );
+        // An unknown capsule type with bit 15 set is ignored.
+        let mut optional = encode_capsules(&[Capsule::Open { want: want::IPV4 }]);
+        optional.extend_from_slice(&[0x23, 0x81, 0x00, 0x00]);
+        send_packet(&mut in_tx, encode_tunnel(11, &optional)).await;
+        expect_tunnel(&mut out_rx, 11).await;
+        expect_quiet(&mut out_rx).await;
+        assert!(!handle.is_finished());
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn refused_opens_close_with_their_reasons() {
+        let (svc, _nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc.clone()));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, &[]).await;
+        // No IPv6 is offered.
+        send_packet(&mut in_tx, tunnel_open(3, want::IPV6)).await;
+        assert!(matches!(
+            expect_tunnel(&mut out_rx, 3).await[..],
+            [Capsule::Error {
+                code: error_code::FAMILY_NOT_OFFERED,
+                ..
+            }]
+        ));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(3, close_reason::INVALID_INFO)
+        );
+        // One tunnel per connection.
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        expect_tunnel(&mut out_rx, 5).await;
+        send_packet(&mut in_tx, tunnel_open(7, want::IPV4)).await;
+        assert!(matches!(
+            expect_tunnel(&mut out_rx, 7).await[..],
+            [Capsule::Error {
+                code: error_code::TOO_MANY_TUNNELS,
+                ..
+            }]
+        ));
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(7, close_reason::CONN_THROTTLED)
+        );
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+
+        // A credential that may not open tunnels.
+        let mut blocked = (*public_options(443)).clone();
+        blocked.allow_ip_tunnel = false;
+        let ctx = test_ctx(Arc::new(blocked), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, &[]).await;
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        assert_eq!(
+            next_packet(&mut out_rx).await,
+            close(5, close_reason::HOST_BLOCKED)
+        );
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_leaves_its_tunnel_to_resume() {
+        let (svc, mut nets) = tunnel_service(|_| {});
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc.clone()));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, &[]).await;
+        send_packet(&mut in_tx, tunnel_open(5, want::IPV4)).await;
+        let token = resume_token(&expect_tunnel(&mut out_rx, 5).await);
+        let mut net = nets.recv().await.unwrap();
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+        assert!(!net.is_torn_down());
+
+        let ctx = test_ctx(public_options(443), true).with_tunnels(Some(svc));
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake_tunnel(&mut in_tx, &mut out_rx, &[]).await;
+        let resume = encode_capsules(&[
+            Capsule::Open { want: want::IPV4 },
+            Capsule::Resume { token },
+        ]);
+        send_packet(&mut in_tx, encode_tunnel(1, &resume)).await;
+        let confirmation = expect_tunnel(&mut out_rx, 1).await;
+        assert_ne!(resume_token(&confirmation), token, "a fresh token");
+        assert!(
+            !confirmation
+                .iter()
+                .any(|c| matches!(c, Capsule::Error { .. })),
+            "resumed, not a new tunnel"
+        );
+        assert!(nets.try_recv().is_err(), "the same network");
+        let packet = build_udp(ip(CLIENT), 4000, ip(PUBLIC), 443, b"again");
+        send_packet(&mut in_tx, encode_data(1, &packet)).await;
+        let got = timeout(Duration::from_secs(2), net.from_tunnel.recv())
+            .await
+            .expect("packet timed out")
+            .unwrap();
+        assert_eq!(&got[..], &packet[..]);
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
     }
 }

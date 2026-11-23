@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{debug, warn};
 use wisp_config::{
-    endpoint_matches, endpoint_path_token, WispAuthRegistry, WispAuthTokenPolicy,
+    endpoint_matches, endpoint_path_token, token_principal, WispAuthRegistry, WispAuthTokenPolicy,
     WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
 use wisp_dos::{ConnectionLimiter, DosGuard};
@@ -40,7 +40,7 @@ use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
 use wisp_wisp_server::{
     serve_connection, ProxyControllerTemplate, ServerContext, ServerError, ServerOptions,
-    WispMessage,
+    TunnelService, WispMessage,
 };
 
 use crate::frame::{
@@ -69,6 +69,8 @@ pub struct H3WsContext {
     /// Share one set across listeners with [`H3WsContext::with_ip_bans`].
     pub ip_bans: Arc<IpHashBans>,
     pub shutdown: CancellationToken,
+    /// The IP tunnel engine, when `[ip_tunnel]` is enabled.
+    pub tunnels: Option<Arc<TunnelService>>,
 }
 
 impl H3WsContext {
@@ -91,7 +93,14 @@ impl H3WsContext {
             connection_limiter,
             ip_bans: Arc::new(IpHashBans::new()),
             shutdown: CancellationToken::new(),
+            tunnels: None,
         }
+    }
+
+    /// Offers IP tunnels through `tunnels` on this dispatcher's connections.
+    pub fn with_tunnels(mut self, tunnels: Option<Arc<TunnelService>>) -> Self {
+        self.tunnels = tunnels;
+        self
     }
 
     pub fn with_ip_bans(mut self, ip_bans: Arc<IpHashBans>) -> Self {
@@ -133,6 +142,7 @@ impl H3WsContext {
     }
 
     pub async fn context_for_path(&self, path: &str) -> Option<H3WsConnectionView> {
+        let principal = endpoint_path_token(path, &self.options.endpoint).map(token_principal);
         let (options, auth_policy) =
             if let Some(token) = endpoint_path_token(path, &self.options.endpoint) {
                 if !self.options.auth.token_path {
@@ -170,6 +180,7 @@ impl H3WsContext {
             options,
             server_options,
             auth_policy,
+            principal,
         })
     }
 
@@ -184,6 +195,9 @@ pub struct H3WsConnectionView {
     pub options: Arc<WispServerOptions>,
     pub server_options: Arc<ServerOptions>,
     pub auth_policy: WispAuthTokenPolicy,
+    /// A digest of the connection's token, which IP tunnel resume tokens are
+    /// bound to. `None` without a token.
+    pub principal: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -313,6 +327,8 @@ fn build_server_ctx(
         ctx.dos.clone(),
     )
     .with_cancel(ctx.shutdown.child_token())
+    .with_tunnels(ctx.tunnels.clone())
+    .with_principal(view.principal.clone())
 }
 
 /// Error carried on the inbound stream. [`serve_connection`]'s `RxErr`

@@ -247,6 +247,29 @@ impl HostPolicy {
             && self.host_rule_admits(host, port)
     }
 
+    /// The gates for a destination that is only ever an address and port: a
+    /// flow inside an IP tunnel, where the relay never sees a name. Port
+    /// lists, host and port rules, and the address gates of
+    /// [`Self::check_ip`] apply as they do to an IP literal in a CONNECT.
+    /// `allow_direct_ip` does not: it keeps a client from stepping around a
+    /// domain list with an address, and a connection with a domain list
+    /// cannot open tunnels at all. `udp` selects `udp_port_whitelist` the
+    /// way [`Self::check_udp_host`] does.
+    pub fn check_addr_port(&self, ip: IpAddr, port: u16, udp: bool) -> Result<(), ProxyError> {
+        let ip = canonical_ip(ip);
+        if port == 0 || self.port_blacklist.contains(&port) {
+            return Err(ProxyError::PortBlocked(port));
+        }
+        let udp_ports = self.udp_port_whitelist.as_ref().filter(|_| udp);
+        let scoped = udp_ports.is_none() && self.host_rule_admits(&NormalizedHost::Ip(ip), port);
+        if let Some(allowed) = udp_ports.or(self.port_whitelist.as_ref()) {
+            if !allowed.contains(&port) && !scoped {
+                return Err(ProxyError::PortBlocked(port));
+            }
+        }
+        self.check_ip(ip)
+    }
+
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), ProxyError> {
         let ip = canonical_ip(ip);
         if let Some(whitelist) = &self.ip_whitelist {
@@ -759,6 +782,78 @@ impl UdpConnector {
 /// already strips kind/flow-id, so the payload goes through unchanged.
 pub fn shape_udp_outbound(payload: Bytes) -> Bytes {
     payload
+}
+
+#[cfg(test)]
+mod addr_port_tests {
+    use super::*;
+
+    fn policy(edit: impl FnOnce(&mut WispServerOptions)) -> HostPolicy {
+        let mut o = WispServerOptions::default();
+        edit(&mut o);
+        HostPolicy::from_options(&o)
+    }
+
+    #[test]
+    fn tunnel_flows_need_no_allow_direct_ip() {
+        let p = policy(|_| {});
+        assert!(!p.allow_direct_ip);
+        assert!(p
+            .check_addr_port("1.1.1.1".parse().unwrap(), 443, false)
+            .is_ok());
+        assert!(matches!(
+            p.check_addr_port("1.1.1.1".parse().unwrap(), 22, false),
+            Err(ProxyError::PortBlocked(22))
+        ));
+        assert!(matches!(
+            p.check_addr_port("1.1.1.1".parse().unwrap(), 0, true),
+            Err(ProxyError::PortBlocked(0))
+        ));
+    }
+
+    #[test]
+    fn tunnel_flows_keep_the_address_gates() {
+        let p = policy(|o| o.ip_blacklist = Some(vec!["9.9.9.0/24".to_owned()]));
+        assert!(matches!(
+            p.check_addr_port("10.0.0.1".parse().unwrap(), 443, false),
+            Err(ProxyError::PrivateBlocked(_))
+        ));
+        assert!(matches!(
+            p.check_addr_port("127.0.0.1".parse().unwrap(), 443, false),
+            Err(ProxyError::LoopbackBlocked(_))
+        ));
+        assert!(matches!(
+            p.check_addr_port("169.254.169.254".parse().unwrap(), 80, false),
+            Err(ProxyError::PrivateBlocked(_))
+        ));
+        assert!(matches!(
+            p.check_addr_port("9.9.9.9".parse().unwrap(), 443, false),
+            Err(ProxyError::HostBlocked(_))
+        ));
+    }
+
+    #[test]
+    fn tunnel_udp_follows_its_own_port_list_and_host_rules_widen_tcp() {
+        let p = policy(|o| {
+            o.udp_port_whitelist = Some(vec![443]);
+            o.host_port_whitelist = Some(vec![wisp_config::HostPortRule {
+                host: "8.8.8.0/24".to_owned(),
+                port: 53,
+            }]);
+        });
+        assert!(p
+            .check_addr_port("1.1.1.1".parse().unwrap(), 443, true)
+            .is_ok());
+        assert!(p
+            .check_addr_port("8.8.8.8".parse().unwrap(), 53, true)
+            .is_err());
+        assert!(p
+            .check_addr_port("8.8.8.8".parse().unwrap(), 53, false)
+            .is_ok());
+        assert!(p
+            .check_addr_port("8.8.4.4".parse().unwrap(), 53, false)
+            .is_err());
+    }
 }
 
 #[cfg(test)]

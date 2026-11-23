@@ -3061,6 +3061,7 @@ dependencies = [
  "wisp-proxy-resi",
  "wisp-router",
  "wisp-server",
+ "wisp-tun",
  "wisp-wisp-server",
  "wisp-ws-h2",
 ]
@@ -3084,6 +3085,29 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "wisp-config",
+]
+
+[[package]]
+name = "wisp-ip"
+version = "0.1.0"
+
+[[package]]
+name = "wisp-ip-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "http",
+ "libc",
+ "tokio",
+ "tokio-websockets",
+ "wisp-config",
+ "wisp-dos",
+ "wisp-ip",
+ "wisp-tun",
+ "wisp-wire",
+ "wisp-wisp",
+ "wisp-wisp-server",
 ]
 
 [[package]]
@@ -3277,15 +3301,37 @@ dependencies = [
  "wisp-config",
  "wisp-dos",
  "wisp-inspect",
+ "wisp-ip",
+ "wisp-ip-client",
  "wisp-iphash",
  "wisp-origin",
  "wisp-proxy",
  "wisp-quic-msquic",
  "wisp-reports",
+ "wisp-tun",
  "wisp-wire",
  "wisp-wisp",
  "wisp-wisp-server",
  "wisp-ws-h3",
+]
+
+[[package]]
+name = "wisp-tun"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "parking_lot",
+ "rand 0.8.6",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wisp-config",
+ "wisp-dos",
+ "wisp-ip",
+ "wisp-proxy",
 ]
 
 [[package]]
@@ -3318,6 +3364,7 @@ dependencies = [
  "governor",
  "hickory-resolver",
  "http",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
@@ -3330,11 +3377,13 @@ dependencies = [
  "wisp-config",
  "wisp-dos",
  "wisp-inspect",
+ "wisp-ip",
  "wisp-iphash",
  "wisp-origin",
  "wisp-proxy",
  "wisp-proxy-base",
  "wisp-reports",
+ "wisp-tun",
  "wisp-wisp",
 ]
 

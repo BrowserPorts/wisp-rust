@@ -21,6 +21,7 @@ pub mod handshake;
 pub mod policy;
 pub mod serve;
 pub mod session;
+pub mod tunnel_flow;
 pub mod udp_flow;
 pub mod wt_proxy;
 

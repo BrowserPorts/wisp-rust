@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use wisp_wire::{
     decode_frame_body, encode_info_frame, encode_ready_frame, frame_type, parse_extensions,
-    parse_info_payload, ExtensionRegistry, Udp, WireError,
+    parse_info_payload, Extension, ExtensionRegistry, IpTunnel, Udp, WireError,
 };
 
 use crate::session::SessionContext;
@@ -86,12 +86,31 @@ pub async fn negotiate_handshake_with(
     let info = parse_info_payload(&parsed.payload)?;
     let client_exts = parse_extensions(&info.extensions)?;
     let client_ids: HashSet<u8> = client_exts.iter().map(|e| e.id).collect();
-    let negotiated = registry.intersect_ids(&client_ids);
+    let mut negotiated = registry.intersect_ids(&client_ids);
+    // IP_TUNNEL needs more than both ids: the WIPT magic in both entries
+    // and the client's version inside the server's range.
+    let mut ip_tunnel = None;
+    if negotiated.contains(&IpTunnel::ID) {
+        let server = registry
+            .entries()
+            .iter()
+            .find(|e| e.id == IpTunnel::ID)
+            .and_then(|e| wisp_ip::ServerInfo::parse(&e.payload).ok());
+        let client = client_exts.iter().find(|e| e.id == IpTunnel::ID);
+        ip_tunnel = match (server, client) {
+            (Some(server), Some(client)) => wisp_ip::negotiate(&server, &client.payload),
+            _ => None,
+        };
+        if ip_tunnel.is_none() {
+            negotiated.remove(&IpTunnel::ID);
+        }
+    }
 
     io.write_frame(encode_info_frame(registry.entries()))
         .await?;
     io.write_frame(encode_ready_frame()).await?;
     ctx.negotiated = negotiated.clone();
+    ctx.ip_tunnel = ip_tunnel;
     Ok(HandshakeOutcome { negotiated })
 }
 
@@ -213,6 +232,82 @@ mod tests {
             .unwrap();
         assert!(outcome.negotiated.contains(&Udp::ID));
         assert!(!outcome.negotiated.contains(&WebTransportProxy::ID));
+    }
+
+    fn tunnel_registry() -> ExtensionRegistry {
+        let mut registry = ExtensionRegistry::new();
+        registry.register_raw(
+            IpTunnel::ID,
+            Bytes::from(wisp_ip::ServerInfo::v1(0x3f, 2, 1500, 1500).encode()),
+        );
+        registry
+    }
+
+    async fn offer_tunnel(payload: Vec<u8>) -> SessionContext {
+        let (mut server_io, mut client_io) = pair();
+        let mut ctx = make_ctx();
+        let client_info = encode_info_frame(&[ExtensionEntry {
+            id: IpTunnel::ID,
+            payload: Bytes::from(payload),
+        }]);
+        client_io
+            .write_frame(strip_len(&client_info))
+            .await
+            .unwrap();
+        negotiate_handshake_with(&mut server_io, &mut ctx, &tunnel_registry())
+            .await
+            .unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn ip_tunnel_needs_the_magic_and_a_version_in_range() {
+        let good = wisp_ip::ClientInfo {
+            version: 1,
+            flags: 0x07,
+        }
+        .encode();
+        let ctx = offer_tunnel(good.clone()).await;
+        assert!(ctx.has::<IpTunnel>());
+        let neg = ctx.ip_tunnel.unwrap();
+        assert_eq!((neg.flags, neg.max_tunnels), (0x07, 2));
+
+        let mut magic = good.clone();
+        magic[0] = b'X';
+        let ctx = offer_tunnel(magic).await;
+        assert!(!ctx.has::<IpTunnel>());
+        assert!(ctx.ip_tunnel.is_none());
+
+        let version = wisp_ip::ClientInfo {
+            version: 9,
+            flags: 0x07,
+        }
+        .encode();
+        assert!(offer_tunnel(version).await.ip_tunnel.is_none());
+        assert!(offer_tunnel(Vec::new()).await.ip_tunnel.is_none());
+    }
+
+    #[tokio::test]
+    async fn ip_tunnel_absent_from_the_server_is_not_negotiated() {
+        let (mut server_io, mut client_io) = pair();
+        let mut ctx = make_ctx();
+        let client_info = encode_info_frame(&[ExtensionEntry {
+            id: IpTunnel::ID,
+            payload: Bytes::from(
+                wisp_ip::ClientInfo {
+                    version: 1,
+                    flags: 1,
+                }
+                .encode(),
+            ),
+        }]);
+        client_io
+            .write_frame(strip_len(&client_info))
+            .await
+            .unwrap();
+        negotiate_handshake(&mut server_io, &mut ctx).await.unwrap();
+        assert!(ctx.ip_tunnel.is_none());
+        assert!(!ctx.has::<IpTunnel>());
     }
 
     #[tokio::test]

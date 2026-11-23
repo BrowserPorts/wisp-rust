@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 wisp-wisp = { path = "../wisp-wisp" }
+wisp-ip = { path = "../wisp-ip" }
+wisp-tun = { path = "../wisp-tun" }
 wisp-config = { path = "../wisp-config" }
 wisp-inspect = { path = "../wisp-inspect" }
 wisp-origin = { path = "../wisp-origin" }
@@ -31,3 +33,6 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 socket2 = { workspace = true }
 governor = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

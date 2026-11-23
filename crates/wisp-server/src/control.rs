@@ -14,8 +14,9 @@ use thiserror::Error;
 use wisp_dos::is_control_message_allowed;
 use wisp_wire::{
     decode_frame_body, frame_type, parse_close_payload, parse_control_payload,
-    parse_udp_close_payload, parse_udp_open_payload, parse_wt_proxy_close_payload,
-    parse_wt_proxy_open_payload, ProxyControl, Udp, UdpClose, UdpOpenFrame, WebTransportProxy,
+    parse_tunnel_close_payload, parse_tunnel_payload, parse_udp_close_payload,
+    parse_udp_open_payload, parse_wt_proxy_close_payload, parse_wt_proxy_open_payload,
+    ProxyControl, TunnelClose, TunnelFrame, Udp, UdpClose, UdpOpenFrame, WebTransportProxy,
     WireError, WtProxyClose,
 };
 
@@ -52,6 +53,9 @@ pub trait ControlSink: Send {
     async fn on_udp_close(&mut self, frame: UdpClose);
     async fn on_wt_proxy_open(&mut self, url: String);
     async fn on_wt_proxy_close(&mut self, frame: WtProxyClose);
+    async fn on_tunnel_open(&mut self, frame: TunnelFrame);
+    async fn on_tunnel_close(&mut self, frame: TunnelClose);
+    async fn on_tunnel_capsules(&mut self, frame: TunnelFrame);
 }
 
 /// Drives a single post-handshake control bidi.
@@ -80,9 +84,13 @@ impl<'a> SessionDispatch<'a> {
             // only frees a flow, so neither counts against the control-message
             // budget, whose overflow ends the whole session (and whose per-IP
             // share is common to every client behind one address).
+            // TUNNEL_OPEN and TUNNEL_CLOSE likewise spend the tunnel limits.
             let udp_flow_frame = matches!(
                 parsed.frame_type,
-                frame_type::UDP_OPEN | frame_type::UDP_CLOSE
+                frame_type::UDP_OPEN
+                    | frame_type::UDP_CLOSE
+                    | frame_type::TUNNEL_OPEN
+                    | frame_type::TUNNEL_CLOSE
             );
             if !udp_flow_frame
                 && !is_control_message_allowed(
@@ -141,6 +149,31 @@ impl<'a> SessionDispatch<'a> {
                     Ok(frame) => sink.on_wt_proxy_close(frame).await,
                     Err(e) => return ControlOutcome::Error(e.to_string()),
                 },
+                frame_type::TUNNEL_OPEN
+                | frame_type::TUNNEL_OPENED
+                | frame_type::TUNNEL_CLOSE
+                | frame_type::TUNNEL_CAPSULES
+                    if self.ctx.ip_tunnel.is_none() =>
+                {
+                    return ControlOutcome::Error(
+                        "IP tunnel extension was not negotiated".to_owned(),
+                    );
+                }
+                frame_type::TUNNEL_OPENED => {
+                    return ControlOutcome::Error("TUNNEL_OPENED is the server's".to_owned());
+                }
+                frame_type::TUNNEL_OPEN => match parse_tunnel_payload(&parsed.payload) {
+                    Ok(frame) => sink.on_tunnel_open(frame).await,
+                    Err(e) => return ControlOutcome::Error(e.to_string()),
+                },
+                frame_type::TUNNEL_CLOSE => match parse_tunnel_close_payload(&parsed.payload) {
+                    Ok(frame) => sink.on_tunnel_close(frame).await,
+                    Err(e) => return ControlOutcome::Error(e.to_string()),
+                },
+                frame_type::TUNNEL_CAPSULES => match parse_tunnel_payload(&parsed.payload) {
+                    Ok(frame) => sink.on_tunnel_capsules(frame).await,
+                    Err(e) => return ControlOutcome::Error(e.to_string()),
+                },
                 _ => {}
             }
         }
@@ -156,8 +189,8 @@ mod tests {
     use wisp_config::WispServerOptions;
     use wisp_dos::DosGuard;
     use wisp_wire::{
-        encode_close_frame, encode_control_frame, encode_udp_close_frame, encode_udp_open_frame,
-        encode_wt_proxy_open_frame, Extension,
+        encode_close_frame, encode_control_frame, encode_frame, encode_udp_close_frame,
+        encode_udp_open_frame, encode_wt_proxy_open_frame, Extension,
     };
 
     struct ChanIo {
@@ -180,6 +213,9 @@ mod tests {
         udp_closes: Vec<UdpClose>,
         wt_opens: Vec<String>,
         wt_closes: Vec<WtProxyClose>,
+        tunnel_opens: Vec<TunnelFrame>,
+        tunnel_closes: Vec<TunnelClose>,
+        tunnel_capsules: Vec<TunnelFrame>,
     }
     #[async_trait::async_trait]
     impl ControlSink for Recorder {
@@ -197,6 +233,15 @@ mod tests {
         }
         async fn on_wt_proxy_close(&mut self, frame: WtProxyClose) {
             self.wt_closes.push(frame);
+        }
+        async fn on_tunnel_open(&mut self, frame: TunnelFrame) {
+            self.tunnel_opens.push(frame);
+        }
+        async fn on_tunnel_close(&mut self, frame: TunnelClose) {
+            self.tunnel_closes.push(frame);
+        }
+        async fn on_tunnel_capsules(&mut self, frame: TunnelFrame) {
+            self.tunnel_capsules.push(frame);
         }
     }
 
@@ -268,6 +313,112 @@ mod tests {
         assert_eq!(rec.udp_closes.len(), 50);
         assert_eq!(rec.controls.len(), 2);
         assert!(matches!(outcome, ControlOutcome::Error(ref e) if e == "control rate limit"));
+    }
+
+    fn tunnel_ctx() -> SessionContext {
+        let mut ctx = make_ctx();
+        ctx.negotiated.insert(wisp_wire::IpTunnel::ID);
+        ctx.ip_tunnel = Some(wisp_ip::Negotiated {
+            version: 1,
+            flags: 0x3f,
+            max_tunnels: 1,
+            link_mtu: 1500,
+            max_packet: 1500,
+        });
+        ctx
+    }
+
+    #[tokio::test]
+    async fn dispatches_the_tunnel_frames() {
+        use wisp_wire::{encode_tunnel_close_frame, encode_tunnel_frame};
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(body(&encode_tunnel_frame(
+            frame_type::TUNNEL_OPEN,
+            7,
+            &[0x01, 0x00, 0x02, 0x00, 0x05, 0x00],
+        )))
+        .unwrap();
+        tx.send(body(&encode_tunnel_frame(
+            frame_type::TUNNEL_CAPSULES,
+            7,
+            &[],
+        )))
+        .unwrap();
+        tx.send(body(&encode_tunnel_close_frame(7, 0x02))).unwrap();
+        tx.send(body(&encode_close_frame(0x02))).unwrap();
+        let mut io = ChanIo { rx };
+        let mut rec = Recorder::default();
+        let ctx = tunnel_ctx();
+        let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
+        assert!(matches!(
+            outcome,
+            ControlOutcome::PeerClose { reason: 0x02 }
+        ));
+        assert_eq!(rec.tunnel_opens.len(), 1);
+        assert_eq!(rec.tunnel_opens[0].tunnel_id, 7);
+        assert_eq!(
+            rec.tunnel_opens[0].capsules.as_ref(),
+            &[0x01, 0x00, 0x02, 0x00, 0x05, 0x00]
+        );
+        assert_eq!(rec.tunnel_capsules.len(), 1);
+        assert_eq!(rec.tunnel_closes.len(), 1);
+        assert_eq!(rec.tunnel_closes[0].reason, 0x02);
+    }
+
+    #[tokio::test]
+    async fn tunnel_frames_need_the_extension_and_the_right_direction() {
+        use wisp_wire::encode_tunnel_frame;
+        for (frame, ctx) in [
+            (
+                encode_tunnel_frame(frame_type::TUNNEL_OPEN, 1, &[]),
+                make_ctx(),
+            ),
+            (
+                encode_tunnel_frame(frame_type::TUNNEL_OPENED, 1, &[]),
+                tunnel_ctx(),
+            ),
+            (encode_frame(frame_type::TUNNEL_OPEN, &[1, 2]), tunnel_ctx()),
+            (
+                encode_frame(frame_type::TUNNEL_CLOSE, &[1, 0, 0, 0]),
+                tunnel_ctx(),
+            ),
+        ] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(body(&frame)).unwrap();
+            let mut io = ChanIo { rx };
+            let mut rec = Recorder::default();
+            let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
+            assert!(matches!(outcome, ControlOutcome::Error(_)), "{frame:?}");
+            assert!(rec.tunnel_opens.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_opens_do_not_spend_the_control_budget() {
+        use wisp_wire::{encode_tunnel_close_frame, encode_tunnel_frame};
+        let options = WispServerOptions {
+            max_control_messages_per_connection_per_minute: 2,
+            ..WispServerOptions::default()
+        };
+        let mut ctx = SessionContext::new(
+            "1.2.3.4".to_owned(),
+            Arc::new(options),
+            Arc::new(DosGuard::new()),
+        );
+        ctx.negotiated.insert(wisp_wire::IpTunnel::ID);
+        ctx.ip_tunnel = tunnel_ctx().ip_tunnel;
+        let (tx, rx) = mpsc::unbounded_channel();
+        for id in 0..20 {
+            tx.send(body(&encode_tunnel_frame(frame_type::TUNNEL_OPEN, id, &[])))
+                .unwrap();
+            tx.send(body(&encode_tunnel_close_frame(id, 2))).unwrap();
+        }
+        tx.send(body(&encode_close_frame(0x02))).unwrap();
+        let mut io = ChanIo { rx };
+        let mut rec = Recorder::default();
+        let outcome = SessionDispatch::new(&ctx).run(&mut io, &mut rec).await;
+        assert_eq!(rec.tunnel_opens.len(), 20);
+        assert!(matches!(outcome, ControlOutcome::PeerClose { .. }));
     }
 
     #[tokio::test]

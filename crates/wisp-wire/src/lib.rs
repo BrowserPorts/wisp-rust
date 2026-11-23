@@ -1,8 +1,8 @@
 //! wisp-wt frame and stream encoders.
 //!
-//! Three negotiable extensions ([`extension::UDP`],
-//! [`extension::WEBTRANSPORT_PROXY`], [`extension::WISP_PROXY_CONTROL`])
-//! gate wisp-specific routing features. Everything else (stream priority,
+//! Four negotiable extensions ([`extension::UDP`],
+//! [`extension::WEBTRANSPORT_PROXY`], [`extension::WISP_PROXY_CONTROL`],
+//! [`extension::IP_TUNNEL`]) gate wisp-specific routing features. Everything else (stream priority,
 //! datagram priority class, server→client uni responses, per-flow UDP uni
 //! streams) is baked into the base protocol unconditionally — every
 //! spec-compliant WebTransport server can do them, so there is nothing to
@@ -30,7 +30,19 @@
 //!
 //! `class` is one of [`datagram_class`] (`BULK = 0`, `NORMAL = 1`,
 //! `INTERACTIVE = 2`); class 2 maps to `QUIC_SEND_FLAG_DGRAM_PRIORITY`.
-//! `kind` is one of [`datagram_kind`] (`UDP = 0x00`, `WT_PROXY = 0x01`).
+//! `kind` is one of [`datagram_kind`] (`UDP = 0x00`, `WT_PROXY = 0x01`,
+//! `IP = 0x02`). For `IP` the flow id is a tunnel id and the payload starts
+//! with the tunnel fragment header (`wisp-ip`'s `frag` module).
+//!
+//! ### IP tunnels
+//!
+//! With [`extension::IP_TUNNEL`] negotiated, tunnels are controlled with
+//! [`frame_type::TUNNEL_OPEN`], [`frame_type::TUNNEL_OPENED`],
+//! [`frame_type::TUNNEL_CLOSE`] and [`frame_type::TUNNEL_CAPSULES`], each
+//! `[tunnelId:u32 LE]` followed by capsules (or, for `TUNNEL_CLOSE`, a reason
+//! byte). Packets ride `IP` datagrams, or, when datagrams are not negotiated,
+//! one uni stream per tunnel and direction with the same prelude and chunk
+//! layout as a per-flow UDP uni stream.
 //!
 //! ### Bidi stream header (always priority-prefixed)
 //!
@@ -81,6 +93,14 @@ pub mod frame_type {
     pub const WT_PROXY_OPEN: u8 = 0x08;
     pub const WT_PROXY_OPENED: u8 = 0x09;
     pub const WT_PROXY_CLOSE: u8 = 0x0a;
+    /// C→S `[tunnelId:u32][capsules]`, the client picks an id not in use.
+    pub const TUNNEL_OPEN: u8 = 0x0b;
+    /// S→C `[tunnelId:u32][capsules]`, the open confirmation.
+    pub const TUNNEL_OPENED: u8 = 0x0c;
+    /// Either way `[tunnelId:u32][reason:u8]`, reasons as Wisp CLOSE.
+    pub const TUNNEL_CLOSE: u8 = 0x0d;
+    /// Either way `[tunnelId:u32][capsules]`, later control.
+    pub const TUNNEL_CAPSULES: u8 = 0x0e;
 }
 
 /// Bidi stream kind discriminator, immediately following the priority prefix.
@@ -93,6 +113,8 @@ pub mod stream_kind {
 pub mod datagram_kind {
     pub const UDP: u8 = 0x00;
     pub const WT_PROXY: u8 = 0x01;
+    /// An IP packet, or a piece of one, of the tunnel named by the flow id.
+    pub const IP: u8 = 0x02;
 }
 
 /// Three-class datagram priority. `INTERACTIVE` maps to
@@ -112,6 +134,7 @@ pub mod extension {
     pub const UDP: u8 = 0x01;
     pub const WEBTRANSPORT_PROXY: u8 = 0x02;
     pub const WISP_PROXY_CONTROL: u8 = 0x03;
+    pub const IP_TUNNEL: u8 = 0xf3;
 }
 
 /// A negotiable wisp-wt extension.
@@ -169,6 +192,17 @@ pub struct ProxyControl;
 impl Extension for ProxyControl {
     const ID: u8 = extension::WISP_PROXY_CONTROL;
     const NAME: &'static str = "WISP_PROXY_CONTROL";
+}
+
+/// 0xF3 — IP packets in tunnels. The INFO payload is not empty: it carries
+/// the magic `WIPT`, the version range, flags and limits, built from the
+/// server's tunnel configuration, so the server registers it with
+/// [`ExtensionRegistry::register_raw`]. The client's entry must carry the
+/// magic and a version in range, or the extension stays off.
+pub struct IpTunnel;
+impl Extension for IpTunnel {
+    const ID: u8 = extension::IP_TUNNEL;
+    const NAME: &'static str = "IP_TUNNEL";
 }
 
 /// Server-side builder for the extension set advertised in INFO. Add typed
@@ -272,6 +306,10 @@ pub enum WireError {
     ExtensionTooShort,
     #[error("wisp-wt extension payload too short")]
     ExtensionPayloadTooShort,
+    #[error("wisp-wt tunnel frame too short")]
+    TunnelFrameTooShort,
+    #[error("wisp-wt TUNNEL_CLOSE too short")]
+    TunnelCloseTooShort,
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;
@@ -304,6 +342,20 @@ pub struct UdpOpenFrame {
 #[derive(Debug, Clone, Copy)]
 pub struct UdpClose {
     pub flow_id: u32,
+    pub reason: u8,
+}
+
+/// A `TUNNEL_OPEN`, `TUNNEL_OPENED` or `TUNNEL_CAPSULES` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelFrame {
+    pub tunnel_id: u32,
+    /// Encoded capsules, parsed by `wisp-ip`.
+    pub capsules: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelClose {
+    pub tunnel_id: u32,
     pub reason: u8,
 }
 
@@ -566,6 +618,41 @@ pub fn parse_wt_proxy_close_payload(payload: &[u8]) -> Result<WtProxyClose> {
         session_id,
         code,
         reason,
+    })
+}
+
+/// Encode `TUNNEL_OPEN`, `TUNNEL_OPENED` or `TUNNEL_CAPSULES`.
+pub fn encode_tunnel_frame(frame_type: u8, tunnel_id: u32, capsules: &[u8]) -> Bytes {
+    let mut payload = BytesMut::with_capacity(4 + capsules.len());
+    payload.put_u32_le(tunnel_id);
+    payload.extend_from_slice(capsules);
+    encode_frame(frame_type, &payload)
+}
+
+pub fn parse_tunnel_payload(payload: &[u8]) -> Result<TunnelFrame> {
+    if payload.len() < 4 {
+        return Err(WireError::TunnelFrameTooShort);
+    }
+    Ok(TunnelFrame {
+        tunnel_id: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        capsules: Bytes::copy_from_slice(&payload[4..]),
+    })
+}
+
+pub fn encode_tunnel_close_frame(tunnel_id: u32, reason: u8) -> Bytes {
+    let mut payload = BytesMut::with_capacity(5);
+    payload.put_u32_le(tunnel_id);
+    payload.put_u8(reason);
+    encode_frame(frame_type::TUNNEL_CLOSE, &payload)
+}
+
+pub fn parse_tunnel_close_payload(payload: &[u8]) -> Result<TunnelClose> {
+    if payload.len() < 5 {
+        return Err(WireError::TunnelCloseTooShort);
+    }
+    Ok(TunnelClose {
+        tunnel_id: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        reason: payload[4],
     })
 }
 
@@ -933,6 +1020,76 @@ mod tests {
         let buf = [0x01u8, 0x05, 0x00, 0x00, 0x00];
         let err = parse_extensions(&buf).unwrap_err();
         assert!(matches!(err, WireError::ExtensionPayloadTooShort));
+    }
+
+    #[test]
+    fn tunnel_frames_roundtrip() {
+        let capsules = [0x01, 0x00, 0x02, 0x00, 0x01, 0x00];
+        let f = encode_tunnel_frame(frame_type::TUNNEL_OPEN, 0x0102_0304, &capsules);
+        assert_eq!(hex(&f), "0b0000000b04030201010002000100");
+        let parsed = decode_frame_body(&f[4..]).unwrap();
+        assert_eq!(parsed.frame_type, frame_type::TUNNEL_OPEN);
+        let open = parse_tunnel_payload(&parsed.payload).unwrap();
+        assert_eq!(open.tunnel_id, 0x0102_0304);
+        assert_eq!(open.capsules.as_ref(), &capsules);
+
+        for ty in [frame_type::TUNNEL_OPENED, frame_type::TUNNEL_CAPSULES] {
+            let f = encode_tunnel_frame(ty, 9, &[]);
+            let parsed = decode_frame_body(&f[4..]).unwrap();
+            assert_eq!(parsed.frame_type, ty);
+            let body = parse_tunnel_payload(&parsed.payload).unwrap();
+            assert_eq!(body.tunnel_id, 9);
+            assert!(body.capsules.is_empty());
+        }
+
+        let f = encode_tunnel_close_frame(9, 0x41);
+        assert_eq!(hex(&f), "060000000d0900000041");
+        let parsed = decode_frame_body(&f[4..]).unwrap();
+        assert_eq!(
+            parse_tunnel_close_payload(&parsed.payload).unwrap(),
+            TunnelClose {
+                tunnel_id: 9,
+                reason: 0x41
+            }
+        );
+    }
+
+    #[test]
+    fn tunnel_frames_reject_short_payloads() {
+        assert!(matches!(
+            parse_tunnel_payload(&[1, 2, 3]),
+            Err(WireError::TunnelFrameTooShort)
+        ));
+        assert!(matches!(
+            parse_tunnel_close_payload(&[1, 2, 3, 4]),
+            Err(WireError::TunnelCloseTooShort)
+        ));
+    }
+
+    #[test]
+    fn ip_datagram_roundtrip() {
+        let d = encode_datagram(
+            datagram_class::INTERACTIVE,
+            datagram_kind::IP,
+            7,
+            &[0x00, 0x45],
+        );
+        assert_eq!(hex(&d), "0202070000000045");
+        let parsed = parse_datagram(&d).unwrap();
+        assert_eq!(parsed.kind, datagram_kind::IP);
+        assert_eq!(parsed.flow_id, 7);
+        assert_eq!(parsed.payload.as_ref(), &[0x00, 0x45]);
+    }
+
+    #[test]
+    fn ip_tunnel_registers_with_its_payload() {
+        let mut reg = ExtensionRegistry::new();
+        reg.register::<Udp>()
+            .register_raw(IpTunnel::ID, Bytes::from_static(b"WIPT"));
+        assert!(reg.contains::<IpTunnel>());
+        assert_eq!(IpTunnel::ID, 0xf3);
+        let entry = reg.entries().iter().find(|e| e.id == IpTunnel::ID).unwrap();
+        assert_eq!(entry.payload.as_ref(), b"WIPT");
     }
 
     #[test]

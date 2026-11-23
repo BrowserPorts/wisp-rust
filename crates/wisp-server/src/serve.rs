@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use wisp_config::{
-    endpoint_matches, endpoint_path_token, normalize_endpoint, WispAuthRegistry, WispServerOptions,
-    WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
+    endpoint_matches, endpoint_path_token, normalize_endpoint, token_principal, WispAuthRegistry,
+    WispServerOptions, WispWtServerOptions, WISP_BASE_LIMIT_PROFILE,
 };
 use wisp_dos::{
     datagram_limit_decision, is_dns_resolution_allowed, is_tcp_stream_open_allowed,
@@ -50,10 +50,11 @@ use wisp_proxy::{HostPolicy, TcpConnector};
 use wisp_quic_msquic::adapter::MsQuicConnection;
 use wisp_quic_msquic::engine::{EngineConfig, EngineError, MsQuicEngine};
 use wisp_reports::{emit_report, ConnectionContext, ReportErrorType, ReportInput, Transport};
+use wisp_tun::{Binding, TunnelService};
 use wisp_wire::{
     datagram_class, datagram_kind, encode_control_frame, try_parse_bidi_stream_header,
-    BidiStreamKind, Extension, ProxyControl, UdpClose, UdpOpenFrame, WebTransportProxy,
-    WtProxyClose,
+    BidiStreamKind, Extension, IpTunnel, ProxyControl, TunnelClose, TunnelFrame, UdpClose,
+    UdpOpenFrame, WebTransportProxy, WtProxyClose,
 };
 use wisp_wisp_server::{
     handle_proxy_control_text, ProxyController, ProxyControllerTemplate, ServerOptions,
@@ -64,6 +65,7 @@ use crate::control::{ControlOutcome, ControlSink, SessionDispatch};
 use crate::handshake::{ControlIo, ControlIoError, HandshakeError};
 use crate::policy::PreUpgradePolicy;
 use crate::session::SessionContext;
+use crate::tunnel_flow::{TunnelFlows, TunnelOutput, TunnelSession, UniDecoder, TUNNEL_UNI_QUEUE};
 use crate::udp_flow::{UdpFlowHandle, UdpFlowRegistry};
 use crate::wt_proxy::{WtProxyError, WtProxyRegistry, WtProxySession};
 
@@ -91,6 +93,9 @@ const REJECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a finished session waits for its stream, flow and proxy tasks to
 /// observe cancellation before it releases its connection slot anyway.
 const SESSION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the uni-stream accept looks again for a stream it was not woken
+/// for (see `accept_uni_streams`).
+const UNI_ACCEPT_RETRY: Duration = Duration::from_millis(250);
 /// Requests one connection may have refused before it is closed. Each refusal
 /// can cost a token lookup, so a client must not keep one connection open
 /// just to make them.
@@ -218,6 +223,9 @@ pub struct ServeExtras {
     /// the handshake, so a banned address never gets a connection; the
     /// WebTransport and WS-over-H3 policies check them again per session.
     pub ip_bans: Arc<IpHashBans>,
+    /// The IP tunnel engine (`[ip_tunnel]`). When set, sessions are offered
+    /// the IP_TUNNEL extension.
+    pub tunnels: Option<Arc<TunnelService>>,
 }
 
 /// Raw QUIC connection caps. Handshakes in progress and established
@@ -421,6 +429,7 @@ pub async fn serve(
         connection_limiter,
         auth_registry,
         extras.proxy_template,
+        extras.tunnels,
         extras.ip_bans,
     ));
 
@@ -437,6 +446,7 @@ async fn connection_acceptor(
     connection_limiter: Arc<ConnectionLimiter>,
     auth_registry: WispAuthRegistry,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    tunnels: Option<Arc<TunnelService>>,
     ip_bans: Arc<IpHashBans>,
 ) {
     let handshake_timeout =
@@ -459,6 +469,7 @@ async fn connection_acceptor(
                 let connection_limiter = connection_limiter.clone();
                 let auth_registry = auth_registry.clone();
                 let proxy_template = proxy_template.clone();
+                let tunnels = tunnels.clone();
                 let ip_bans = ip_bans.clone();
                 let connection_cancel = cancel.child_token();
                 tokio::spawn(async move {
@@ -487,6 +498,7 @@ async fn connection_acceptor(
                                 connection_limiter,
                                 auth_registry,
                                 proxy_template,
+                                tunnels,
                                 ip_bans,
                             )
                             .await
@@ -597,6 +609,7 @@ async fn handle_connection(
     connection_limiter: Arc<ConnectionLimiter>,
     auth_registry: WispAuthRegistry,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    tunnels: Option<Arc<TunnelService>>,
     ip_bans: Arc<IpHashBans>,
 ) -> Result<(), HandlerError> {
     let handshake_timeout =
@@ -731,6 +744,7 @@ async fn handle_connection(
                 &options,
                 dos,
                 proxy_template,
+                tunnels,
                 &mut ws_sessions,
                 handshake_timeout,
             )
@@ -891,6 +905,7 @@ async fn serve_webtransport(
     options: &WispWtServerOptions,
     dos: Arc<DosGuard>,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    tunnels: Option<Arc<TunnelService>>,
     ws_sessions: &mut JoinSet<()>,
     handshake_timeout: Duration,
 ) -> Result<(), HandlerError> {
@@ -902,6 +917,11 @@ async fn serve_webtransport(
         client_hash,
         conn_guard: _conn_guard,
     } = admitted;
+    let principal = endpoint_path_token(
+        request.uri().path(),
+        &normalize_endpoint(&options.base.endpoint),
+    )
+    .map(token_principal);
     tokio::time::timeout(handshake_timeout, await_peer_settings(&mut h3_conn))
         .await
         .map_err(|_| HandlerError::WtAccept("peer SETTINGS timed out".to_owned()))?
@@ -913,8 +933,9 @@ async fn serve_webtransport(
     );
     debug!(client_ip = %client_ip, "wisp: WebTransport session accepted");
 
-    let mut ctx =
-        SessionContext::new(client_ip, effective_options, dos).with_client_hash(client_hash);
+    let mut ctx = SessionContext::new(client_ip, effective_options, dos)
+        .with_client_hash(client_hash)
+        .with_principal(principal);
 
     let result = session_loop(
         session.clone(),
@@ -928,6 +949,7 @@ async fn serve_webtransport(
             allowed_proxy_providers,
         },
         proxy_template,
+        tunnels,
     )
     .await;
     // The session owns the h3 connection, and dropping it closes the QUIC
@@ -952,6 +974,7 @@ async fn session_loop(
     ctx: &mut SessionContext,
     settings: SessionSettings,
     proxy_template: Option<Arc<ProxyControllerTemplate>>,
+    tunnels: Option<Arc<TunnelService>>,
 ) -> Result<(), HandlerError> {
     let SessionSettings {
         wt_proxy_enabled,
@@ -1003,6 +1026,12 @@ async fn session_loop(
     };
     if proxy_controller.is_some() {
         registry.register_raw(ProxyControl::ID, Bytes::from_static(br#"{"version":1}"#));
+    }
+    if let Some(service) = &tunnels {
+        registry.register_raw(
+            IpTunnel::ID,
+            Bytes::from(service.config().server_info(Binding::WebTransport).encode()),
+        );
     }
     if let Err(e) = tokio::time::timeout(
         handshake_timeout,
@@ -1081,8 +1110,13 @@ async fn session_loop(
                 );
                 continue;
             }
-            let is_wt_proxy = queued.frame.get(1) == Some(&datagram_kind::WT_PROXY);
-            if is_wt_proxy
+            // A proxied or tunnelled datagram that waited this long is
+            // worthless; the tunnel's TCP retransmits instead.
+            let ages = matches!(
+                queued.frame.get(1),
+                Some(&datagram_kind::WT_PROXY) | Some(&datagram_kind::IP)
+            );
+            if ages
                 && queued.queued_at.elapsed()
                     > Duration::from_millis(u64::from(
                         wisp_wire::WISP_WT_PROXY_UPSTREAM_DATAGRAM_MAX_AGE_MS,
@@ -1111,6 +1145,28 @@ async fn session_loop(
         None
     };
     let session_limits = SessionLimits::from_ctx(ctx);
+    let tunnel_flows = match (&tunnels, ctx.ip_tunnel) {
+        (Some(service), Some(negotiated)) => Some(TunnelFlows::new(
+            service.clone(),
+            negotiated,
+            TunnelSession {
+                client_ip: ctx.client_ip.clone(),
+                principal: ctx.principal.clone(),
+                options: ctx.options.clone(),
+                policy: Arc::new(HostPolicy::from_options(&ctx.options)),
+                max_datagram_bytes: max_datagram_bytes as usize,
+            },
+            control_writer_tx.clone(),
+            Arc::new(SessionTunnelOutput {
+                datagrams: datagram_tx.clone(),
+                session: session.clone(),
+                tasks: tasks.clone(),
+                shutdown: flow_shutdown.clone(),
+            }),
+            tasks.clone(),
+        )),
+        _ => None,
+    };
     session_tasks.spawn(accept_streams_loop(
         session.clone(),
         tcp_connector.clone(),
@@ -1121,13 +1177,19 @@ async fn session_loop(
         tasks.clone(),
         flow_shutdown.clone(),
     ));
-    session_tasks.spawn(refuse_uni_streams(session.clone()));
+    session_tasks.spawn(accept_uni_streams(
+        session.clone(),
+        tunnel_flows.clone(),
+        tasks.clone(),
+        flow_shutdown.clone(),
+    ));
 
     let udp_negotiated = ctx.has::<wisp_wire::Udp>();
     session_tasks.spawn(datagram_demux_loop(
         datagram_reader,
         udp_flows.clone(),
         wt_proxies.clone(),
+        tunnel_flows.clone(),
         session_limits.clone(),
         udp_negotiated,
         max_datagram_bytes,
@@ -1155,6 +1217,7 @@ async fn session_loop(
         udp_slots,
         udp_reply_tail: None,
         tasks: tasks.clone(),
+        tunnels: tunnel_flows.clone(),
     };
 
     let dispatch = SessionDispatch::new(ctx);
@@ -1166,6 +1229,10 @@ async fn session_loop(
         }
     };
 
+    if let Some(flows) = &tunnel_flows {
+        // Open tunnels wait out the resume grace period.
+        flows.shutdown();
+    }
     flow_shutdown.cancel();
     udp_flows.shutdown_all();
     if let Some(registry) = wt_proxies {
@@ -1197,18 +1264,147 @@ async fn session_loop(
     }
 }
 
-/// wisp-wt clients open no unidirectional streams of their own. Any that
-/// arrive are told to stop sending, so they hold no flow-control credit or
-/// buffered data for the rest of the session.
-async fn refuse_uni_streams(session: Arc<WebTransportSession<MsQuicConnection, Bytes>>) {
+/// The only unidirectional streams a wisp-wt client opens carry an IP
+/// tunnel's packets when the tunnel does not use datagrams: prelude
+/// `[tunnel_id:u32]`, then `[length:u16][packet]`. Any other is told to stop
+/// sending, so it holds no flow-control credit or buffered data for the rest
+/// of the session.
+async fn accept_uni_streams(
+    session: Arc<WebTransportSession<MsQuicConnection, Bytes>>,
+    tunnels: Option<Arc<TunnelFlows>>,
+    tasks: TaskTracker,
+    shutdown: CancellationToken,
+) {
     loop {
-        match session.accept_uni().await {
+        // h3-webtransport keeps one waker for incoming uni streams, and the
+        // bidi accept loop's control polling can queue a stream without
+        // waking this task, so a session with tunnels looks again on a timer.
+        let accepted = match &tunnels {
+            Some(_) => loop {
+                match tokio::time::timeout(UNI_ACCEPT_RETRY, session.accept_uni()).await {
+                    Ok(accepted) => break accepted,
+                    Err(_) => continue,
+                }
+            },
+            None => session.accept_uni().await,
+        };
+        match accepted {
             Ok(Some((_, mut stream))) => {
-                stream.stop_sending(h3::error::Code::H3_NO_ERROR.value());
-                debug!("wisp: client unidirectional WT stream refused");
+                let Some(flows) = tunnels.clone() else {
+                    stream.stop_sending(h3::error::Code::H3_NO_ERROR.value());
+                    debug!("wisp: client unidirectional WT stream refused");
+                    continue;
+                };
+                let shutdown = shutdown.clone();
+                tasks.spawn(async move {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {}
+                        _ = read_tunnel_uni(&mut stream, &flows) => {}
+                    }
+                    stream.stop_sending(h3::error::Code::H3_NO_ERROR.value());
+                });
             }
             Ok(None) | Err(_) => return,
         }
+    }
+}
+
+/// Feeds one client tunnel uni stream into its tunnel until it ends or turns
+/// out not to belong to a uni-stream tunnel.
+async fn read_tunnel_uni<S>(stream: &mut S, flows: &TunnelFlows)
+where
+    S: h3::quic::RecvStream,
+{
+    let mut decoder = UniDecoder::default();
+    let mut handle = None;
+    loop {
+        if handle.is_none() {
+            if let Some(tunnel_id) = decoder.tunnel_id() {
+                match flows.accepts_uni(tunnel_id) {
+                    Some(h) => handle = Some(h),
+                    None => {
+                        debug!(
+                            tunnel_id,
+                            "wisp: uni stream for no uni-stream tunnel refused"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(h) = &handle {
+            while let Some(packet) = decoder.next_packet() {
+                h.forward(packet);
+            }
+        }
+        // One chunk is at most a 16-bit length and its packet.
+        if decoder.buffered() > 2 + usize::from(u16::MAX) {
+            return;
+        }
+        match std::future::poll_fn(|cx| stream.poll_data(cx)).await {
+            Ok(Some(mut chunk)) => {
+                while chunk.has_remaining() {
+                    let part = chunk.chunk();
+                    decoder.push(part);
+                    let n = part.len();
+                    chunk.advance(n);
+                }
+            }
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+/// The QUIC side of a session's tunnel packets towards the client.
+struct SessionTunnelOutput {
+    datagrams: mpsc::Sender<DatagramEgress>,
+    session: Arc<WebTransportSession<MsQuicConnection, Bytes>>,
+    tasks: TaskTracker,
+    shutdown: CancellationToken,
+}
+
+impl TunnelOutput for SessionTunnelOutput {
+    fn datagram(&self, frame: Bytes) -> bool {
+        self.datagrams.try_send(DatagramEgress::new(frame)).is_ok()
+    }
+
+    fn uni(&self, tunnel_id: u32) -> mpsc::Sender<Bytes> {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(TUNNEL_UNI_QUEUE);
+        let session = self.session.clone();
+        let shutdown = self.shutdown.clone();
+        self.tasks.spawn(async move {
+            let mut stream = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                opened = session.open_uni(session.session_id()) => match opened {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        debug!(tunnel_id, error = ?error, "wisp: tunnel uni stream open failed");
+                        return;
+                    }
+                },
+            };
+            let mut next = Some(Bytes::copy_from_slice(&tunnel_id.to_le_bytes()));
+            loop {
+                let mut frame = match next.take() {
+                    Some(frame) => frame,
+                    None => tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        chunk = rx.recv() => match chunk {
+                            Some(chunk) => chunk,
+                            None => break,
+                        },
+                    },
+                };
+                while frame.has_remaining() {
+                    match std::future::poll_fn(|cx| stream.poll_send(cx, &mut frame)).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let _ = std::future::poll_fn(|cx| stream.poll_finish(cx)).await;
+        });
+        tx
     }
 }
 
@@ -2249,6 +2445,8 @@ struct BridgeSink {
     udp_reply_tail: Option<oneshot::Receiver<()>>,
     /// Tasks the session waits for before releasing its connection slot.
     tasks: TaskTracker,
+    /// The session's IP tunnels, when IP_TUNNEL was negotiated.
+    tunnels: Option<Arc<TunnelFlows>>,
 }
 
 /// One UDP_OPEN's place in the reply order. UDP_OPENED carries no request id,
@@ -2457,6 +2655,21 @@ impl ControlSink for BridgeSink {
             registry.remove(frame.session_id, frame.code, frame.reason.as_bytes());
         }
     }
+    async fn on_tunnel_open(&mut self, frame: TunnelFrame) {
+        if let Some(flows) = &self.tunnels {
+            flows.on_open(frame).await;
+        }
+    }
+    async fn on_tunnel_close(&mut self, frame: TunnelClose) {
+        if let Some(flows) = &self.tunnels {
+            flows.on_close(frame);
+        }
+    }
+    async fn on_tunnel_capsules(&mut self, frame: TunnelFrame) {
+        if let Some(flows) = &self.tunnels {
+            flows.on_capsules(frame).await;
+        }
+    }
 }
 
 /// Pops one QUIC datagram, parses its class- and kind-prefixed header, and
@@ -2470,6 +2683,7 @@ async fn datagram_demux_loop(
     >,
     flows: Arc<UdpFlowRegistry>,
     wt_proxies: Option<Arc<WtProxyRegistry>>,
+    tunnels: Option<Arc<TunnelFlows>>,
     limits: SessionLimits,
     udp_negotiated: bool,
     max_datagram_bytes: u32,
@@ -2490,13 +2704,18 @@ async fn datagram_demux_loop(
             );
             continue;
         }
-        match limits.datagram_decision(buf.len() as u64) {
-            DatagramDecision::Allow => {}
-            DatagramDecision::Drop => continue,
-            DatagramDecision::Close => {
-                debug!("wisp: datagram rate exceeded; ending session");
-                session_cancel.cancel();
-                return;
+        // A tunnel carries a whole network stack's traffic and is metered by
+        // the tunnel engine's own packet and byte limits instead.
+        let tunnel_datagram = buf.get(1) == Some(&datagram_kind::IP) && tunnels.is_some();
+        if !tunnel_datagram {
+            match limits.datagram_decision(buf.len() as u64) {
+                DatagramDecision::Allow => {}
+                DatagramDecision::Drop => continue,
+                DatagramDecision::Close => {
+                    debug!("wisp: datagram rate exceeded; ending session");
+                    session_cancel.cancel();
+                    return;
+                }
             }
         }
         match wisp_wire::parse_datagram(&buf) {
@@ -2535,6 +2754,14 @@ async fn datagram_demux_loop(
                     if let Err(error) = upstream.session.send_datagram(d.payload) {
                         debug!(session_id = d.flow_id, error = %error, "wisp: upstream WT datagram dropped");
                     }
+                }
+                datagram_kind::IP => {
+                    let Some(tunnels) = &tunnels else {
+                        debug!("wisp: IP datagram received without negotiated extension");
+                        session_cancel.cancel();
+                        return;
+                    };
+                    tunnels.on_datagram(d.flow_id, &d.payload);
                 }
                 other => {
                     debug!(kind = other, "wisp: unknown datagram kind dropped");

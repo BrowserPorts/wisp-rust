@@ -1,0 +1,38 @@
+[package]
+name = "wisp-ip-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The uplink of a machine whose network stack is a whole kernel (Ferrochrome's
+# netkernel): IP_TUNNEL (0xF3) on both Wisp bindings, the virtual router on the
+# machine's Ethernet link, and the machine manager. No I/O: the carriers in
+# `packages/wisp-ip-carrier` move the bytes. Builds for wasm32-unknown-unknown
+# (a `cdylib` with the exports of `src/abi.rs`) and natively for tests.
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+wisp-ip = { path = "../wisp-ip" }
+wisp-wisp = { path = "../wisp-wisp" }
+wisp-wire = { path = "../wisp-wire" }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+# The relay's own code, for interop tests on the WebSocket binding.
+wisp-wisp-server = { path = "../wisp-wisp-server" }
+wisp-tun = { path = "../wisp-tun" }
+wisp-config = { path = "../wisp-config" }
+wisp-dos = { path = "../wisp-dos" }
+
+
+# The end-to-end test against a real wispd and Linux network namespaces.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "fastrand", "sha1_smol"] }
+http = { workspace = true }
