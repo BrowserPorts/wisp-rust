@@ -48,6 +48,10 @@ use crate::proxy_control::ProxyConnectError;
 const READ_CHUNK: usize = 128 * 1024;
 const READ_BUFFER_POOL_CAPACITY: usize = 256;
 const WRITE_BATCH_CAPACITY: usize = 64;
+/// Most client payloads one stream collects before they are written to its
+/// upstream together, and the most bytes. See [`flush_batch`].
+const COALESCE_MAX_PACKETS: usize = 64;
+const COALESCE_MAX_BYTES: usize = 256 * 1024;
 /// Upstream reads shorter than this are copied out of the pooled buffer, so
 /// a frame waiting in the egress queue pins only its own length and not the
 /// whole read buffer the egress budget does not see.
@@ -551,6 +555,11 @@ pub(crate) struct TcpStreamSlot {
     activity: Arc<Activity>,
     /// Upload credit and held bytes, made with the first payload.
     flow: Option<Arc<StreamFlow>>,
+    /// Client payloads that arrived together and are written to the upstream
+    /// with one call by [`flush_batch`]. Empty whenever the mux handles
+    /// anything but DATA.
+    batch: Vec<QueuedWrite>,
+    batch_bytes: usize,
     /// The client sent FIN; no more DATA is valid.
     pub client_fin: bool,
     /// The upstream write half has been shut down.
@@ -577,6 +586,8 @@ impl TcpStreamSlot {
             uninspected: false,
             activity: Activity::new(),
             flow: None,
+            batch: Vec::new(),
+            batch_bytes: 0,
             client_fin: false,
             write_shut: false,
             upstream_eof: false,
@@ -866,15 +877,27 @@ fn spawn_reader(
         activity.touch();
         let pool = read_buffer_pool();
         let mut eof = false;
+        // Both live for the whole loop. Making a cancellation future or a
+        // timer per read costs a lock or a timer-wheel entry each time.
+        let cancelled = ctx.cancel.cancelled();
+        tokio::pin!(cancelled);
+        let idle_check = idle.map_or(Duration::from_secs(3600), |limit| limit / 2);
+        let idle_timer = tokio::time::sleep(idle_check);
+        tokio::pin!(idle_timer);
         'read_loop: loop {
+            if ctx.cancel.is_cancelled() {
+                break;
+            }
             // Nothing more is read from the upstream while the client's
             // egress queue, or the process budget, is full.
-            tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => break,
-                room = egress.room() => if room.is_err() {
-                    break;
-                },
+            if !egress.has_room() {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => break,
+                    room = egress.room() => if room.is_err() {
+                        break;
+                    },
+                }
             }
             let mut buf = pool.take();
             if buf.data.capacity() < PACKET_HEADER_LEN + READ_CHUNK {
@@ -883,13 +906,9 @@ fn spawn_reader(
             }
             buf.data.resize(PACKET_HEADER_LEN, 0);
             tokio::select! {
-                _ = ctx.cancel.cancelled() => break,
-                _ = idle_wait(idle) => {
-                    if activity.idle_for(idle) {
-                        send_close(&egress, &ctx.cancel, stream_id, close_reason::TRANSFER_TIMEOUT).await;
-                        break;
-                    }
-                }
+                // The read comes first, so a busy stream never touches the
+                // timer or the cancellation list.
+                biased;
                 res = up_read.read_buf(&mut buf.data) => match res {
                     Ok(0) if half_close => {
                         eof = true;
@@ -941,7 +960,7 @@ fn spawn_reader(
                         };
                         let send_res = tokio::select! {
                             biased;
-                            _ = ctx.cancel.cancelled() => break,
+                            _ = &mut cancelled => break,
                             r = egress.send(WispMessage::Binary(frame)) => r,
                         };
                         if send_res.is_err() {
@@ -961,6 +980,16 @@ fn spawn_reader(
                         send_close(&egress, &ctx.cancel, stream_id, close_reason::NETWORK_ERROR).await;
                         break;
                     }
+                },
+                _ = &mut cancelled => break,
+                _ = &mut idle_timer, if idle.is_some() => {
+                    if activity.idle_for(idle) {
+                        send_close(&egress, &ctx.cancel, stream_id, close_reason::TRANSFER_TIMEOUT).await;
+                        break;
+                    }
+                    idle_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_check);
                 }
             }
         }
@@ -997,6 +1026,11 @@ fn spawn_reader(
 
 pub(crate) enum WriteOutcome {
     Ok,
+    /// The payload waits in the stream's batch for [`flush_batch`]. `first`
+    /// is set when the batch was empty before it.
+    Deferred {
+        first: bool,
+    },
     /// Grant the client this much CONTINUE credit for the stream.
     SendContinue(u32),
     DropStream(u8),
@@ -1096,10 +1130,14 @@ fn taken(flow: &StreamFlow, held: Option<HeldBytes>) {
 
 /// Mux-thread DATA path. Never awaits TCP: Connecting queues; Live
 /// `try_write`s when the socket is idle and only enqueues on WouldBlock.
+/// With `defer`, a payload for an idle socket joins the stream's batch
+/// instead, and the caller must call [`flush_batch`] before it handles
+/// anything else for the connection.
 pub(crate) fn write_upstream(
     slot: &mut TcpStreamSlot,
     payload: Bytes,
     stream_id: u32,
+    defer: bool,
     ctx: &ServerContext,
     egress: &EgressSender,
     events: &mpsc::Sender<TcpEvent>,
@@ -1112,16 +1150,18 @@ pub(crate) fn write_upstream(
         }
         return WriteOutcome::Ok;
     }
-    write_live(slot, payload, None, stream_id, ctx, egress, events)
+    write_live(slot, payload, None, stream_id, defer, ctx, egress, events)
 }
 
 /// Writes one payload to a live stream. `held` is set when the payload was
 /// already held while the stream was connecting.
+#[allow(clippy::too_many_arguments)]
 fn write_live(
     slot: &mut TcpStreamSlot,
     payload: Bytes,
     held: Option<HeldBytes>,
     stream_id: u32,
+    defer: bool,
     ctx: &ServerContext,
     egress: &EgressSender,
     events: &mpsc::Sender<TcpEvent>,
@@ -1170,6 +1210,24 @@ fn write_live(
     } else {
         payload
     };
+
+    if defer && held.is_none() && write.is_some() {
+        slot.batch_bytes += payload.len();
+        let held = flow.hold(payload.len());
+        slot.batch.push(QueuedWrite {
+            data: payload,
+            _held: held,
+        });
+        // A batch the socket only partly takes moves to a fresh writer queue,
+        // so it must never outgrow that queue.
+        let max_packets = COALESCE_MAX_PACKETS.min(write_queue_cap(ctx));
+        if slot.batch.len() >= max_packets || slot.batch_bytes >= COALESCE_MAX_BYTES {
+            return flush_batch(slot, stream_id, ctx, egress, events);
+        }
+        return WriteOutcome::Deferred {
+            first: slot.batch.len() == 1,
+        };
+    }
 
     if let Some(write_half) = write.as_mut() {
         match try_write_nonblock(write_half, &payload) {
@@ -1234,6 +1292,115 @@ fn write_live(
     }
 }
 
+/// Writes a stream's batch to its upstream with one vectored write, where
+/// writing each payload as it arrived would cost a system call apiece. Each
+/// payload is held against the byte budgets until the upstream takes it, and
+/// counts once towards the stream's credit. What the socket does not take
+/// moves to a queued writer, as on the unbatched path.
+pub(crate) fn flush_batch(
+    slot: &mut TcpStreamSlot,
+    stream_id: u32,
+    ctx: &ServerContext,
+    egress: &EgressSender,
+    events: &mpsc::Sender<TcpEvent>,
+) -> WriteOutcome {
+    if slot.batch.is_empty() {
+        return WriteOutcome::Ok;
+    }
+    let mut batch = std::mem::take(&mut slot.batch);
+    slot.batch_bytes = 0;
+    let generation = slot.generation;
+    let flow = slot.flow_for(ctx);
+    let activity = slot.activity.clone();
+    let TcpStreamState::Live { write, queued, .. } = &mut slot.state else {
+        return WriteOutcome::Ok;
+    };
+    let Some(write_half) = write.as_mut() else {
+        return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
+    };
+
+    // `done` payloads are fully written, plus `offset` bytes of the next.
+    let mut done = 0;
+    let mut offset = 0;
+    loop {
+        while done < batch.len() && offset == batch[done].data.len() {
+            done += 1;
+            offset = 0;
+        }
+        if done == batch.len() {
+            break;
+        }
+        let result = if batch.len() - done == 1 {
+            write_half.try_write(&batch[done].data[offset..])
+        } else {
+            let pending = &batch[done..];
+            let count = pending.len().min(COALESCE_MAX_PACKETS);
+            let slices: [IoSlice<'_>; COALESCE_MAX_PACKETS] =
+                std::array::from_fn(|index| match pending.get(index) {
+                    Some(queued) if index == 0 => IoSlice::new(&queued.data[offset..]),
+                    Some(queued) => IoSlice::new(&queued.data),
+                    None => IoSlice::new(&[]),
+                });
+            write_half.try_write_vectored(&slices[..count])
+        };
+        match result {
+            Ok(0) => return WriteOutcome::DropStream(close_reason::NETWORK_ERROR),
+            Ok(mut written) => {
+                while written > 0 {
+                    let left = batch[done].data.len() - offset;
+                    if written < left {
+                        offset += written;
+                        break;
+                    }
+                    written -= left;
+                    done += 1;
+                    offset = 0;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => return WriteOutcome::DropStream(close_reason::NETWORK_ERROR),
+        }
+    }
+    // Dropping a written payload releases what it held and counts it
+    // towards the next grant.
+    let all_written = done == batch.len();
+    let mut rest = batch.drain(done..);
+    let Some(mut first) = rest.next() else {
+        drop(rest);
+        debug_assert!(all_written);
+        batch.clear();
+        slot.batch = batch;
+        return grant_outcome(&flow);
+    };
+    first.data = first.data.slice(offset..);
+
+    let write_half = write.take().expect("write half present");
+    let writer = spawn_writer(
+        stream_id,
+        generation,
+        write_half,
+        first,
+        flow,
+        activity,
+        ctx.clone(),
+        egress.clone(),
+        events.clone(),
+        write_queue_cap(ctx),
+    );
+    for queued_write in rest {
+        let sent = writer
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(queued_write).is_ok());
+        if !sent {
+            writer.task.abort();
+            return WriteOutcome::DropStream(close_reason::CONN_THROTTLED);
+        }
+    }
+    *queued = Some(writer);
+    WriteOutcome::Ok
+}
+
 /// Keep the write half in mux-owned state. A queued writer is allocated only
 /// after the socket first reports backpressure.
 pub(crate) async fn activate_writer(
@@ -1270,7 +1437,16 @@ pub(crate) async fn activate_writer(
     };
     for queued in pending {
         let QueuedWrite { data, _held: held } = queued;
-        match write_live(slot, data, Some(held), stream_id, ctx, egress, events) {
+        match write_live(
+            slot,
+            data,
+            Some(held),
+            stream_id,
+            false,
+            ctx,
+            egress,
+            events,
+        ) {
             WriteOutcome::DropStream(reason) => return WriteOutcome::DropStream(reason),
             WriteOutcome::SendContinue(credit) => {
                 if egress
@@ -1281,7 +1457,7 @@ pub(crate) async fn activate_writer(
                     return WriteOutcome::DropStream(close_reason::NETWORK_ERROR);
                 }
             }
-            WriteOutcome::Ok => {}
+            WriteOutcome::Ok | WriteOutcome::Deferred { .. } => {}
         }
     }
     if slot.client_fin {

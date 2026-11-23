@@ -36,7 +36,7 @@
 //! `tunnel` module); streams and tunnels share the connection.
 
 use bytes::Bytes;
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -78,10 +78,24 @@ use crate::proxy_control::{
     handle_proxy_control_text, proxy_control_error_frame, ProxyControlLimits, ProxyController,
 };
 use crate::stream::{
-    activate_writer, drop_slot, shutdown_upstream_write, spawn_tcp_connect, write_upstream,
-    StreamTable, TcpEvent, TcpStreamSlot, TcpStreamState, WriteOutcome,
+    activate_writer, drop_slot, flush_batch, shutdown_upstream_write, spawn_tcp_connect,
+    write_upstream, StreamTable, TcpEvent, TcpStreamSlot, TcpStreamState, WriteOutcome,
 };
 use crate::tunnel::{TunnelEvent, Tunnels};
+
+/// `future` under a time limit, like [`tokio::time::timeout`], but the timer
+/// is only made when the first poll does not finish. A write to a client that
+/// is keeping up finishes at once, so the relay path builds no timer per frame.
+async fn within<F: std::future::Future>(
+    limit: std::time::Duration,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::pin!(future);
+    if let std::task::Poll::Ready(output) = futures::poll!(future.as_mut()) {
+        return Ok(output);
+    }
+    tokio::time::timeout(limit, future).await
+}
 
 /// The connection's idle limit, `idle_timeout_ms`. Also bounds how long one
 /// write to the client may take.
@@ -190,6 +204,12 @@ impl EgressSender {
     /// Resolves once the queue is not full and the process budget has room,
     /// so a reader waits here before it reads more from its upstream. Fails
     /// once the writer is gone.
+    /// Whether [`Self::room`] would resolve at once: two atomic loads, so a
+    /// reader with room skips building the wait.
+    pub(crate) fn has_room(&self) -> bool {
+        self.budget.available_permits() > 0 && self.process.has_room()
+    }
+
     pub(crate) async fn room(&self) -> Result<(), ()> {
         if self.budget.available_permits() == 0 {
             drop(self.budget.acquire().await.map_err(|_| ())?);
@@ -585,6 +605,8 @@ where
         let mut stopping = false;
         let mut batch: Vec<(WispMessage, Option<EgressPermit>)> = Vec::with_capacity(64);
         let mut flushed_permits: Vec<EgressPermit> = Vec::with_capacity(64);
+        let stop = egress_writer_stop.cancelled();
+        tokio::pin!(stop);
         while !(main_closed && flow_closed && ctl_closed) {
             // Control replies go first: they are tiny, and bulk data must not
             // starve them.
@@ -601,7 +623,7 @@ where
             } else {
                 tokio::select! {
                     biased;
-                    _ = egress_writer_stop.cancelled() => { stopping = true; continue; }
+                    _ = &mut stop => { stopping = true; continue; }
                     text = control_egress_rx.recv(), if !ctl_closed => match text {
                         Some(t) => Some((WispMessage::Text(t), None)),
                         None => { ctl_closed = true; continue; }
@@ -651,7 +673,7 @@ where
                 }
             }
             for (m, permit) in batch.drain(..) {
-                match tokio::time::timeout(write_timeout, outgoing.feed(m)).await {
+                match within(write_timeout, outgoing.feed(m)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return Err(ServerError::transport(e)),
                     Err(_) => return Err(ServerError::transport("client write timed out")),
@@ -660,7 +682,7 @@ where
                     flushed_permits.push(permit);
                 }
             }
-            match tokio::time::timeout(write_timeout, outgoing.flush()).await {
+            match within(write_timeout, outgoing.flush()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(ServerError::transport(e)),
                 Err(_) => return Err(ServerError::transport("client write timed out")),
@@ -806,14 +828,50 @@ where
     // read until the upstreams take some of them. One message is still read
     // and parked meanwhile, so a client that goes away is noticed.
     let mut parked: Option<WispMessage> = None;
+    // Made once: a cancellation future per message would join and leave the
+    // token's waiter list, under its lock, for every frame.
+    let cancelled = ctx.cancel.cancelled();
+    tokio::pin!(cancelled);
+    let writer_gone = writer_done.cancelled();
+    tokio::pin!(writer_gone);
+    // DATA that arrives together is written to each upstream together: the
+    // streams in `dirty` hold a batch, and are flushed before the loop waits
+    // or handles anything but more DATA. `ready` is the next message when it
+    // was already there to read, and `burst` bounds how many are taken that
+    // way before the other branches get a turn.
+    let mut dirty: Vec<u32> = Vec::new();
+    let mut ready: Option<WispMessage> = None;
+    let mut burst = 0_u32;
 
     loop {
         let ingress_open = ctx.ingress.has_room();
-        let msg = tokio::select! {
+        if !ingress_open {
+            if let Some(m) = ready.take() {
+                parked = Some(m);
+            }
+        }
+        let msg = if let Some(m) = ready.take() {
+            m
+        } else {
+            burst = 0;
+            if let Err(e) = flush_dirty(
+                &mut dirty,
+                &mut streams,
+                &mut caps,
+                &ctx,
+                &egress_tx,
+                &tcp_events_tx,
+            )
+            .await
+            {
+                serve_err = Some(e);
+                break;
+            }
+            tokio::select! {
             biased;
-            _ = ctx.cancel.cancelled() => break,
+            _ = &mut cancelled => break,
             // The writer's own error is collected at teardown.
-            _ = writer_done.cancelled() => break,
+            _ = &mut writer_gone => break,
             _ = &mut idle_timer => {
                 let now = tokio::time::Instant::now();
                 if !heard_from_client {
@@ -1006,7 +1064,27 @@ where
                 }
                 None => break,
             },
+            }
         };
+        let is_data = matches!(
+            &msg,
+            WispMessage::Binary(frame) if frame.len() >= 5 && frame[0] == packet_type::DATA
+        );
+        if !is_data {
+            if let Err(e) = flush_dirty(
+                &mut dirty,
+                &mut streams,
+                &mut caps,
+                &ctx,
+                &egress_tx,
+                &tcp_events_tx,
+            )
+            .await
+            {
+                serve_err = Some(e);
+                break;
+            }
+        }
         match msg {
             WispMessage::Binary(frame) => {
                 if frame.len() as u64 > ctx.server_options.max_binary_frame_bytes as u64 {
@@ -1041,6 +1119,7 @@ where
                         &mut udp_streams,
                         &tunnels,
                         &mut caps,
+                        Some(&mut dirty),
                         &ctx,
                         &egress_tx,
                         &tcp_events_tx,
@@ -1055,6 +1134,43 @@ where
                             .await;
                         serve_err = Some(e);
                         break;
+                    }
+                    // Take the next message now if it is already here, so its
+                    // DATA joins the same upstream write.
+                    if burst < 64 && parked.is_none() {
+                        burst += 1;
+                        match incoming.next().now_or_never() {
+                            Some(Some(Ok(m))) => {
+                                last_inbound = tokio::time::Instant::now();
+                                ready = Some(m);
+                            }
+                            Some(Some(Err(e))) => {
+                                let _ = flush_dirty(
+                                    &mut dirty,
+                                    &mut streams,
+                                    &mut caps,
+                                    &ctx,
+                                    &egress_tx,
+                                    &tcp_events_tx,
+                                )
+                                .await;
+                                serve_err = Some(ServerError::transport(e));
+                                break;
+                            }
+                            Some(None) => {
+                                let _ = flush_dirty(
+                                    &mut dirty,
+                                    &mut streams,
+                                    &mut caps,
+                                    &ctx,
+                                    &egress_tx,
+                                    &tcp_events_tx,
+                                )
+                                .await;
+                                break;
+                            }
+                            None => {}
+                        }
                     }
                     continue;
                 }
@@ -1624,6 +1740,7 @@ async fn handle_data(
     udp_streams: &mut UdpStreams,
     tunnels: &Tunnels,
     caps: &mut StreamCaps,
+    dirty: Option<&mut Vec<u32>>,
     ctx: &ServerContext,
     egress: &EgressSender,
     tcp_events: &mpsc::Sender<TcpEvent>,
@@ -1643,7 +1760,15 @@ async fn handle_data(
         let outcome = if slot.client_fin {
             WriteOutcome::DropStream(close_reason::UNKNOWN)
         } else {
-            write_upstream(slot, payload, stream_id, ctx, egress, tcp_events)
+            write_upstream(
+                slot,
+                payload,
+                stream_id,
+                dirty.is_some(),
+                ctx,
+                egress,
+                tcp_events,
+            )
         };
         match outcome {
             WriteOutcome::DropStream(reason) => {
@@ -1663,6 +1788,11 @@ async fn handle_data(
                     .is_err()
                 {
                     return Err(ServerError::ClientClosed);
+                }
+            }
+            WriteOutcome::Deferred { first } => {
+                if let (true, Some(dirty)) = (first, dirty) {
+                    dirty.push(stream_id);
                 }
             }
             WriteOutcome::Ok => {}
@@ -1893,6 +2023,7 @@ async fn handle_packet(
                 udp_streams,
                 tunnels,
                 caps,
+                None,
                 ctx,
                 egress,
                 tcp_events,
@@ -1961,6 +2092,36 @@ async fn handle_packet(
             return tunnels
                 .on_tunnel(tunnel.stream_id, tunnel.capsules, taken, ctx, egress)
                 .await;
+        }
+    }
+    Ok(())
+}
+
+/// Writes every batch the DATA path collected to its upstream.
+async fn flush_dirty(
+    dirty: &mut Vec<u32>,
+    streams: &mut StreamTable,
+    caps: &mut StreamCaps,
+    ctx: &ServerContext,
+    egress: &EgressSender,
+    tcp_events: &mpsc::Sender<TcpEvent>,
+) -> Result<(), ServerError> {
+    for stream_id in dirty.drain(..) {
+        // A stream dropped since it joined the list has no batch to write.
+        let Some(slot) = streams.get_mut(stream_id) else {
+            continue;
+        };
+        match flush_batch(slot, stream_id, ctx, egress, tcp_events) {
+            WriteOutcome::DropStream(reason) => {
+                close_tcp_stream(stream_id, reason, streams, caps, egress).await?;
+            }
+            WriteOutcome::SendContinue(credit) => {
+                egress
+                    .send(WispMessage::Binary(encode_continue(stream_id, credit)))
+                    .await
+                    .map_err(|()| ServerError::ClientClosed)?;
+            }
+            WriteOutcome::Ok | WriteOutcome::Deferred { .. } => {}
         }
     }
     Ok(())
@@ -3454,6 +3615,111 @@ mod serve_connection_tests {
             .expect("upstream never finished")
             .unwrap();
         assert_eq!(total, CHUNK * PACKETS);
+        drop(in_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Bytes `offset..offset + len` of a counting sequence that differs per
+    /// stream, so a lost, repeated or reordered payload shows.
+    fn counting_bytes(stream: usize, offset: usize, len: usize) -> Vec<u8> {
+        (offset..offset + len)
+            .map(|i| ((i + stream * 97) % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn coalesced_bursts_reach_stalled_upstreams_whole_and_in_order() {
+        // Each burst outgrows the socket buffers, so a batch is cut short,
+        // often partway through a payload, and handed to a queued writer.
+        const CHUNK: usize = 16 * 1024;
+        const WINDOW: usize = 32;
+        const TOTAL: usize = WINDOW * 4;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(16 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(2).unwrap();
+        let mut options = (*loopback_test_options(listener.local_addr().unwrap().port())).clone();
+        options.buffer_size = WINDOW as u64;
+        options.continue_threshold = (WINDOW / 2) as u64;
+        options.max_pending_packets_per_stream = (WINDOW * 2) as u64;
+        options.max_pending_bytes_per_stream = (CHUNK * WINDOW * 2) as u64;
+        let ctx = test_ctx(Arc::new(options), true);
+        let ingress = ctx.ingress.clone();
+        let (mut in_tx, mut out_rx, handle) = spawn_serve(ctx).await;
+        v2_handshake(&mut in_tx, &mut out_rx, HALF_CLOSE).await;
+        let upstreams = [
+            open_tcp(&mut in_tx, &mut out_rx, &listener, 1).await,
+            open_tcp(&mut in_tx, &mut out_rx, &listener, 2).await,
+        ];
+        // The upstreams take nothing at first, then read to the FIN.
+        let readers = upstreams.map(|mut upstream| {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut received = Vec::new();
+                upstream.read_to_end(&mut received).await.map(|_| received)
+            })
+        });
+
+        // The client spends all its credit at once with the two streams
+        // interleaved, so the server finds the payloads queued together.
+        // The last burst ends with the FINs, which must not overtake it.
+        let mut credit = [WINDOW as u32; 2];
+        let mut sent = [0usize; 2];
+        let on_packet = |packet: WispPacket, credit: &mut [u32; 2]| match packet {
+            WispPacket::Continue(c) if c.stream_id == 1 || c.stream_id == 2 => {
+                credit[c.stream_id as usize - 1] = c.remaining;
+            }
+            other => panic!("unexpected packet {other:?}"),
+        };
+        while sent != [TOTAL; 2] {
+            while let Ok(WispMessage::Binary(frame)) = out_rx.try_recv() {
+                on_packet(parse_packet(frame).unwrap(), &mut credit);
+            }
+            let burst = [0, 1].map(|s| (credit[s] as usize).min(TOTAL - sent[s]));
+            if burst == [0, 0] {
+                let packet = timeout(Duration::from_secs(5), next_packet(&mut out_rx))
+                    .await
+                    .expect("credit never came back");
+                on_packet(packet, &mut credit);
+                continue;
+            }
+            for k in 0..burst[0].max(burst[1]) {
+                for s in 0..2 {
+                    if k < burst[s] {
+                        let payload = counting_bytes(s, sent[s] * CHUNK, CHUNK);
+                        queue(&in_tx, encode_data(s as u32 + 1, &payload));
+                        sent[s] += 1;
+                        credit[s] -= 1;
+                    }
+                }
+            }
+        }
+        queue(&in_tx, encode_fin(1));
+        queue(&in_tx, encode_fin(2));
+
+        for (s, reader) in readers.into_iter().enumerate() {
+            let received = timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("upstream never saw the FIN")
+                .unwrap()
+                .unwrap();
+            let expected = counting_bytes(s, 0, TOTAL * CHUNK);
+            assert_eq!(received.len(), expected.len(), "stream {} length", s + 1);
+            let first_wrong = received.iter().zip(&expected).position(|(a, b)| a != b);
+            assert_eq!(first_wrong, None, "stream {} bytes out of order", s + 1);
+        }
+        // Written payloads give back every byte they held.
+        let released = timeout(Duration::from_secs(2), async {
+            while ingress.connection_used() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "{} bytes still held",
+            ingress.connection_used()
+        );
         drop(in_tx);
         let _ = timeout(Duration::from_secs(2), handle).await;
     }
