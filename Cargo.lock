@@ -3121,6 +3121,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-loadgen"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "http",
+ "tokio",
+ "tokio-websockets",
+]
+
+[[package]]
 name = "wisp-origin"
 version = "0.1.0"
 dependencies = [
@@ -3323,7 +3334,7 @@ dependencies = [
  "bytes",
  "libc",
  "parking_lot",
- "rand 0.8.6",
+ "rand 0.8.8",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

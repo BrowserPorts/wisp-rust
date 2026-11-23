@@ -1,0 +1,16 @@
+[package]
+name = "wisp-loadgen"
+description = "Wisp v1 load generator and TCP echo server for benchmarking wispd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true }
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "fastrand", "sha1_smol"] }
