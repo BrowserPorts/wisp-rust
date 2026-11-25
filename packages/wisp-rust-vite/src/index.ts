@@ -227,6 +227,14 @@ const BUN_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_WEBSOCKETS = 2048;
 const DEFAULT_MAX_WEBSOCKETS_PER_IP = 128;
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+// The app is gone for a second or two while it restarts. A GET or HEAD that finds it so is sent
+// again within this window instead of failing at once, waiting a little longer each time
+const APP_RETRY_WINDOW_MS = 5_000;
+const APP_RETRY_FIRST_DELAY_MS = 100;
+const APP_RETRY_MAX_DELAY_MS = 500;
+// What Bun's fetch reports when nothing listens on the port, or the connection closes before any
+// response arrives. A response that has begun is never retried, so a stream is relayed only once
+const APP_UNREACHABLE_CODES = new Set(["ConnectionRefused", "ECONNREFUSED", "ECONNRESET"]);
 export const DEFAULT_WISP_RUST_VITE_TOML = `
 [wisp.server]
 endpoint = "/wisp/"
@@ -949,24 +957,59 @@ async function proxyBunHttpRequest(
   });
   assertSameOrigin(upstream, appTarget);
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
+  // A body can be read only once and its request may not be safe to repeat, so only a request
+  // without one is retried
+  const deadline = Date.now() + APP_RETRY_WINDOW_MS;
+  let delay = APP_RETRY_FIRST_DELAY_MS;
   let response: Response;
-  try {
-    response = await fetch(upstream, {
-      method: request.method,
-      headers,
-      body: hasBody ? request.body : undefined,
-      redirect: "manual",
-      // The body is relayed as the app encoded it, so Content-Encoding stays true
-      decompress: false,
-      signal: request.signal,
-    });
-  } catch {
-    return new Response("Bad gateway", { status: 502 });
+  for (;;) {
+    try {
+      response = await fetch(upstream, {
+        method: request.method,
+        headers,
+        body: hasBody ? request.body : undefined,
+        redirect: "manual",
+        // The body is relayed as the app encoded it, so Content-Encoding stays true
+        decompress: false,
+        signal: request.signal,
+      });
+      break;
+    } catch (error) {
+      if (hasBody || !isAppUnreachable(error)) {
+        return new Response("Bad gateway", { status: 502 });
+      }
+      const wait = Math.min(delay, deadline - Date.now());
+      if (wait <= 0 || !(await waitUnlessAborted(wait, request.signal))) {
+        return new Response("Bad gateway", { status: 502 });
+      }
+      delay = Math.min(delay * 2, APP_RETRY_MAX_DELAY_MS);
+    }
   }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers: filterUpstreamResponseHeaders(response.headers),
+  });
+}
+
+function isAppUnreachable(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && APP_UNREACHABLE_CODES.has(code);
+}
+
+/** Resolves false at once if the client has gone, so no retry outlives its request */
+function waitUnlessAborted(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
