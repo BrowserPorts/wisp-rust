@@ -69,7 +69,7 @@ dns_servers                             = []      # empty + auto = system resolv
 dns_result_order                        = "ipv4first" # "ipv4first" | "ipv6first" | "verbatim"
 dns_cache_max_entries                   = 4096
 max_dns_resolutions_per_ip_per_minute   = 600
-max_dns_resolutions_per_minute          = 60000
+max_dns_resolutions_per_minute          = 120000
 max_unique_hostnames_per_ip_per_minute  = 120
 
 # ============================================================================

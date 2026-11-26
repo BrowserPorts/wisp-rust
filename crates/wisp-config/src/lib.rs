@@ -333,7 +333,12 @@ impl Default for WispServerOptions {
             client_ip_blacklist: None,
             client_ip_whitelist: None,
             stream_limit_per_host: -1,
-            stream_limit_total: 64,
+            // A browser page opens a stream for each of its first requests
+            // to a host, before any connection exists to share, so a page
+            // with 50 scripts on one host holds 50 streams at once. A cap of
+            // 64 was passed by one such page on top of whatever else the
+            // client had open, and the relay refused the rest as throttled.
+            stream_limit_total: 4096,
             allow_udp_streams: true,
             allow_tcp_streams: true,
             allow_ip_tunnel: default_allow_ip_tunnel(),
@@ -343,15 +348,19 @@ impl Default for WispServerOptions {
             dns_result_order: DnsResultOrder::Verbatim,
             dns_negative_ttl: 60,
             dns_cache_max_entries: 4096,
-            max_dns_resolutions_per_ip_per_minute: 120,
+            // Every stream opened to a named host counts as a resolution,
+            // cached or not, so this bounds stream opens to named hosts. One
+            // busy page passes 120 opens and 60 distinct names a minute.
+            max_dns_resolutions_per_ip_per_minute: 600,
             // Global budgets are backstops, not fairness tools: the per-IP
             // limits already bound each client, and a global bucket that a
             // few dozen busy addresses can drain (the old 2048 DNS and 4096
             // start budgets fell to 18 and 35 IPs) denies every other user.
-            // 60000 per minute is 500 clients running flat out at the per-IP
-            // limits, so only a flood across hundreds of addresses reaches it.
-            max_dns_resolutions_per_minute: 60_000,
-            max_unique_hostnames_per_ip_per_minute: 60,
+            // Each budget is 200 or more clients running flat out at the
+            // per-IP limit, so only a flood across hundreds of addresses
+            // reaches it.
+            max_dns_resolutions_per_minute: 120_000,
+            max_unique_hostnames_per_ip_per_minute: 120,
             parse_real_ip: true,
             parse_real_ip_from: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
             buffer_size: packet_window,
@@ -368,8 +377,8 @@ impl Default for WispServerOptions {
             max_buffered_bytes_total: default_max_buffered_bytes_total(),
             max_connection_starts_per_ip_per_minute: 120,
             max_connection_starts_per_minute: 60_000,
-            max_tcp_stream_opens_per_connection_per_minute: 120,
-            max_tcp_stream_opens_per_ip_per_minute: 480,
+            max_tcp_stream_opens_per_connection_per_minute: 1200,
+            max_tcp_stream_opens_per_ip_per_minute: 4800,
             max_tcp_bytes_per_connection_per_second: 64 * 1024 * 1024,
             max_tcp_bytes_per_ip_per_second: 256 * 1024 * 1024,
             // UDP reaches any public address, so a high budget makes the
