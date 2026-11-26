@@ -96,18 +96,26 @@ export type WispRust = {
   stop(): Promise<RuntimeStatus>;
   status(): RuntimeStatus;
   boundUrls(): string[];
+  /**
+   * Builds the egress plugin, which decides how upstream streams leave the server and answers the
+   * proxy-control channel, from its configuration. Only a native build that carries a plugin has
+   * one to build; call it before start.
+   */
+  configureEgress(config: Record<string, unknown>): RuntimeResult;
+  /** One operator call to the egress plugin, by the plugin's name for it */
+  egressAdmin(op: string, args?: unknown): Promise<unknown>;
   setRoute(route: ProxyRouteInput): Promise<RuntimeResult>;
-  removeRoute(routeId: string): RuntimeResult;
-  listRoutes(): RuntimeResult[];
+  removeRoute(routeId: string): Promise<RuntimeResult>;
+  listRoutes(): Promise<RuntimeResult[]>;
   rotateRoute(routeId: string): Promise<RuntimeResult | null>;
   locations(provider?: string): Promise<RuntimeResult>;
   refreshLocations(provider?: string): Promise<RuntimeResult>;
-  providerStatus(): RuntimeResult;
-  egressInventory(): RuntimeResult;
-  blockEgressIp(ip: string): RuntimeResult;
-  releaseEgressIp(ip: string): RuntimeResult;
-  getPolicy(): ProxyRuntimePolicy;
-  setPolicy(policy: ProxyRuntimePolicy): ProxyRuntimePolicy;
+  providerStatus(): Promise<RuntimeResult>;
+  egressInventory(): Promise<RuntimeResult>;
+  blockEgressIp(ip: string): Promise<RuntimeResult>;
+  releaseEgressIp(ip: string): Promise<RuntimeResult>;
+  getPolicy(): Promise<ProxyRuntimePolicy>;
+  setPolicy(policy: ProxyRuntimePolicy): Promise<ProxyRuntimePolicy>;
   getLimits(): RuntimeResult;
   patchLimits(patch: RuntimeResult): RuntimeResult;
   setLimitProfile(name: string, limits: RuntimeResult): RuntimeResult;
@@ -139,7 +147,13 @@ export type WispRustRuntimeOptions = {
   authenticatedLimitMultiplier?: number;
   authenticatedProfileName?: string;
   authTokenHandler?: WispAuthTokenHandler;
+  /** The proxies an authenticated token is granted, by the egress plugin's names; `*` is all */
   authenticatedAllowedProxyProviders?: string[];
+  /**
+   * The egress plugin's configuration, handed to the native runtime before it starts. The plugin
+   * decides which destinations leave through a proxy and which proxy carries them.
+   */
+  egress?: Record<string, unknown>;
   config?: WispRuntimeInput;
   logLevel?: string;
   cwd?: string;
@@ -215,13 +229,11 @@ type BunMiddlewareStack = {
   ): unknown;
 };
 type TomlRecord = Record<string, TomlValue>;
-type ProviderSection = TomlRecord | undefined;
 
 const require = createRequire(import.meta.url);
-const DEFAULT_MULLVAD_API = "https://api.mullvad.net/www/relays/wireguard/";
-const DEFAULT_MYSTERIUM_API = "https://api.mysteriumvpn.com";
 const DEFAULT_AUTHENTICATED_PROFILE = "authenticated";
-const DEFAULT_AUTHENTICATED_PROVIDERS = ["mullvad", "resi", "mysterium"];
+/** An authenticated token may use every proxy the egress plugin offers */
+const DEFAULT_AUTHENTICATED_PROVIDERS = ["*"];
 const MAX_BUN_PENDING_BYTES = 1024 * 1024;
 const BUN_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_WEBSOCKETS = 2048;
@@ -304,6 +316,7 @@ export class WispRustRuntime {
       ? { ...options, trustedEdgeSecret: this.edgeSecret }
       : options;
     this.instance = createNativeRuntime(this.native, resolved);
+    if (resolved.egress) this.instance.configureEgress(resolved.egress);
     configureAuthenticatedProfile(this.instance, resolved);
   }
 
@@ -390,16 +403,20 @@ export class WispRustRuntime {
     return this.instance.setRoute(route);
   }
 
-  removeRoute(routeId: string): RuntimeResult {
+  removeRoute(routeId: string): Promise<RuntimeResult> {
     return this.instance.removeRoute(routeId);
   }
 
-  listRoutes(): RuntimeResult[] {
+  listRoutes(): Promise<RuntimeResult[]> {
     return this.instance.listRoutes();
   }
 
   rotateRoute(routeId: string): Promise<RuntimeResult | null> {
     return this.instance.rotateRoute(routeId);
+  }
+
+  egressAdmin(op: string, args?: unknown): Promise<unknown> {
+    return this.instance.egressAdmin(op, args);
   }
 
   locations(provider?: string): Promise<RuntimeResult> {
@@ -410,27 +427,27 @@ export class WispRustRuntime {
     return this.instance.refreshLocations(provider);
   }
 
-  providerStatus(): RuntimeResult {
+  providerStatus(): Promise<RuntimeResult> {
     return this.instance.providerStatus();
   }
 
-  egressInventory(): RuntimeResult {
+  egressInventory(): Promise<RuntimeResult> {
     return this.instance.egressInventory();
   }
 
-  blockEgressIp(ip: string): RuntimeResult {
+  blockEgressIp(ip: string): Promise<RuntimeResult> {
     return this.instance.blockEgressIp(ip);
   }
 
-  releaseEgressIp(ip: string): RuntimeResult {
+  releaseEgressIp(ip: string): Promise<RuntimeResult> {
     return this.instance.releaseEgressIp(ip);
   }
 
-  getPolicy(): ProxyRuntimePolicy {
+  getPolicy(): Promise<ProxyRuntimePolicy> {
     return this.instance.getPolicy();
   }
 
-  setPolicy(policy: ProxyRuntimePolicy): ProxyRuntimePolicy {
+  setPolicy(policy: ProxyRuntimePolicy): Promise<ProxyRuntimePolicy> {
     return this.instance.setPolicy(policy);
   }
 
@@ -1643,6 +1660,11 @@ function mergeTomlTables(target: TomlTable, source: TomlTable): TomlTable {
   return target;
 }
 
+/**
+ * The proxy config file's `[proxy.routing] force_proxy` (or a top-level `force_proxy`), as
+ * `[wisp.proxy]`. Everything else in the file belongs to the egress plugin and is passed to it by the
+ * embedder through the `egress` option.
+ */
 function proxyConfigTable(path: string): TomlTable {
   if (!existsSync(path)) {
     return {};
@@ -1652,112 +1674,12 @@ function proxyConfigTable(path: string): TomlTable {
     throw new Error(`Invalid proxy TOML config: ${path}`);
   }
   const proxy = recordField(parsed, "proxy");
-  const providers = recordField(proxy, "providers");
   const routing =
     recordField(proxy, "routing") ?? recordField(parsed, "routing");
-  const mullvad =
-    recordField(providers, "mullvad") ?? recordField(parsed, "mullvad");
-  const resi =
-    recordField(providers, "resi") ??
-    recordField(providers, "resi-proxy") ??
-    recordField(providers, "mysterium") ??
-    recordField(parsed, "mysterium");
-  const out: TomlTable = {};
   const forceProxy =
     boolField(parsed, "force_proxy") || boolField(routing, "force_proxy");
-  if (forceProxy) {
-    out.wisp = {
-      proxy: {
-        force_proxy: true,
-      },
-    };
-  }
-  const mullvadToml = mullvadProviderToml(mullvad);
-  if (mullvadToml) {
-    out.wisp_proxy_mullvad = mullvadToml;
-  }
-  const resiToml = residentialProviderToml(resi);
-  if (resiToml) {
-    out.wisp_proxy_resi = resiToml;
-  }
-  if (mullvadToml || resiToml) {
-    out.wisp_proxy_control = { enabled: true };
-    out.wisp_websocket = { proxy_control_enabled: true };
-  }
-  return out;
-}
-
-function mullvadProviderToml(section: ProviderSection): TomlTable | undefined {
-  if (!section) return;
-  const config: TomlTable = {
-    enabled: true,
-    relay_api: stringField(section, "relay_api") ?? DEFAULT_MULLVAD_API,
-  };
-  const wireproxySocks5 = stringField(section, "wireproxy_socks5");
-  if (wireproxySocks5) {
-    config.wireproxy_socks5 = wireproxySocks5;
-  }
-  return config;
-}
-
-function residentialProviderToml(
-  section: ProviderSection,
-): TomlTable | undefined {
-  if (!section) return;
-  const bearerToken =
-    stringField(section, "bearer_token") ??
-    envField(section, "bearer_token_env", [
-      "ST_RESI_BEARER_TOKEN",
-      "MYSTERIUM_BEARER_TOKEN",
-      "ST_MYSTERIUM_BEARER_TOKEN",
-    ]);
-  const wireproxySocks5 = stringField(section, "wireproxy_socks5");
-  if (bearerToken && wireproxySocks5) {
-    throw new Error(
-      "Mysterium config cannot combine bearer_token and wireproxy_socks5",
-    );
-  }
-  if (wireproxySocks5) {
-    return {
-      enabled: true,
-      wireproxy_socks5: wireproxySocks5,
-    };
-  }
-  if (!bearerToken) return;
-  const config: TomlTable = {
-    enabled: true,
-    bearer_token: bearerToken,
-    api_base: stringField(section, "api_base") ?? DEFAULT_MYSTERIUM_API,
-    country: stringField(section, "country") ?? "US",
-    ip_type: stringField(section, "ip_type") ?? "residential",
-  };
-  const cookie =
-    stringField(section, "cookie") ??
-    envField(section, "cookie_env", [
-      "ST_RESI_COOKIE",
-      "MYSTERIUM_COOKIE",
-      "ST_MYSTERIUM_COOKIE",
-    ]);
-  if (cookie) {
-    config.cookie = cookie;
-  }
-  return config;
-}
-
-function envField(
-  section: TomlRecord,
-  key: string,
-  fallbacks: string[],
-): string | undefined {
-  const configuredKey = stringField(section, key);
-  if (configuredKey) {
-    const val = process.env[configuredKey]?.trim();
-    if (val) return val;
-  }
-  for (const fallback of fallbacks) {
-    const val = process.env[fallback]?.trim();
-    if (val) return val;
-  }
+  if (!forceProxy) return {};
+  return { wisp: { proxy: { force_proxy: true } } };
 }
 
 function recordField(
@@ -1767,15 +1689,6 @@ function recordField(
   if (!input) return;
   const val = input[key];
   return isRecord(val) ? val : undefined;
-}
-
-function stringField(
-  input: TomlRecord | undefined,
-  key: string,
-): string | undefined {
-  if (!input) return;
-  const val = input[key];
-  return typeof val === "string" && val.trim() ? val.trim() : undefined;
 }
 
 function boolField(input: TomlRecord | undefined, key: string): boolean {
