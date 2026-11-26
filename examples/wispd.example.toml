@@ -157,13 +157,13 @@ bind_addr             = "0.0.0.0:4242" # explicit bind; overrides host/port if s
 cert_path             = "/etc/wispd/tls/fullchain.pem"
 key_path              = "/etc/wispd/tls/privkey.pem"
 endpoint              = "/wisp/"       # override [wisp.server].endpoint for this transport
-proxy_control_enabled = false          # true needs a provider below ([wisp_proxy_mullvad] or [wisp_proxy_resi]) enabled
+proxy_control_enabled = false          # true lets clients steer the embedder's egress plugin, when it installed one
 ingress_mode          = "direct_tls"                                                                    
 
 # ============================================================================
 # ============================================================================
 [wisp_proxy_control]
-enabled = false                        # true needs a provider below enabled, and wisp_version = "v2"
+enabled = false                        # true needs an egress plugin from the embedder, and wisp_version = "v2"
 
 # ============================================================================
 # [wisp_wt] — Wisp v2 over WebTransport (HTTP/3 + extended CONNECT via msquic)
@@ -179,27 +179,6 @@ max_datagram_bytes = 1200              # RFC 9221 max; msquic caps to MTU minus 
 webtransport_proxy_enabled         = false
 max_proxy_sessions_per_connection = 4
 max_proxy_substreams_per_session   = 64
-
-# ============================================================================
-# [wisp_proxy_mullvad] — optional Mullvad WireGuard SOCKS5 backend
-# Provider crate lives in browserports.dev/BrowserPorts/wisp-rust-proxy-providers.
-# Omit the whole section or set enabled = false to skip registration.
-# ============================================================================
-[wisp_proxy_mullvad]
-enabled           = false
-relay_api         = "https://api.mullvad.net/www/relays/wireguard/"
-wireproxy_socks5  = "127.0.0.1:40000"
-
-# ============================================================================
-# [wisp_proxy_resi] — optional residential / partner HTTP-API proxy backend
-# ============================================================================
-[wisp_proxy_resi]
-enabled       = false
-api_base      = "https://example-residential.invalid"
-bearer_token  = "REPLACE_ME"
-cookie        = ""
-country       = "US"
-ip_type       = "residential"
 
 # ============================================================================
 # [ip_tunnel] — IP packets over Wisp (extension 0xF3, IP_TUNNEL)
