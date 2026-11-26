@@ -15,10 +15,10 @@
 //! Client and server share the process, and QUIC packet I/O dominates: in a
 //! November 2026 profile, UDP sends and receives took about 75 % of the CPU
 //! and the bridge's upstream TCP writes about 18 %. msquic hands the bridge
-//! one receive at a time, so a write carries about 2 KB, and merging the
-//! receives already waiting (about 9 % of them) into vectored writes changed
-//! neither throughput nor CPU per byte, so the bridge writes each receive as
-//! it comes.
+//! one receive at a time, so a write carries about 2 KB. The bridge merges
+//! the receives already waiting into vectored writes, but only about 9 % of
+//! them were waiting, and neither throughput nor CPU per byte moved
+//! measurably here.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
