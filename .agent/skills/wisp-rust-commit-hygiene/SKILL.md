@@ -68,7 +68,7 @@ Use Conventional Commits:
 - Keep the subject at or below 72 characters.
 - Describe product behavior and technical rationale only.
 - Use the configured human author and committer.
-- No AI or model attribution of any kind: no `Co-Authored-By` naming Claude or Anthropic, no `noreply@anthropic.com`, no `Claude-Session` line, no generated-by line. Forgejo's pre-receive hook refuses a push that brings in such a commit.
+- No AI or model attribution of any kind: no `Co-Authored-By` naming Claude or Anthropic, no `noreply@anthropic.com`, no `Claude-Session` line, no generated-by line. Nothing on the server checks this, so the agent making the commit is responsible for keeping it out.
 - No sessions, prompts, task or rule numbers, agents, waves, worktrees, workflows, checkpoints, plans, transcripts, or process narration.
 
 Scan the exact proposed message before committing:
@@ -83,13 +83,13 @@ No matches are permitted.
 
 - Push only to `origin` on Forgejo, and only when authorized. `git remote get-url --push origin` must print the Forgejo URL. Never push to Cursor's origin (`origin.cursor.com`) or to GitHub.
 - Push one branch with an explicit refspec: `git push origin main:main`. Never `--force`, `--all`, `--mirror`, or a bare `git push`.
-- Scan the whole outgoing range first, including commits already ahead of the remote and those a merged topic branch brings:
+- Before every push, scan the whole outgoing range, including commits already ahead of the remote and those a merged topic branch brings, and stop if anything matches:
 
 ```sh
 git log --format='%H%n%B' origin/main..HEAD | rg -ni 'co-authored-by:.*(claude|anthropic)|noreply@anthropic\.com|claude-session|generated(-by| with)'
 ```
 
-- If Forgejo refuses a push, report why. Do not rewrite history or work around the hook.
+- If Forgejo refuses a push, report why. Do not rewrite history to get around it.
 
 ## Safeguards
 
