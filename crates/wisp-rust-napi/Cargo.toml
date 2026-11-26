@@ -8,7 +8,14 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Builds in the egress plugin from the private proxy-providers crates. Off by
+# default, so the public build needs nothing outside this repository's
+# required dependencies.
+proxy-providers = ["dep:wisp-proxy-providers", "dep:async-trait"]
+
 [dependencies]
+async-trait = { workspace = true, optional = true }
 napi = { version = "3.9.0", default-features = false, features = ["async", "napi6", "serde-json"] }
 napi-derive = "3.5.6"
 parking_lot = { workspace = true }
@@ -21,6 +28,7 @@ wisp-iphash = { path = "../wisp-iphash" }
 wisp-reports = { path = "../wisp-reports" }
 wisp-core = { path = "../wisp-core", default-features = false, features = ["ws", "quic"] }
 wisp-wisp-server = { path = "../wisp-wisp-server" }
+wisp-proxy-providers = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }
 
 [build-dependencies]
 napi-build = "2.3.2"

@@ -17,18 +17,28 @@ setBannedIpHashes(hashes: Array<string>): { count: number }
 bannedIpHashes(): Array<string>
 onReport(callback: (report: WispReport) => void): void
 boundUrls(): Array<string>
+/**
+ * Build the egress plugin from its configuration. It decides how
+ * upstream streams leave the server and answers the proxy-control
+ * channel; without one every stream is dialed directly. Call it before
+ * `start`, since the runtime takes the plugin when it starts. Only a
+ * build with the `proxy-providers` feature has a plugin to build.
+ */
+configureEgress(config: any): any
+/** One operator call to the egress plugin, by the plugin's name for it. */
+egressAdmin(op: string, args?: any | undefined | null): Promise<any>
 setRoute(route: any): Promise<any>
-removeRoute(routeId: string): any
-listRoutes(): any
-rotateRoute(routeId: string): Promise<any | null>
+removeRoute(routeId: string): Promise<any>
+listRoutes(): Promise<any>
+rotateRoute(routeId: string): Promise<any>
 locations(provider?: string | undefined | null): Promise<any>
 refreshLocations(provider?: string | undefined | null): Promise<any>
-providerStatus(): any
-egressInventory(): any
-blockEgressIp(ip: string): any
-releaseEgressIp(ip: string): any
-getPolicy(): any
-setPolicy(policy: any): any
+providerStatus(): Promise<any>
+egressInventory(): Promise<any>
+blockEgressIp(ip: string): Promise<any>
+releaseEgressIp(ip: string): Promise<any>
+getPolicy(): Promise<any>
+setPolicy(policy: any): Promise<any>
 getLimits(): any
 patchLimits(patch: any): any
 setLimitProfile(name: string, limits: any): any

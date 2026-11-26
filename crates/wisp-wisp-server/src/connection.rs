@@ -3434,7 +3434,7 @@ mod serve_connection_tests {
         options.max_control_messages_per_connection_per_minute = UNLIMITED;
         let options = Arc::new(options);
         let server_options = Arc::new(ServerOptions::from_wisp(&options, true));
-        let template = crate::ProxyControllerTemplate::new(Vec::new());
+        let template = crate::ProxyControllerTemplate::new(crate::proxy_control::test_plugin());
         let dos = Arc::new(DosGuard::new());
         let connect = || {
             let ctx = ServerContext::new(

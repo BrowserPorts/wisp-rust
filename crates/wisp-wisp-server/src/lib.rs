@@ -1,6 +1,6 @@
 //! Wisp v2 server: protocol-level connection handling that drives
-//! [`wisp-wisp`] codec, the [`wisp-proxy-base`] proxy traits, and the
-//! shared [`wisp-inspect`] / [`wisp-origin`] / [`wisp-dos`] subsystems.
+//! [`wisp-wisp`] codec, the egress extension point in [`ProxyControllerTemplate`],
+//! and the shared [`wisp-inspect`] / [`wisp-origin`] / [`wisp-dos`] subsystems.
 //!
 //! Transport-agnostic: the entry point [`serve_connection`] takes a
 //! message-oriented sink+stream of [`bytes::Bytes`] payloads. Each payload
@@ -22,9 +22,9 @@ pub use connection::{
     serve_connection, ServerContext, ServerError, ServerOptions, TransportError, WispMessage,
 };
 pub use proxy_control::{
-    handle_proxy_control_text, ProxyConnectError, ProxyControlError, ProxyControlLimits,
-    ProxyControlRequest, ProxyController, ProxyControllerTemplate, ProxyHopLimits,
-    ProxyRouteConfig, ProxyRouteSnapshot, ProxyRuntimePolicy,
+    handle_proxy_control_text, EgressDialer, EgressIpBudget, EgressPlugin, EgressReport,
+    EgressReportKind, EgressRoute, EgressSession, EgressSessionInit, ProxyConnectError,
+    ProxyControlLimits, ProxyController, ProxyControllerTemplate,
 };
 pub use stream::ConnectError;
 pub use wisp_tun::TunnelService;

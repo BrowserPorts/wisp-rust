@@ -15,9 +15,6 @@ ws = [
     "dep:wisp-router",
     "dep:wisp-ws-h2",
     "dep:wisp-wisp-server",
-    "dep:wisp-proxy-base",
-    "dep:wisp-proxy-mullvad",
-    "dep:wisp-proxy-resi",
 ]
 
 [dependencies]
@@ -36,6 +33,4 @@ wisp-proxy = { path = "../wisp-proxy", optional = true }
 wisp-router = { path = "../wisp-router", optional = true }
 wisp-ws-h2 = { path = "../wisp-ws-h2", optional = true }
 wisp-wisp-server = { path = "../wisp-wisp-server", optional = true }
-wisp-proxy-base = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }
-wisp-proxy-mullvad = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }
-wisp-proxy-resi = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }
+

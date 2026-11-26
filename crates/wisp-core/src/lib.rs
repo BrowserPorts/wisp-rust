@@ -39,19 +39,13 @@ use tracing::info;
 #[cfg(feature = "ws")]
 use wisp_config::IngressMode;
 #[cfg(feature = "ws")]
-use wisp_proxy_base::SharedProvider;
-#[cfg(feature = "ws")]
-use wisp_proxy_mullvad::{MullvadProxyConfig, MullvadProxyProvider};
-#[cfg(feature = "ws")]
-use wisp_proxy_resi::{ResidentialProxyConfig, ResidentialProxyProvider};
-#[cfg(feature = "ws")]
 use wisp_router::{
     bind_ws_h2_listener, bind_ws_plain_listener, serve_bound_ws_h2_listener,
     serve_bound_ws_plain_listener, WsH2ListenerConfig, WsH2ListenerError, WsPlainListenerConfig,
     WsPlainListenerError,
 };
 #[cfg(feature = "ws")]
-use wisp_wisp_server::{ProxyControllerTemplate, ProxyRuntimePolicy};
+use wisp_wisp_server::{EgressPlugin, ProxyControllerTemplate};
 #[cfg(feature = "ws")]
 use wisp_ws_h2::H2ServeContext;
 
@@ -87,10 +81,25 @@ pub enum CoreError {
 
 /// One-shot bootstrap config. Built from `WispWtServerOptions` or read from
 /// disk by [`RuntimeConfig::from_toml`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeConfig {
     pub options: Arc<WispWtServerOptions>,
     pub log_level: String,
+    /// Decides how upstream streams leave the server and answers the
+    /// proxy-control channel. Without one every stream is dialed directly.
+    #[cfg(feature = "ws")]
+    pub egress: Option<Arc<dyn EgressPlugin>>,
+}
+
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("RuntimeConfig");
+        out.field("options", &self.options)
+            .field("log_level", &self.log_level);
+        #[cfg(feature = "ws")]
+        out.field("egress", &self.egress.is_some());
+        out.finish()
+    }
 }
 
 impl RuntimeConfig {
@@ -99,7 +108,16 @@ impl RuntimeConfig {
         Ok(Self {
             options: Arc::new(options),
             log_level: "info".to_owned(),
+            #[cfg(feature = "ws")]
+            egress: None,
         })
+    }
+
+    /// Install the egress plugin the runtime hands each client to.
+    #[cfg(feature = "ws")]
+    pub fn with_egress(mut self, egress: Option<Arc<dyn EgressPlugin>>) -> Self {
+        self.egress = egress;
+        self
     }
 
     pub fn from_toml(path: &Path) -> Result<Self, CoreError> {
@@ -155,7 +173,7 @@ impl Runtime {
         #[cfg(feature = "ws")]
         wisp_wisp_server::set_max_buffered_bytes_total(cfg.options.base.max_buffered_bytes_total);
         #[cfg(feature = "ws")]
-        let proxy_template = build_proxy_template(&cfg.options);
+        let proxy_template = build_proxy_template(cfg.egress.as_ref());
         if !cfg.options.enabled {
             warn!("wispd: wisp_wt.enabled = false — listener will not be opened");
         }
@@ -455,63 +473,17 @@ impl Runtime {
     }
 }
 
-/// Build the shared proxy provider template from config. Returns `None`
-/// when no provider is enabled — the providers (Mullvad relay cache,
-/// reqwest client) are non-trivial to construct, so we skip when nothing
-/// can use them. The order of providers determines which one wins
-/// `can_resolve` ties: explicit config (Mullvad first by tradition) before
-/// fallbacks. The template is shared across all connections; each
-/// connection calls `template.spawn()` to mint its own per-connection
-/// controller with isolated state.
+/// Wrap the egress plugin for the listeners, or `None` when no plugin is
+/// installed and every stream is dialed directly. The plugin routes streams
+/// whether or not the proxy-control extension is advertised; `[wisp_proxy_control]`
+/// and `proxy_control_enabled` only decide whether clients may steer it. The
+/// template is shared across all connections; each connection calls
+/// `template.spawn()` for a session of its own.
 #[cfg(feature = "ws")]
-pub fn build_proxy_template(opts: &WispWtServerOptions) -> Option<Arc<ProxyControllerTemplate>> {
-    let ws_proxy_control = opts
-        .websocket
-        .proxy_control_enabled
-        .unwrap_or(opts.proxy_control_enabled);
-    if !(opts.proxy_control_enabled || ws_proxy_control) {
-        return None;
-    }
-    let mut providers: Vec<SharedProvider> = Vec::new();
-    if let Some(mv) = &opts.mullvad {
-        providers.push(Arc::new(MullvadProxyProvider::new(Some(
-            MullvadProxyConfig {
-                relay_api: mv.relay_api.clone(),
-                wireproxy_socks5: mv.wireproxy_socks5.clone(),
-            },
-        ))));
-    }
-    if let Some(re) = &opts.resi {
-        let cfg = ResidentialProxyConfig {
-            bearer_token: re.bearer_token.clone().unwrap_or_default(),
-            wireproxy_socks5: re.wireproxy_socks5.clone(),
-            cookie: re.cookie.clone(),
-            api_base: re.api_base.clone(),
-            country: re.country.clone(),
-            ip_type: re.ip_type.clone(),
-        };
-        providers.push(Arc::new(ResidentialProxyProvider::new(Some(cfg))));
-    }
-    if providers.is_empty() {
-        return None;
-    }
-    let template = ProxyControllerTemplate::new(providers);
-    if opts.base.force_proxy {
-        template.set_policy(ProxyRuntimePolicy {
-            force_proxy: true,
-            default_provider: if opts.resi.is_some() {
-                Some("resi".to_owned())
-            } else if opts.mullvad.is_some() {
-                Some("mullvad".to_owned())
-            } else {
-                None
-            },
-            default_country: opts.resi.as_ref().map(|cfg| cfg.country.clone()),
-            default_city: None,
-            default_ip_type: opts.resi.as_ref().map(|cfg| cfg.ip_type.clone()),
-        });
-    }
-    Some(Arc::new(template))
+pub fn build_proxy_template(
+    egress: Option<&Arc<dyn EgressPlugin>>,
+) -> Option<Arc<ProxyControllerTemplate>> {
+    egress.map(|plugin| Arc::new(ProxyControllerTemplate::new(plugin.clone())))
 }
 
 #[cfg(test)]
@@ -615,31 +587,5 @@ mod tests {
         opts.base.max_proxy_rules_per_connection = 0;
         let res = RuntimeConfig::from_options(opts);
         assert!(matches!(res, Err(CoreError::Config(_))));
-    }
-
-    #[cfg(feature = "ws")]
-    #[test]
-    fn build_proxy_template_honors_websocket_override() {
-        use wisp_config::MullvadProviderConfig;
-
-        let mut opts = WispWtServerOptions {
-            proxy_control_enabled: false,
-            mullvad: Some(MullvadProviderConfig {
-                relay_api: "https://example.test/relays".to_owned(),
-                wireproxy_socks5: None,
-            }),
-            ..WispWtServerOptions::default()
-        };
-        opts.websocket.proxy_control_enabled = Some(true);
-        assert!(
-            build_proxy_template(&opts).is_some(),
-            "WS-only proxy_control override must still build providers"
-        );
-
-        opts.websocket.proxy_control_enabled = Some(false);
-        assert!(
-            build_proxy_template(&opts).is_none(),
-            "disabled override with global off must skip providers"
-        );
     }
 }

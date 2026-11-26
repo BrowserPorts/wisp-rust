@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,10 +19,10 @@ use wisp_config::{
 use wisp_core::{Runtime, RuntimeConfig, ServeHandle};
 use wisp_iphash::IpHashBans;
 use wisp_reports::{set_report_hook, Report};
-use wisp_wisp_server::{
-    ProxyControlLimits, ProxyControlRequest, ProxyControllerTemplate, ProxyRouteConfig,
-    ProxyRuntimePolicy,
-};
+use wisp_wisp_server::EgressPlugin;
+
+#[cfg(feature = "proxy-providers")]
+mod egress;
 
 #[napi(js_name = "WispRust")]
 pub struct WispRust {
@@ -35,15 +35,11 @@ struct WispRustState {
     runtime: Option<Runtime>,
     ws_handle: Option<JoinHandle<()>>,
     wt_handle: Option<ServeHandle>,
-    proxy_template: Option<Arc<ProxyControllerTemplate>>,
-    pending_routes: HashMap<String, ProxyRouteConfig>,
+    /// Set by `configure_egress`; the runtime takes it at the next start.
+    egress: Option<Arc<dyn EgressPlugin>>,
     configured_auth_tokens: HashMap<String, WispAuthTokenPolicy>,
     configured_auth_handler: Option<AuthHandler>,
     configured_limit_profiles: HashMap<String, WispServerOptions>,
-    /// Policy set through `set_policy`. `None` until then, so starting the
-    /// runtime keeps the policy built from the config.
-    pending_policy: Option<ProxyRuntimePolicy>,
-    pending_blocked_ips: HashSet<String>,
     /// Banned client IP hashes. Owned here, not by the runtime, so bans set
     /// before `start()` apply from the first connection and survive a restart.
     ip_bans: Arc<IpHashBans>,
@@ -243,13 +239,10 @@ impl WispRustState {
             runtime: None,
             ws_handle: None,
             wt_handle: None,
-            proxy_template: None,
-            pending_routes: HashMap::new(),
+            egress: None,
             configured_auth_tokens: HashMap::new(),
             configured_auth_handler: None,
             configured_limit_profiles: HashMap::new(),
-            pending_policy: None,
-            pending_blocked_ips: HashSet::new(),
             ip_bans: Arc::new(IpHashBans::new()),
         }
     }
@@ -299,22 +292,19 @@ impl WispRust {
     #[napi]
     pub async fn start(&self) -> Result<Value> {
         let _lifecycle = self.lifecycle.lock().await;
-        let (runtime, template, ws_handle, wt_enabled) = {
+        let (runtime, ws_handle, wt_enabled) = {
             let guard = self.state.lock();
             if guard.runtime.is_some() {
                 return Ok(status_value(&guard));
             }
-            let runtime = Runtime::start(guard.config.clone())
+            let config = guard.config.clone().with_egress(guard.egress.clone());
+            let runtime = Runtime::start(config)
                 .map_err(js_err)?
                 .with_ip_bans(guard.ip_bans.clone());
-            let template = runtime.proxy_template();
             apply_configured_auth(&runtime, &guard)?;
-            if let Some(template) = template.as_ref() {
-                apply_pending(template, &guard)?;
-            }
             let ws_handle = runtime.bind_ws().map_err(js_err)?;
             let wt_enabled = guard.config.options.enabled;
-            (runtime, template, ws_handle, wt_enabled)
+            (runtime, ws_handle, wt_enabled)
         };
         let wt_handle = if wt_enabled {
             match runtime.bind().await {
@@ -332,7 +322,6 @@ impl WispRust {
             None
         };
         let mut guard = self.state.lock();
-        guard.proxy_template = template;
         guard.ws_handle = ws_handle;
         guard.wt_handle = wt_handle;
         guard.runtime = Some(runtime);
@@ -347,7 +336,6 @@ impl WispRust {
             let runtime = guard.runtime.take();
             let ws_handle = guard.ws_handle.take();
             let wt_handle = guard.wt_handle.take();
-            guard.proxy_template = None;
             (runtime, ws_handle, wt_handle)
         };
 
@@ -422,92 +410,64 @@ impl WispRust {
         bound_urls(&self.state.lock().config)
     }
 
+    /// Build the egress plugin from its configuration. It decides how
+    /// upstream streams leave the server and answers the proxy-control
+    /// channel; without one every stream is dialed directly. Call it before
+    /// `start`, since the runtime takes the plugin when it starts. Only a
+    /// build with the `proxy-providers` feature has a plugin to build.
     #[napi]
-    pub async fn set_route(&self, route: Value) -> Result<Value> {
-        let route: ProxyRouteConfig = serde_json::from_value(route).map_err(js_err)?;
-        let route_id = route.route_id.clone();
-        let template = {
-            let mut guard = self.state.lock();
-            guard.pending_routes.insert(route_id, route.clone());
-            guard.proxy_template.clone()
-        };
-
-        if let Some(template) = template {
-            let snapshot = template.set_route(route).map_err(js_err)?;
-            Ok(json!({
-                "applied": true,
-                "route": snapshot,
-            }))
-        } else {
-            Ok(json!({
-                "applied": false,
-                "route": route,
-            }))
-        }
+    pub fn configure_egress(&self, config: Value) -> Result<Value> {
+        let plugin = build_egress(&config)?;
+        let status = plugin.status();
+        self.state.lock().egress = Some(plugin);
+        Ok(status)
     }
 
+    /// One operator call to the egress plugin, by the plugin's name for it.
     #[napi]
-    pub fn remove_route(&self, route_id: String) -> Value {
-        let template = {
-            let mut guard = self.state.lock();
-            guard.pending_routes.remove(&route_id);
-            guard.proxy_template.clone()
-        };
-
-        if let Some(template) = template {
-            json!({
-                "removed": template.remove_route(&route_id),
-            })
-        } else {
-            json!({
-                "removed": Value::Null,
-            })
-        }
-    }
-
-    #[napi]
-    pub fn list_routes(&self) -> Value {
-        let guard = self.state.lock();
-        if let Some(template) = guard.proxy_template.as_ref() {
-            json!(template.list_routes())
-        } else {
-            let mut routes: Vec<Value> = guard
-                .pending_routes
-                .values()
-                .map(|route| serde_json::to_value(route).unwrap_or(Value::Null))
-                .collect();
-            routes.sort_by(|a, b| {
-                let left = a.get("routeId").and_then(Value::as_str).unwrap_or_default();
-                let right = b.get("routeId").and_then(Value::as_str).unwrap_or_default();
-                left.cmp(right)
-            });
-            Value::Array(routes)
-        }
-    }
-
-    #[napi]
-    pub async fn rotate_route(&self, route_id: String) -> Result<Option<Value>> {
-        let template = self.state.lock().proxy_template.clone();
-        let Some(template) = template else {
-            return Ok(None);
-        };
-        template
-            .rotate_route(&route_id)
+    pub async fn egress_admin(&self, op: String, args: Option<Value>) -> Result<Value> {
+        let plugin = self.require_egress()?;
+        plugin
+            .admin(&op, args.unwrap_or(Value::Null))
             .await
-            .map(|snapshot| snapshot.map(|route| json!(route)))
             .map_err(js_err)
     }
 
     #[napi]
+    pub async fn set_route(&self, route: Value) -> Result<Value> {
+        self.egress_admin("set_route".to_owned(), Some(route)).await
+    }
+
+    #[napi]
+    pub async fn remove_route(&self, route_id: String) -> Result<Value> {
+        self.egress_admin(
+            "remove_route".to_owned(),
+            Some(json!({ "routeId": route_id })),
+        )
+        .await
+    }
+
+    #[napi]
+    pub async fn list_routes(&self) -> Result<Value> {
+        self.egress_admin("list_routes".to_owned(), None).await
+    }
+
+    #[napi]
+    pub async fn rotate_route(&self, route_id: String) -> Result<Value> {
+        self.egress_admin(
+            "rotate_route".to_owned(),
+            Some(json!({ "routeId": route_id })),
+        )
+        .await
+    }
+
+    #[napi]
     pub async fn locations(&self, provider: Option<String>) -> Result<Value> {
-        let template = self.require_template()?;
-        let controller = template.spawn(
-            ProxyControlLimits::default(),
-            Some(vec!["resi".to_owned(), "mysterium".to_owned()]),
-        );
-        Ok(controller
-            .dispatch(ProxyControlRequest::ProxyLocations { provider })
-            .await)
+        self.egress_admin(
+            "locations".to_owned(),
+            Some(json!({ "provider": provider })),
+        )
+        .await
     }
 
     #[napi]
@@ -516,104 +476,36 @@ impl WispRust {
     }
 
     #[napi]
-    pub fn provider_status(&self) -> Value {
-        let guard = self.state.lock();
-        let Some(template) = guard.proxy_template.as_ref() else {
-            return json!({
-                "type": "proxy_list",
-                "providers": [],
-            });
-        };
-
-        let providers: Vec<Value> = template
-            .providers()
-            .iter()
-            .map(|provider| {
-                json!({
-                    "id": provider.id(),
-                    "name": provider.name(),
-                    "aliases": provider.aliases(),
-                    "configured": provider.is_configured(),
-                })
-            })
-            .collect();
-        json!({
-            "type": "proxy_list",
-            "providers": providers,
-        })
+    pub async fn provider_status(&self) -> Result<Value> {
+        self.egress_admin("provider_status".to_owned(), None).await
     }
 
     #[napi]
-    pub fn egress_inventory(&self) -> Value {
-        let guard = self.state.lock();
-        if let Some(template) = guard.proxy_template.as_ref() {
-            template.egress_inventory()
-        } else {
-            let mut blocked: Vec<String> = guard.pending_blocked_ips.iter().cloned().collect();
-            blocked.sort();
-            json!({
-                "routes": guard.pending_routes.values().collect::<Vec<_>>(),
-                "blockedEgressIps": blocked,
-                "policy": guard.pending_policy.clone().unwrap_or_default(),
-            })
-        }
+    pub async fn egress_inventory(&self) -> Result<Value> {
+        self.egress_admin("egress_inventory".to_owned(), None).await
     }
 
     #[napi]
-    pub fn block_egress_ip(&self, ip: String) -> Value {
-        let template = {
-            let mut guard = self.state.lock();
-            guard.pending_blocked_ips.insert(ip.clone());
-            guard.proxy_template.clone()
-        };
-        if let Some(template) = template {
-            json!({
-                "blockedEgressIps": template.block_egress_ip(ip),
-            })
-        } else {
-            self.egress_inventory()
-        }
+    pub async fn block_egress_ip(&self, ip: String) -> Result<Value> {
+        self.egress_admin("block_egress_ip".to_owned(), Some(json!({ "ip": ip })))
+            .await
     }
 
     #[napi]
-    pub fn release_egress_ip(&self, ip: String) -> Value {
-        let template = {
-            let mut guard = self.state.lock();
-            guard.pending_blocked_ips.remove(&ip);
-            guard.proxy_template.clone()
-        };
-        if let Some(template) = template {
-            json!({
-                "blockedEgressIps": template.release_egress_ip(&ip),
-            })
-        } else {
-            self.egress_inventory()
-        }
+    pub async fn release_egress_ip(&self, ip: String) -> Result<Value> {
+        self.egress_admin("release_egress_ip".to_owned(), Some(json!({ "ip": ip })))
+            .await
     }
 
     #[napi]
-    pub fn get_policy(&self) -> Value {
-        let guard = self.state.lock();
-        if let Some(template) = guard.proxy_template.as_ref() {
-            json!(template.policy())
-        } else {
-            json!(guard.pending_policy.clone().unwrap_or_default())
-        }
+    pub async fn get_policy(&self) -> Result<Value> {
+        self.egress_admin("get_policy".to_owned(), None).await
     }
 
     #[napi]
-    pub fn set_policy(&self, policy: Value) -> Result<Value> {
-        let policy: ProxyRuntimePolicy = serde_json::from_value(policy).map_err(js_err)?;
-        let template = {
-            let mut guard = self.state.lock();
-            guard.pending_policy = Some(policy.clone());
-            guard.proxy_template.clone()
-        };
-        if let Some(template) = template {
-            Ok(json!(template.set_policy(policy)))
-        } else {
-            Ok(json!(policy))
-        }
+    pub async fn set_policy(&self, policy: Value) -> Result<Value> {
+        self.egress_admin("set_policy".to_owned(), Some(policy))
+            .await
     }
 
     #[napi]
@@ -832,12 +724,13 @@ impl WispRust {
 }
 
 impl WispRust {
-    fn require_template(&self) -> Result<Arc<ProxyControllerTemplate>> {
-        self.state
-            .lock()
-            .proxy_template
-            .clone()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "wisp runtime is not started"))
+    fn require_egress(&self) -> Result<Arc<dyn EgressPlugin>> {
+        self.state.lock().egress.clone().ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "no egress plugin is configured, so every stream is dialed directly",
+            )
+        })
     }
 }
 
@@ -883,17 +776,17 @@ fn apply_config_flags(
     Ok(config)
 }
 
-fn apply_pending(template: &ProxyControllerTemplate, state: &WispRustState) -> Result<()> {
-    if let Some(policy) = state.pending_policy.as_ref() {
-        template.set_policy(policy.clone());
-    }
-    for route in state.pending_routes.values() {
-        template.set_route(route.clone()).map_err(js_err)?;
-    }
-    for ip in &state.pending_blocked_ips {
-        template.block_egress_ip(ip.clone());
-    }
-    Ok(())
+#[cfg(feature = "proxy-providers")]
+fn build_egress(config: &Value) -> Result<Arc<dyn EgressPlugin>> {
+    egress::plugin_from_config(config).map_err(|message| Error::new(Status::InvalidArg, message))
+}
+
+#[cfg(not(feature = "proxy-providers"))]
+fn build_egress(_config: &Value) -> Result<Arc<dyn EgressPlugin>> {
+    Err(Error::new(
+        Status::GenericFailure,
+        "this build has no proxy providers; build it with the proxy-providers feature",
+    ))
 }
 
 fn apply_configured_auth(runtime: &Runtime, state: &WispRustState) -> Result<()> {
@@ -1051,7 +944,7 @@ fn status_value(state: &WispRustState) -> Value {
         "webtransportEnabled": state.config.options.enabled,
         "websocketEnabled": state.config.options.websocket.enabled,
         "proxyControlEnabled": state.config.options.proxy_control_enabled,
-        "providersConfigured": state.proxy_template.as_ref().map(|t| t.providers().len()).unwrap_or(0),
+        "egress": state.egress.as_ref().map(|plugin| plugin.status()),
         "authRequired": state.config.options.base.auth.required,
         "configuredAuthTokens": state.configured_auth_tokens.len(),
         "authHandlerConfigured": state.configured_auth_handler.is_some(),

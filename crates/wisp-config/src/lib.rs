@@ -855,36 +855,14 @@ pub struct WispWtServerOptions {
     /// PEM identity covers both transports on the same hostname.
     pub websocket: WispWebSocketOptions,
     /// Whether the WISP_PROXY_CONTROL (0x03) extension is advertised.
-    /// When enabled (or overridden per WebSocket section), the runtime builds
-    /// a provider template and advertises the extension on WS and, when the
-    /// WebTransport listener is up, on WT as well.
+    /// When enabled (or overridden per WebSocket section) and the embedder
+    /// installed an egress plugin, the runtime hands the plugin each client
+    /// and advertises the extension on WS and, when the WebTransport listener
+    /// is up, on WT as well.
     pub proxy_control_enabled: bool,
-    /// Mullvad provider config (None when section absent or disabled).
-    pub mullvad: Option<MullvadProviderConfig>,
-    /// Residential provider config (None when section absent or disabled).
-    pub resi: Option<ResiProviderConfig>,
     /// `[ip_tunnel]`: whether and how IP tunnels (extension 0xF3) are
     /// offered on both transports.
     pub ip_tunnel: IpTunnelOptions,
-}
-
-/// Resolved Mullvad config — the validated subset of [`WispMullvadToml`]
-/// after defaulting. The provider crate consumes this without re-parsing.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MullvadProviderConfig {
-    pub relay_api: String,
-    pub wireproxy_socks5: Option<String>,
-}
-
-/// Resolved residential provider config.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResiProviderConfig {
-    pub bearer_token: Option<String>,
-    pub wireproxy_socks5: Option<String>,
-    pub cookie: Option<String>,
-    pub api_base: String,
-    pub country: String,
-    pub ip_type: String,
 }
 
 /// Shortest accepted `trusted_edge_secret`.
@@ -983,8 +961,6 @@ impl Default for WispWtServerOptions {
             max_proxy_substreams_per_session: 64,
             websocket: WispWebSocketOptions::default(),
             proxy_control_enabled: false,
-            mullvad: None,
-            resi: None,
             ip_tunnel: IpTunnelOptions::default(),
         }
     }
@@ -1242,29 +1218,6 @@ pub struct WispProxyControlToml {
     pub enabled: Option<bool>,
 }
 
-/// `[wisp_proxy_mullvad]` — Mullvad WireGuard SOCKS5 provider config.
-/// Absent or `enabled = false` keeps the provider out of the registry entirely.
-#[derive(Debug, Default, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct WispMullvadToml {
-    pub enabled: Option<bool>,
-    pub relay_api: Option<String>,
-    pub wireproxy_socks5: Option<String>,
-}
-
-/// `[wisp_proxy_resi]` — Mysterium API or WireGuard SOCKS5 provider.
-#[derive(Debug, Default, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct WispResiToml {
-    pub enabled: Option<bool>,
-    pub bearer_token: Option<String>,
-    pub wireproxy_socks5: Option<String>,
-    pub cookie: Option<String>,
-    pub api_base: Option<String>,
-    pub country: Option<String>,
-    pub ip_type: Option<String>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WispWtConfigToml {
@@ -1276,10 +1229,6 @@ pub struct WispWtConfigToml {
     /// `[wisp_proxy_control]` block — toggles the WISP_PROXY_CONTROL
     /// extension (0x03) advertisement.
     pub wisp_proxy_control: Option<WispProxyControlToml>,
-    /// `[wisp_proxy_mullvad]` — provider config for the Mullvad SOCKS5 relay set.
-    pub wisp_proxy_mullvad: Option<WispMullvadToml>,
-    /// `[wisp_proxy_resi]` — provider config for residential / partner proxies.
-    pub wisp_proxy_resi: Option<WispResiToml>,
     /// `[ip_tunnel]` — the IP_TUNNEL extension (0xF3).
     pub ip_tunnel: Option<IpTunnelToml>,
 }
@@ -1635,37 +1584,8 @@ pub fn build_wisp_wt_options(toml_cfg: &WispWtConfigToml) -> WispWtServerOptions
             out.proxy_control_enabled = v;
         }
     }
-    if let Some(mv) = &toml_cfg.wisp_proxy_mullvad {
-        if mv.enabled.unwrap_or(false) {
-            out.mullvad = Some(MullvadProviderConfig {
-                relay_api: mv
-                    .relay_api
-                    .clone()
-                    .unwrap_or_else(|| "https://api.mullvad.net/www/relays/all/".to_owned()),
-                wireproxy_socks5: mv.wireproxy_socks5.clone(),
-            });
-        }
-    }
     if let Some(it) = &toml_cfg.ip_tunnel {
         it.merge_into(&mut out.ip_tunnel);
-    }
-    if let Some(re) = &toml_cfg.wisp_proxy_resi {
-        if re.enabled.unwrap_or(false) {
-            out.resi = Some(ResiProviderConfig {
-                bearer_token: re.bearer_token.clone(),
-                wireproxy_socks5: re.wireproxy_socks5.clone(),
-                cookie: re.cookie.clone(),
-                api_base: re
-                    .api_base
-                    .clone()
-                    .unwrap_or_else(|| "https://api.mysterium.network".to_owned()),
-                country: re.country.clone().unwrap_or_default(),
-                ip_type: re
-                    .ip_type
-                    .clone()
-                    .unwrap_or_else(|| "residential".to_owned()),
-            });
-        }
     }
     out
 }
@@ -1782,29 +1702,6 @@ impl WispWtServerOptions {
             .websocket
             .proxy_control_enabled
             .unwrap_or(self.proxy_control_enabled);
-        if (self.proxy_control_enabled || ws_proxy_control)
-            && self.mullvad.is_none()
-            && self.resi.is_none()
-        {
-            return Err(ConfigError::Validate(
-                "proxy control requires at least one configured provider".into(),
-            ));
-        }
-        if let Some(resi) = &self.resi {
-            let has_api = resi
-                .bearer_token
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            let has_wireguard = resi
-                .wireproxy_socks5
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            if has_api == has_wireguard {
-                return Err(ConfigError::Validate(
-                    "Mysterium requires exactly one of bearer_token or wireproxy_socks5".into(),
-                ));
-            }
-        }
         if self.ip_tunnel.enabled {
             self.ip_tunnel.resolve(&self.base)?;
         }

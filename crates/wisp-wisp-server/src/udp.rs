@@ -120,13 +120,13 @@ async fn run_udp(
     };
 
     // UDP cannot go through a proxy. Where TCP to this host would be
-    // proxied, or proxying is mandatory, a direct flow would show the
-    // server's own address, so it is refused instead.
-    let proxied = ctx.options.force_proxy
-        || ctx
-            .proxy_controller
-            .as_ref()
-            .is_some_and(|controller| controller.routes_through_proxy(&host.to_string()));
+    // proxied, a direct flow would show the server's own address, so it is
+    // refused instead. An installed egress plugin decides; without one,
+    // force_proxy makes every destination proxied.
+    let proxied = match ctx.proxy_controller.as_ref() {
+        Some(controller) => controller.routes_through_proxy(&host.to_string()),
+        None => ctx.options.force_proxy,
+    };
     if proxied {
         if let Some(rejections) = ctx.reject_log.admit() {
             warn!(

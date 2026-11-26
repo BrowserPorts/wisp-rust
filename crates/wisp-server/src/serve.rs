@@ -1052,21 +1052,19 @@ async fn session_loop(
     if wt_proxy_enabled {
         registry.register::<WebTransportProxy>();
     }
-    let proxy_controller = if proxy_control_enabled {
-        proxy_template.as_ref().map(|template| {
-            let server_opts = ServerOptions::from_wisp(&ctx.options, true);
-            // The token's provider grants and the per-IP budgets apply here
-            // the same way they do on the WebSocket transports.
-            let controller =
-                template.spawn(server_opts.proxy_control_limits(), allowed_proxy_providers);
-            controller.bind_client(&ctx.client_ip, None);
-            controller.bind_ip_budget(ctx.client_ip.clone(), ctx.dos.clone());
-            controller
-        })
-    } else {
-        None
-    };
-    if proxy_controller.is_some() {
+    // The egress plugin routes this session's streams whether or not the
+    // client may steer it; proxy control only decides the latter.
+    let proxy_controller = proxy_template.as_ref().map(|template| {
+        let server_opts = ServerOptions::from_wisp(&ctx.options, true);
+        // The token's provider grants and the per-IP budgets apply here
+        // the same way they do on the WebSocket transports.
+        let controller =
+            template.spawn(server_opts.proxy_control_limits(), allowed_proxy_providers);
+        controller.bind_client(&ctx.client_ip, None);
+        controller.bind_ip_budget(ctx.client_ip.clone(), ctx.dos.clone());
+        controller
+    });
+    if proxy_control_enabled && proxy_controller.is_some() {
         registry.register_raw(ProxyControl::ID, Bytes::from_static(br#"{"version":1}"#));
     }
     if let Some(service) = &tunnels {
