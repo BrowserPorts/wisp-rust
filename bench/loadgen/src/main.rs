@@ -22,6 +22,11 @@
 //!   client closed each stream instead, wispd closed first and every stream
 //!   parked an ephemeral port in TIME_WAIT; at a few thousand streams a second
 //!   that ran out of ports ("Can't assign requested address").
+//! - `churn-client-close`: as `churn`, but the client closes each stream once
+//!   its echo is back, as a browser closing a finished request does. wispd
+//!   then closes its upstream socket first, so every stream holds an
+//!   ephemeral port in TIME_WAIT for twice the MSL. This mode measures how
+//!   long the port range lasts; `bench/port-range.sh` widens it.
 use bytes::{BufMut, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -46,6 +51,13 @@ enum Mode {
     Bulk,
     RoundTrip,
     Churn,
+    ChurnClientClose,
+}
+
+impl Mode {
+    fn churns(self) -> bool {
+        matches!(self, Mode::Churn | Mode::ChurnClientClose)
+    }
 }
 
 fn connect(id: u32, port: u16) -> Message {
@@ -69,6 +81,14 @@ fn data(id: u32, payload: &[u8]) -> Message {
 /// Packet type and stream id.
 fn head(p: &[u8]) -> (u8, u32) {
     (p[0], u32::from_le_bytes([p[1], p[2], p[3], p[4]]))
+}
+
+fn close(id: u32) -> Message {
+    let mut b = BytesMut::with_capacity(6);
+    b.put_u8(PACKET_CLOSE);
+    b.put_u32_le(id);
+    b.put_u8(0x02); // voluntary
+    Message::binary(b.freeze())
 }
 
 fn continue_credit(p: &[u8]) -> u32 {
@@ -248,7 +268,7 @@ async fn round_trips(
                                 local.push(s.started.elapsed().as_micros() as u32);
                                 OPS.fetch_add(1, Relaxed);
                                 BYTES.fetch_add(payload as u64, Relaxed);
-                                if mode == Mode::Churn {
+                                if mode.churns() {
                                     finished = true;
                                 } else if s.credit > 0 {
                                     s.credit -= 1;
@@ -260,9 +280,12 @@ async fn round_trips(
                             }
                         }
                         if finished {
-                            // The echo server closes the stream; its CLOSE
-                            // arrives after the stream is forgotten.
+                            // In `churn` the echo server closes the stream,
+                            // and its CLOSE arrives after it is forgotten.
                             live.remove(&id);
+                            if mode == Mode::ChurnClientClose {
+                                out.push(close(id));
+                            }
                             open(&mut live, &mut out, window);
                         }
                     }
@@ -270,7 +293,7 @@ async fn round_trips(
                         // Only a stream still waiting on its echo was cut.
                         if live.remove(&id).is_some() {
                             ERRORS.fetch_add(1, Relaxed);
-                            if mode == Mode::Churn {
+                            if mode.churns() {
                                 open(&mut live, &mut out, window);
                             }
                         }
@@ -299,7 +322,7 @@ async fn round_trips(
 
 fn usage() -> ! {
     eprintln!(
-        "usage: wisp-loadgen <bulk|rr|churn> <ws_port> <echo_port> <conns> <streams> <payload> <secs>"
+        "usage: wisp-loadgen <bulk|rr|churn|churn-client-close> <ws_port> <echo_port> <conns> <streams> <payload> <secs>"
     );
     std::process::exit(2);
 }
@@ -317,6 +340,7 @@ async fn main() {
         Some("bulk") => Mode::Bulk,
         Some("rr") => Mode::RoundTrip,
         Some("churn") => Mode::Churn,
+        Some("churn-client-close") => Mode::ChurnClientClose,
         _ => usage(),
     };
     let port: u16 = arg(&args, 2);
@@ -340,9 +364,9 @@ async fn main() {
         let latencies = latencies.clone();
         match mode {
             Mode::Bulk => drop(tokio::spawn(bulk(port, echo_port, streams, payload))),
-            Mode::RoundTrip | Mode::Churn => drop(tokio::spawn(round_trips(
-                port, echo_port, streams, payload, mode, latencies,
-            ))),
+            Mode::RoundTrip | Mode::Churn | Mode::ChurnClientClose => drop(tokio::spawn(
+                round_trips(port, echo_port, streams, payload, mode, latencies),
+            )),
         }
     }
     tokio::time::sleep(Duration::from_secs(1)).await; // warm-up

@@ -12,10 +12,10 @@
 #   bench/ab.sh /tmp/wispd-before before bulk 2 10 512 5
 #   bench/ab.sh target/release/wispd after bulk 2 10 512 5
 #
-# usage: ab.sh <wispd-binary> <label> <bulk|rr|churn> <conns> <streams> <payload> <secs>
+# usage: ab.sh <wispd-binary> <label> <bulk|rr|churn|churn-client-close> <conns> <streams> <payload> <secs>
 set -eu
 if (( $# != 7 )); then
-  print -u2 "usage: ab.sh <wispd-binary> <label> <bulk|rr|churn> <conns> <streams> <payload> <secs>"
+  print -u2 "usage: ab.sh <wispd-binary> <label> <bulk|rr|churn|churn-client-close> <conns> <streams> <payload> <secs>"
   exit 2
 fi
 root="${0:A:h:h}"
