@@ -37,7 +37,7 @@ const MAX_BUCKETS: usize = 65_536;
 const EVICT_DIVISOR: usize = 16;
 
 /// IPv6 per-IP keys are aggregated to this many leading bits (the /56 a
-/// residential ISP typically delegates), so one subscriber cannot mint a
+/// home broadband ISP typically delegates), so one subscriber cannot mint a
 /// fresh bucket per /64. Set from `rate_limit_ipv6_prefix` by
 /// [`DosGuard::from_options`]; the helpers and [`ConnectionLimiter`] read it
 /// when they build a key. It is process-wide because those helpers have no
