@@ -15,7 +15,7 @@ wisp-origin = { path = "../wisp-origin" }
 wisp-iphash = { path = "../wisp-iphash" }
 wisp-reports = { path = "../wisp-reports" }
 wisp-dos = { path = "../wisp-dos" }
-wisp-proxy-base = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git" }
+wisp-proxy-base = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git" }
 wisp-proxy = { path = "../wisp-proxy" }
 bytes = { workspace = true }
 thiserror = { workspace = true }

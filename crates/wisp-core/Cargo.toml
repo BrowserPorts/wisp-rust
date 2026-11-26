@@ -36,6 +36,6 @@ wisp-proxy = { path = "../wisp-proxy", optional = true }
 wisp-router = { path = "../wisp-router", optional = true }
 wisp-ws-h2 = { path = "../wisp-ws-h2", optional = true }
 wisp-wisp-server = { path = "../wisp-wisp-server", optional = true }
-wisp-proxy-base = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git", optional = true }
-wisp-proxy-mullvad = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git", optional = true }
-wisp-proxy-resi = { git = "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git", optional = true }
+wisp-proxy-base = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }
+wisp-proxy-mullvad = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }
+wisp-proxy-resi = { git = "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git", optional = true }

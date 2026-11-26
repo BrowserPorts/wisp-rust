@@ -46,5 +46,5 @@ allow-git = [
     # Cargo.toml's [patch.crates-io].
     "https://github.com/hyperium/h3",
     # The proxy providers, patched to a sibling checkout in Cargo.toml.
-    "ssh://git@github.com/browser-ports/wisp-rust-proxy-providers.git",
+    "https://browserports.dev/BrowserPorts/wisp-rust-proxy-providers.git",
 ]

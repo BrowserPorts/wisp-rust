@@ -182,7 +182,7 @@ max_proxy_substreams_per_session   = 64
 
 # ============================================================================
 # [wisp_proxy_mullvad] — optional Mullvad WireGuard SOCKS5 backend
-# Provider crate lives in browser-ports/wisp-rust-proxy-providers.
+# Provider crate lives in browserports.dev/BrowserPorts/wisp-rust-proxy-providers.
 # Omit the whole section or set enabled = false to skip registration.
 # ============================================================================
 [wisp_proxy_mullvad]
