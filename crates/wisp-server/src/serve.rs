@@ -104,6 +104,48 @@ const MAX_REFUSED_REQUESTS: u32 = 8;
 const CLOSE_NETWORK_ERROR: u8 = 0x03;
 const CLOSE_HOST_BLOCKED: u8 = 0x48;
 const CLOSE_THROTTLED: u8 = 0x49;
+/// Most client chunks one TCP bridge writes upstream together, and the most
+/// bytes. See [`write_all_chunks`].
+const WT_COALESCE_MAX_CHUNKS: usize = 64;
+const WT_COALESCE_MAX_BYTES: usize = 256 * 1024;
+
+/// Writes every chunk in order with as few vectored writes as the socket
+/// allows, leaving `chunks` advanced past what was written on error.
+async fn write_all_chunks<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    chunks: &mut [Bytes],
+) -> std::io::Result<()> {
+    let mut first = 0;
+    while first < chunks.len() {
+        let pending = &chunks[first..];
+        let written = if pending.len() == 1 {
+            writer.write(&pending[0]).await?
+        } else {
+            let count = pending.len().min(WT_COALESCE_MAX_CHUNKS);
+            let slices: [std::io::IoSlice<'_>; WT_COALESCE_MAX_CHUNKS] =
+                std::array::from_fn(|index| match pending.get(index) {
+                    Some(chunk) if index < count => std::io::IoSlice::new(chunk),
+                    _ => std::io::IoSlice::new(&[]),
+                });
+            writer.write_vectored(&slices[..count]).await?
+        };
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let mut left = written;
+        while left > 0 {
+            let chunk = &mut chunks[first];
+            if left < chunk.len() {
+                chunk.advance(left);
+                left = 0;
+            } else {
+                left -= chunk.len();
+                first += 1;
+            }
+        }
+    }
+    Ok(())
+}
 
 type RequestBidi = <MsQuicConnection as h3::quic::OpenStreams<Bytes>>::BidiStream;
 
@@ -1869,28 +1911,61 @@ async fn bridge_one_stream(
             let up_activity = activity.clone();
             let limits_up = limits.clone();
             let wt_to_tcp = async move {
+                let mut batch: Vec<Bytes> = Vec::with_capacity(WT_COALESCE_MAX_CHUNKS);
                 loop {
                     let chunk = std::future::poll_fn(|cx| recv.poll_data(cx))
                         .await
                         .map_err(|e| BridgeError::Io(format!("wt recv: {e:?}")))?;
-                    match chunk {
-                        Some(b) if b.has_remaining() => {
-                            up_activity.touch();
-                            if !limits_up.tcp_bytes_allowed(b.chunk().len() as u64) {
-                                return Err(BridgeError::Io(
-                                    "client->upstream byte rate exceeded".into(),
-                                ));
+                    // Whatever else the stream already holds goes out in the
+                    // same write: msquic hands over one receive at a time,
+                    // often a single packet's worth, and each upstream write
+                    // costs a system call. `end` is set when the stream is
+                    // over; the chunks taken before it are written first.
+                    let mut next = Ok(chunk);
+                    let mut batch_bytes = 0;
+                    let end = loop {
+                        match next {
+                            Ok(Some(mut b)) if b.has_remaining() => {
+                                if !limits_up.tcp_bytes_allowed(b.remaining() as u64) {
+                                    break Some(Err(BridgeError::Io(
+                                        "client->upstream byte rate exceeded".into(),
+                                    )));
+                                }
+                                batch_bytes += b.remaining();
+                                batch.push(b.copy_to_bytes(b.remaining()));
                             }
-                            tcp_write
-                                .write_all(b.chunk())
-                                .await
-                                .map_err(|e| BridgeError::Io(format!("tcp write: {e}")))?;
+                            Ok(Some(_)) => {}
+                            Ok(None) => break Some(Ok(())),
+                            Err(e) => break Some(Err(BridgeError::Io(format!("wt recv: {e:?}")))),
                         }
-                        Some(_) => continue,
-                        None => {
+                        if batch.len() >= WT_COALESCE_MAX_CHUNKS
+                            || batch_bytes >= WT_COALESCE_MAX_BYTES
+                        {
+                            break None;
+                        }
+                        let polled = {
+                            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                            recv.poll_data(&mut cx)
+                        };
+                        next = match polled {
+                            std::task::Poll::Ready(result) => result,
+                            std::task::Poll::Pending => break None,
+                        };
+                    };
+                    if !batch.is_empty() {
+                        up_activity.touch();
+                        write_all_chunks(&mut tcp_write, &mut batch)
+                            .await
+                            .map_err(|e| BridgeError::Io(format!("tcp write: {e}")))?;
+                        batch.clear();
+                    }
+                    match end {
+                        None => {}
+                        Some(Ok(())) => {
                             let _ = tcp_write.shutdown().await;
                             return Ok::<(), BridgeError>(());
                         }
+                        Some(Err(e)) => return Err(e),
                     }
                 }
             };
@@ -3094,6 +3169,27 @@ impl ControlIo for WtControlReader<MsQuicConnection, Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn coalesced_chunks_survive_short_writes_in_order() {
+        // A 7-byte pipe takes every write short, often partway into a chunk.
+        let (mut writer, mut reader) = tokio::io::duplex(7);
+        let mut expected = Vec::new();
+        let mut chunks: Vec<Bytes> = (0..40u8)
+            .map(|i| {
+                let chunk: Vec<u8> = (0..(i % 11 + 1)).map(|j| i.wrapping_mul(31) ^ j).collect();
+                expected.extend_from_slice(&chunk);
+                Bytes::from(chunk)
+            })
+            .collect();
+        let read = tokio::spawn(async move {
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).await.map(|_| got)
+        });
+        write_all_chunks(&mut writer, &mut chunks).await.unwrap();
+        drop(writer);
+        assert_eq!(read.await.unwrap().unwrap(), expected);
+    }
 
     #[test]
     fn wt_stream_caps_release_slots_on_drop() {
